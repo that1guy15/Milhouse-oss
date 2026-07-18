@@ -1,0 +1,53 @@
+name: Bug Report
+description: Report reproducible incorrect behavior in Milhouse.
+title: "[Bug]: "
+labels: ["type: bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Milhouse. Do not include credentials, private telemetry, raw agent transcripts, or customer data.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the bug and the impact.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Run ...
+        2. Configure ...
+        3. See ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - collectors
+        - ClickHouse/storage
+        - MCP
+        - feedback loop
+        - agent integration
+        - setup/install
+        - docs
+        - unknown
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Local validation
+      description: Include test output or command results if available.
+      render: shell

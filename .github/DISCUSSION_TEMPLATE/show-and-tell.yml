@@ -1,0 +1,17 @@
+title: "[Show and tell] "
+labels: ["discussion: show-and-tell"]
+body:
+  - type: textarea
+    id: setup
+    attributes:
+      label: What did you build with Milhouse?
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Workflow or architecture
+  - type: textarea
+    id: lessons
+    attributes:
+      label: What worked or did not work?

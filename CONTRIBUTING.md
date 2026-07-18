@@ -31,6 +31,14 @@ make skill-check
 - No private domains, account IDs, tokens, local paths, or generated telemetry are present.
 - Any new collector has fixture tests.
 - Any new alert or feedback rule documents threshold behavior and false-positive handling.
+- Pull requests target `main` and require maintainer review before merge.
+- CODEOWNERS requires `@that1guy15` review for repository-wide changes.
+
+## Community Channels
+
+- Use Issues for actionable bugs, features, docs gaps, and integration requests.
+- Use Discussions for architecture questions, design tradeoffs, ideas, and show-and-tell posts.
+- Use private security reporting for credentials, telemetry exposure, or privacy bugs.
 
 ## Commit Style
 

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security or privacy report
+    url: https://github.com/that1guy15/Millhouse/security/policy
+    about: Please report credential, telemetry, or privacy issues privately.
+  - name: Architecture discussion
+    url: https://github.com/that1guy15/Millhouse/discussions
+    about: Use Discussions for open-ended architecture, integration, and roadmap conversations.

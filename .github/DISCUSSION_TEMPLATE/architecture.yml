@@ -1,0 +1,25 @@
+title: "[Architecture] "
+labels: ["discussion: architecture"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for Milhouse architecture, storage, MCP, collector, feedback-loop, or agent workflow design discussions.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What part of Milhouse are you thinking about?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal or question
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Tradeoffs
+      description: What gets better, harder, riskier, or simpler?

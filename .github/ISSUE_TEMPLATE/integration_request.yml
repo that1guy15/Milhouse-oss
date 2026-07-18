@@ -1,0 +1,29 @@
+name: Integration Request
+description: Request support for a provider, tool, agent, or data source.
+title: "[Integration]: "
+labels: ["type: integration", "needs triage"]
+body:
+  - type: input
+    id: provider
+    attributes:
+      label: Provider or tool
+      placeholder: Cloudflare, GitHub Actions, LangSmith, Telegram, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: signals
+    attributes:
+      label: Signals to collect
+      description: What events, metrics, traces, or feedback should Milhouse ingest?
+    validations:
+      required: true
+  - type: textarea
+    id: auth
+    attributes:
+      label: Authentication model
+      description: Describe the env vars or token shape, without sharing secrets.
+  - type: textarea
+    id: docs
+    attributes:
+      label: Relevant public docs
+      description: Link to provider documentation if available.

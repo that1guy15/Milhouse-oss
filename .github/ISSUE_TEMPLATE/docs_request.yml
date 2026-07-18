@@ -1,0 +1,22 @@
+name: Documentation Request
+description: Request a docs fix, example, or clarification.
+title: "[Docs]: "
+labels: ["type: docs", "needs triage"]
+body:
+  - type: textarea
+    id: page
+    attributes:
+      label: Page or topic
+      description: Which doc, setup step, command, or concept needs work?
+    validations:
+      required: true
+  - type: textarea
+    id: issue
+    attributes:
+      label: What is confusing or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording or example

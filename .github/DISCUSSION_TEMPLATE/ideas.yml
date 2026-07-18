@@ -1,0 +1,18 @@
+title: "[Idea] "
+labels: ["discussion: idea"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: Idea
+      description: What should Milhouse help teams observe or improve?
+    validations:
+      required: true
+  - type: textarea
+    id: users
+    attributes:
+      label: Who benefits?
+  - type: textarea
+    id: signal
+    attributes:
+      label: What signal would prove it works?

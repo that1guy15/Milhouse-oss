@@ -1,0 +1,31 @@
+name: Feature Request
+description: Propose a new Milhouse capability or integration.
+title: "[Feature]: "
+labels: ["type: feature", "needs triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow, signal, or operational gap should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, interface, or integration you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: This can work with fake fixtures and without live credentials.
+        - label: This keeps local-first behavior.
+        - label: This does not require storing raw agent transcripts by default.
