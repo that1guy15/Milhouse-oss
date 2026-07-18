@@ -3,7 +3,7 @@
 The intended GitHub repository is:
 
 ```text
-https://github.com/that1guy15/Millhouse.git
+https://github.com/that1guy15/Milhouse-oss.git
 ```
 
 ## Current Private-First Setup

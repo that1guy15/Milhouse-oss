@@ -4,7 +4,7 @@ Milhouse is a local-first observability and feedback-loop platform for AI-assist
 
 It watches production systems, deploys, synthetic checks, developer workflows, and AI agent sessions, then turns those signals into feedback that humans, Codex, Claude Code, and other agents can act on.
 
-Repository remote: `https://github.com/that1guy15/Millhouse.git`
+Repository remote: `https://github.com/that1guy15/Milhouse-oss.git`
 
 ## What Milhouse Does
 
@@ -25,7 +25,7 @@ The private Milhouse implementation should not be made public directly. Reusable
 ## Quickstart
 
 ```bash
-git clone https://github.com/that1guy15/Millhouse.git milhouse-oss
+git clone https://github.com/that1guy15/Milhouse-oss.git milhouse-oss
 cd milhouse-oss
 ./setup.sh
 ```
