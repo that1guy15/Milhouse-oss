@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Local config and secrets
+.env
+.env.*
+!.env.example
+config/milhouse.toml
+milhouse.toml
+
+# Generated telemetry and state
+spool/
+data/
+logs/
+reports/generated/
+.milhouse/
+*.jsonl
+*.log
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local MCP config
+.mcp.json

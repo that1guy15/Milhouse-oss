@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "milhouse": {
+      "command": "python",
+      "args": ["-m", "milhouse.mcp_server"],
+      "env": {
+        "MILHOUSE_CONFIG": "./config/milhouse.toml"
+      }
+    }
+  }
+}

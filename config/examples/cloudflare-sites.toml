@@ -1,0 +1,34 @@
+[project]
+name = "cloudflare-example"
+default_target = "marketing-site"
+feedback_dir = ".milhouse"
+
+[store]
+kind = "clickhouse"
+dsn_env = "MILHOUSE_CLICKHOUSE_DSN"
+jsonl_spool = "spool"
+state_dir = "data/state"
+
+[cloudflare]
+account_id_env = "MILHOUSE_CLOUDFLARE_ACCOUNT_ID"
+token_env = "MILHOUSE_CLOUDFLARE_TOKEN"
+workers_token_env = "MILHOUSE_CLOUDFLARE_WORKERS_TOKEN"
+
+[[targets]]
+name = "marketing-site"
+kind = "cloudflare-worker"
+environment = "production"
+base_url = "https://www.example.com"
+
+[[collectors.site_canary]]
+target = "marketing-site"
+url = "https://www.example.com"
+interval_seconds = 60
+timeout_seconds = 10
+expected_status = 200
+
+[[collectors.cloudflare_web_analytics]]
+target = "marketing-site"
+enabled = false
+zone_tag_env = "MILHOUSE_EXAMPLE_ZONE_TAG"
+rum_site_tag_env = "MILHOUSE_EXAMPLE_RUM_SITE_TAG"

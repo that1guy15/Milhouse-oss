@@ -1,0 +1,32 @@
+[project]
+name = "agent-workflow-example"
+default_target = "example-app"
+feedback_dir = ".milhouse"
+
+[store]
+kind = "clickhouse"
+dsn_env = "MILHOUSE_CLICKHOUSE_DSN"
+jsonl_spool = "spool"
+state_dir = "data/state"
+
+[privacy]
+strict_redaction = true
+agent_trace_enabled = true
+store_raw_agent_transcripts = false
+retain_days = 14
+
+[[collectors.agent_sessions]]
+agent = "codex"
+enabled = true
+source = "local-session-summary"
+paths = []
+
+[[collectors.agent_sessions]]
+agent = "claude-code"
+enabled = true
+source = "local-session-summary"
+paths = []
+
+[[collectors.feedback_outbox]]
+enabled = true
+repo_globs = ["~/work/*/.milhouse/feedback-outbox.jsonl"]

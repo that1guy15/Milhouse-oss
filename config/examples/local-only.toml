@@ -1,0 +1,28 @@
+[project]
+name = "local-lab"
+default_target = "local-tool"
+feedback_dir = ".milhouse"
+
+[store]
+kind = "clickhouse"
+dsn_env = "MILHOUSE_CLICKHOUSE_DSN"
+jsonl_spool = "spool"
+state_dir = "data/state"
+
+[privacy]
+strict_redaction = true
+agent_trace_enabled = false
+store_raw_agent_transcripts = false
+
+[[targets]]
+name = "local-tool"
+kind = "local-app"
+environment = "development"
+base_url = "http://localhost:3000"
+
+[[collectors.site_canary]]
+target = "local-tool"
+url = "http://localhost:3000"
+interval_seconds = 60
+timeout_seconds = 5
+expected_status = 200

@@ -1,0 +1,58 @@
+[project]
+name = "example-team"
+default_target = "example-app"
+feedback_dir = ".milhouse"
+
+[store]
+kind = "clickhouse"
+dsn_env = "MILHOUSE_CLICKHOUSE_DSN"
+jsonl_spool = "spool"
+state_dir = "data/state"
+clickhouse_database = "milhouse"
+
+[privacy]
+strict_redaction = true
+agent_trace_enabled = false
+retain_days = 30
+store_raw_agent_transcripts = false
+
+[[targets]]
+name = "example-app"
+kind = "web-service"
+environment = "production"
+base_url = "https://example.com"
+
+[[collectors.site_canary]]
+target = "example-app"
+url = "https://example.com/health"
+interval_seconds = 60
+timeout_seconds = 10
+expected_status = 200
+
+[[collectors.browser_errors]]
+target = "example-app"
+source = "http"
+endpoint = "/milhouse/browser-error"
+enabled = false
+
+[[collectors.backend_errors]]
+target = "example-app"
+source = "http"
+endpoint = "/milhouse/backend-error"
+enabled = false
+
+[[collectors.deploy_events]]
+target = "example-app"
+source = "github-actions"
+enabled = false
+
+[mcp]
+enabled = true
+read_only_by_default = true
+
+[notifications.telegram]
+enabled = false
+bot_token_env = "MILHOUSE_TELEGRAM_BOT_TOKEN"
+chat_id_env = "MILHOUSE_TELEGRAM_CHAT_ID"
+weekly_summary = true
+urgent_alerts = true
