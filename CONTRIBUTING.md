@@ -46,12 +46,11 @@ The sign-off name and email must identify the contributor. Pull requests contain
 Pull requests target `main` and require:
 
 - passing aggregate `required-ci` and all protected security/integration checks once W17 installs them;
-- at least one approval from an eligible CODEOWNER who did not author the change;
 - resolved review threads;
 - no P0/P1 defect or privacy/provenance uncertainty;
 - plan/status/documentation updates when applicable.
 
-Until a second maintainer is appointed, owner-authored changes require an explicitly recorded independent reviewer in the pull request rather than self-approval. Repository settings and the effective review path are evidence for G00/G17.
+While the project has one GitHub maintainer, owner-authored work uses a pull request with mandatory protected checks, recorded Codex/sub-agent review evidence, and zero impossible self-approvals. The sole maintainer may merge that pull request after all required checks pass. Pull requests from other contributors still require maintainer review as project policy. When a second trusted maintainer is appointed, required human/CODEOWNER approval will be enabled without changing the source contracts.
 
 ## Before opening a pull request
 

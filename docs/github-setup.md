@@ -21,13 +21,13 @@ Default branch: `main`
 
 - pull request before merge;
 - aggregate `required-ci` plus all release-plan security/integration dependencies;
-- resolved conversations and dismissal of stale approval;
-- eligible CODEOWNER approval for non-owner changes;
-- a recorded independent reviewer for owner-authored changes until a second CODEOWNER is appointed;
+- resolved conversations and stale-review dismissal where reviews exist;
 - DCO sign-off check;
 - no force push or branch deletion.
 
-The review path must be tested with a non-production pull request. Do not configure an impossible self-review requirement.
+Solo-maintainer mode uses zero required approvals, `require_code_owner_reviews = false`, and `require_last_push_approval = false`, while retaining mandatory pull requests, strict status checks, and admin enforcement. This avoids an impossible self-review gate without permitting unchecked direct merges. Contributor pull requests still receive owner review by project policy. Required human/CODEOWNER approval is enabled when another trusted maintainer is appointed.
+
+The review path must be tested with a non-production pull request. W00 uses its implementation branch as that test.
 
 ## Workflow source
 

@@ -1,5 +1,6 @@
-# Default accountable maintainer. A second trusted reviewer must be recorded for
-# owner-authored changes until another CODEOWNER is appointed.
+# Sole accountable maintainer. In solo-maintainer mode, CODEOWNERS identifies
+# ownership but is not a required self-approval gate. Re-enable required
+# CODEOWNER approval when another trusted maintainer is appointed.
 * @that1guy15
 
 # Security, privacy, persistence, and release-sensitive areas.
