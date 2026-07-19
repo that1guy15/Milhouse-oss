@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Iterable, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NoReturn
 
 if __package__:
@@ -49,21 +49,6 @@ EXPECTED_DEPENDABOT_POLICY = {
     "version": 2,
     "updates": [
         {
-            "package-ecosystem": "uv",
-            "directory": "/",
-            "schedule": {
-                "interval": "weekly",
-                "day": "monday",
-                "time": "07:00",
-                "timezone": "America/Chicago",
-            },
-            "open-pull-requests-limit": 5,
-            "groups": {
-                "python-development": {"dependency-type": "development"},
-                "python-runtime": {"dependency-type": "production"},
-            },
-        },
-        {
             "package-ecosystem": "github-actions",
             "directory": "/",
             "schedule": {
@@ -73,17 +58,6 @@ EXPECTED_DEPENDABOT_POLICY = {
                 "timezone": "America/Chicago",
             },
             "open-pull-requests-limit": 5,
-        },
-        {
-            "package-ecosystem": "docker",
-            "directory": "/ops/clickhouse",
-            "schedule": {
-                "interval": "weekly",
-                "day": "monday",
-                "time": "08:00",
-                "timezone": "America/Chicago",
-            },
-            "open-pull-requests-limit": 3,
         },
     ],
 }
@@ -260,9 +234,93 @@ def validate_pyproject_policy(value: object, path: Path) -> None:
         raise DataError(f"{path}: Ruff per-file ignores differ from policy")
 
 
-def validate_dependabot_policy(value: object, path: Path) -> None:
-    """Require exact ecosystems and bounded schedules for dependency updates."""
+def _dependabot_directory(repository_root: Path, value: object, label: str) -> Path:
+    if not isinstance(value, str):
+        raise DataError(f"{label}: directory must be an absolute repository path")
+    if (
+        not value.startswith("/")
+        or "\\" in value
+        or "//" in value
+        or (value != "/" and value.endswith("/"))
+        or (value != "/" and any(part in {"", ".", ".."} for part in value[1:].split("/")))
+    ):
+        raise DataError(f"{label}: directory must be a canonical absolute repository path")
 
+    relative_parts = PurePosixPath(value).parts[1:]
+    candidate = repository_root.joinpath(*relative_parts)
+    current = repository_root
+    for part in relative_parts:
+        current /= part
+        if current.is_symlink():
+            raise DataError(f"{label}: directory traverses a symlink")
+    if not candidate.is_dir():
+        raise DataError(f"{label}: directory does not exist")
+    return candidate
+
+
+def _regular_file(path: Path) -> bool:
+    return path.is_file() and not path.is_symlink()
+
+
+def _validate_dependabot_manifests(value: object, path: Path) -> None:
+    root = require_mapping(value, str(path))
+    updates = root.get("updates")
+    if not isinstance(updates, list):
+        raise DataError(f"{path}: Dependabot updates must be a list")
+
+    repository_root = path.parent.parent
+    for index, raw_update in enumerate(updates):
+        label = f"{path}: Dependabot update {index}"
+        update = require_mapping(raw_update, label)
+        ecosystem = update.get("package-ecosystem")
+        try:
+            directory = _dependabot_directory(repository_root, update.get("directory"), label)
+            if ecosystem == "uv":
+                required = (directory / "pyproject.toml", directory / "uv.lock")
+                if not all(_regular_file(candidate) for candidate in required):
+                    raise DataError(
+                        f"{label}: uv requires regular pyproject.toml and uv.lock files"
+                    )
+            elif ecosystem == "github-actions":
+                workflows = directory / ".github" / "workflows"
+                manifests = (
+                    candidate
+                    for pattern in ("*.yml", "*.yaml")
+                    for candidate in workflows.glob(pattern)
+                )
+                if (
+                    workflows.is_symlink()
+                    or not workflows.is_dir()
+                    or not any(_regular_file(item) for item in manifests)
+                ):
+                    raise DataError(f"{label}: github-actions requires a regular workflow manifest")
+            elif ecosystem == "docker":
+                manifests = (
+                    candidate
+                    for candidate in directory.iterdir()
+                    if candidate.name == "Dockerfile" or candidate.name.startswith("Dockerfile.")
+                )
+                if not any(_regular_file(item) for item in manifests):
+                    raise DataError(
+                        f"{label}: Milhouse docker policy requires a regular Dockerfile manifest"
+                    )
+            elif ecosystem == "docker-compose":
+                names = (
+                    "compose.yml",
+                    "compose.yaml",
+                    "docker-compose.yml",
+                    "docker-compose.yaml",
+                )
+                if not any(_regular_file(directory / name) for name in names):
+                    raise DataError(f"{label}: docker-compose requires a regular Compose manifest")
+        except OSError:
+            raise DataError("Dependabot manifest inspection failed safely") from None
+
+
+def validate_dependabot_policy(value: object, path: Path) -> None:
+    """Require exact ecosystems, usable manifests, and bounded schedules."""
+
+    _validate_dependabot_manifests(value, path)
     if value != EXPECTED_DEPENDABOT_POLICY:
         raise DataError(f"{path}: Dependabot ecosystems or schedules differ from policy")
 

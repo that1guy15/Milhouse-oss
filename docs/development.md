@@ -176,8 +176,14 @@ documenting the matrix or passing only the local interpreter is not equivalent.
 
 The `docs-check` target validates local Markdown targets and anchors and applies a bounded external
 link check. The `repo-check` target parses repository TOML, JSON, YAML, and package resources
-strictly. Keep examples fake and provider-neutral. Do not commit credentials, private paths, raw
-telemetry, generated reports, state, agent content, or donor fixtures.
+strictly. Dependabot entries must use canonical in-repository directories, resolve to
+Milhouse-approved regular manifests, and use the ecosystem matching that manifest (`docker-compose`
+for Compose, not `docker`). Automated version updates currently cover GitHub Actions. The exact
+Python lock remains enforced by lock and compatibility checks and scanned for known vulnerabilities
+by required-CI `pip-audit`; automated Python version updates wait until GitHub's hosted updater can
+run the uv version Milhouse requires. Container update tracking returns with its owning package and
+matching ecosystem. Keep examples fake and provider-neutral. Do not commit credentials, private
+paths, raw telemetry, generated reports, state, agent content, or donor fixtures.
 
 Before handoff, follow [Contributing](../CONTRIBUTING.md), run the checks required by the active
 work package, inspect the combined tree, and report any unverified external behavior separately.

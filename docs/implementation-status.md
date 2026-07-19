@@ -12,8 +12,8 @@ status and evidence; it does not amend the plan.
 | Product phase | **Pre-alpha; not released and not ready for production use** |
 | Plan | Version 1.0, approved for implementation by the owner on 2026-07-18 |
 | Target release | Milhouse OSS 1.0 |
-| Working branch | `codex/w01-quality-foundation` |
-| Git state | Protected `main` at signed squash commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; PR #2 is the protected W01 delivery path from that exact parent |
+| Working branch | `codex/w01-dependabot-remediation` |
+| Git state | Protected `main` at signed W01 squash commit `f6ba1dabc8251447dd5d09ea3b6b48b11a102d51`; its tree exactly matched reviewed PR #2 head `90bc82364c3a9cfc051277044a1499a1276f5a8e` |
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
 | Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
 | External mutation authority | Owner authorized build-branch pushes, pull requests, and merges to `main` after required checks on 2026-07-19. Tags, package publication, announcements, live-provider calls, and unrelated external mutation remain separately controlled |
@@ -73,7 +73,7 @@ evidence. A later regression returns the affected gate to **In progress**.
 | Package | Depends on | State | Gate evidence required before `Passed` | External owner/reviewer action |
 |---|---|---|---|---|
 | W00 — authority, governance, ADRs | Owner plan approval | **Passed** | PR #1 merged as signed squash commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; reviewed head tree matched protected `main`; post-merge `test` and `gitleaks` passed | E01 and E02 complete for G00; third-party PVR delivery remains E01/E05 at G17 |
-| W01 — package and quality toolchain | G00 | **In progress** | [G01 evidence](gate-evidence/G01.md): local quality, coverage, audit, license, build, artifact-install, fresh-bootstrap, exact-candidate scans, and hosted failure/green assertions pass; evidence-head checks, independent review, protected merge, and post-merge verification remain | Aggregate `required-ci` migration and solo-maintainer protected-PR path are complete |
+| W01 — package and quality toolchain | G00 | **In progress** | [G01 evidence](gate-evidence/G01.md): candidate review, protected merge, exact-tree equality, and post-merge required CI passed; first-run Dependabot jobs exposed a misclassified Docker ecosystem and an incompatible hosted uv version, whose fail-closed policy remediation still requires hosted review, merge, and post-merge verification | Aggregate `required-ci` migration and solo-maintainer protected-PR path are complete |
 | W02 — domain, config, identity, privacy | G01 | Pending | Strict examples/schema; cross-process deterministic IDs; adversarial no-secret egress tests; critical branch coverage | None beyond review |
 | W03 — SQLite, spool, replay, retention | G02 | Pending | Every durable-write kill point; concurrency; corruption recovery; replay of 10,000 records twice; permissions; privacy-expiry behavior | Access to a supported local filesystem/host if not available to engineering |
 | W04 — ClickHouse and recovery | G02; G04b also requires G03 | Pending | G04a auth/migrations/checksums; G04b idempotent delivery, 24-hour simulated outage drain, and verified native restore | Docker-capable supported host if not available to engineering |
