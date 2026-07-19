@@ -13,7 +13,7 @@ status and evidence; it does not amend the plan.
 | Plan | Version 1.0, approved for implementation by the owner on 2026-07-18 |
 | Target release | Milhouse OSS 1.0 |
 | Working branch | `codex/build-milhouse-v1` |
-| Git state | `codex/build-milhouse-v1` is anchored to the audited public `origin/main` commit; no W00 implementation commit exists yet |
+| Git state | W00 local checkpoint `b5863d000e35afef1638f2aa0898d080507c335c` on `codex/build-milhouse-v1`, based directly on audited public `origin/main` |
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
 | Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
 | External publication | Not authorized; no push, tag, package publication, announcement, or live-provider call is implied by build approval |
@@ -115,6 +115,8 @@ merge path, public tree, and private-reference boundary are reviewed together.
 
 ## W00 local validation evidence — 2026-07-18
 
+- DCO-signed local W00 checkpoint:
+  `b5863d000e35afef1638f2aa0898d080507c335c`; it has not been pushed.
 - Branch `codex/build-milhouse-v1`, `HEAD`, and `origin/main` were verified at
   public baseline `fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` before the W00
   commit.
