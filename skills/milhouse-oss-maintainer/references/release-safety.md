@@ -1,22 +1,20 @@
 # Release Safety Reference
 
-Block public release if any of these are present:
+Block a merge or release if any of these are present:
 
 - real tokens or credentials
-- account IDs or RUM tags
-- private domains
-- private local paths
-- generated telemetry or reports
-- raw agent transcripts
-- private incidents
-- application-specific docs not intentionally generalized
+- account IDs, private domains, or provider tags
+- private local paths or identifiers
+- generated telemetry, reports, state, logs, or backups
+- raw feedback, agent sessions, prompts, responses, transcripts, or tool output
+- private incidents or application-specific documentation
 - hardcoded user names in examples
+- missing or uncertain donor or third-party provenance
+- skipped, stale, missing, or failed required checks
+- unresolved P0/P1 findings
+- a gate marked passed without its required evidence
+- a mutation outside the current status-ledger authority
 
-Recommended release path:
-
-1. Keep the GitHub repo private.
-2. Push a clean initial commit.
-3. Enable GitHub secret scanning.
-4. Review Actions output.
-5. Run one fresh clone quickstart.
-6. Approve public visibility change.
+Before a release candidate, inspect the full history and built artifacts, verify licenses, SBOM, and
+hashes, install the exact wheel and sdist on supported clean hosts, and obtain the independent review
+and protected-release approvals required by G17/G18.

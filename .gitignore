@@ -24,6 +24,11 @@ reports/generated/
 .milhouse/
 *.jsonl
 *.log
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+backups/
+recovery-secrets/
 
 # Editors and OS
 .DS_Store

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Milhouse gate review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["target", "gates", "verdict", "findings", "missing_evidence", "residual_risk"],
+  "properties": {
+    "target": {"type": "string", "minLength": 1},
+    "gates": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    "verdict": {"enum": ["pass", "fail", "externally_pending"]},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "action", "title", "gate", "evidence", "impact", "correction", "regression_evidence"],
+        "properties": {
+          "severity": {"enum": ["P0", "P1", "P2", "P3"]},
+          "action": {"enum": ["Change", "Verify", "Consider"]},
+          "title": {"type": "string", "minLength": 1},
+          "gate": {"type": "string", "minLength": 1},
+          "evidence": {"type": "string", "minLength": 1},
+          "impact": {"type": "string", "minLength": 1},
+          "correction": {"type": "string", "minLength": 1},
+          "regression_evidence": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "missing_evidence": {"type": "array", "items": {"type": "string"}},
+    "residual_risk": {"type": "array", "items": {"type": "string"}}
+  }
+}

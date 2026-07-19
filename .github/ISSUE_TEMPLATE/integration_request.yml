@@ -3,6 +3,10 @@ description: Request support for a provider, tool, agent, or data source.
 title: "[Integration]: "
 labels: ["type: integration", "needs triage"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach credentials, real telemetry, private paths, raw agent content, generated reports, or customer/user data. Use public provider documentation and synthetic examples only.
   - type: input
     id: provider
     attributes:

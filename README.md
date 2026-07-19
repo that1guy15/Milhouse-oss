@@ -1,110 +1,61 @@
 # Milhouse
 
-Milhouse is a local-first observability and feedback-loop platform for AI-assisted engineering teams.
+Milhouse is a local-first observability and verified engineering-feedback control plane for small teams and AI-assisted development workflows.
 
-It watches production systems, deploys, synthetic checks, developer workflows, and AI agent sessions, then turns those signals into feedback that humans, Codex, Claude Code, and other agents can act on.
+> **Status: pre-alpha implementation.** The architecture and Milhouse OSS 1.0 build contract are approved, but the product described below is not yet implemented. The current Python command is a scaffold and must not be treated as production-ready.
 
-Repository remote: `https://github.com/that1guy15/Milhouse-oss.git`
+The normative scope, contracts, work order, gates, and Definition of Done are in [the authoritative implementation plan](docs/implementation-plan.md). Progress and validation evidence are tracked in [implementation status](docs/implementation-status.md).
 
-## What Milhouse Does
+## Planned 1.0 product
 
-- Collects production health, deploy, CI, browser, backend, and agent workflow events.
-- Spools events locally before export so collection keeps working during outages.
-- Stores analytical data in local ClickHouse by default.
-- Exposes read-focused MCP tools for agents.
-- Writes repo-local `.milhouse/` feedback briefs for passive agent context.
-- Creates postmortem-style feedback when `/doh` marks missed intent or failed validation.
-- Sends optional weekly summaries and urgent alerts through Telegram.
+Milhouse will:
 
-## Current Status
+- collect health, deploy, workflow, error, and privacy-safe agent-session signals;
+- normalize and redact every record before durable persistence;
+- commit acknowledged records to a local segmented JSONL spool;
+- use SQLite for transactional control state and ClickHouse for local analytics;
+- continue collection while ClickHouse or a provider is unavailable;
+- turn recurring evidence into append-only feedback items;
+- mark work verified only after the configured signal is re-observed;
+- expose bounded local CLI, MCP, report, and `.milhouse/` brief surfaces;
+- create neutral `/doh` postmortems;
+- optionally send redacted Telegram summaries and create GitHub Issues.
 
-This repository is the OSS starter kit and handoff package. It contains the public architecture, setup contract, contribution docs, agent instructions, and project skills needed to rebuild the reusable Milhouse platform safely.
+Milhouse 1.0 will not store raw prompts, responses, agent transcripts, or tool output. It will not require a hosted Milhouse service or send call-home telemetry.
 
-The private Milhouse implementation should not be made public directly. Reusable code should be copied into this repo only after it has been sanitized, generalized, tested, and scanned.
+## Build status
 
-## Quickstart
+Implementation follows W00-W18 in the approved plan. Until a work-package gate passes, its behavior is planned rather than available. In particular, the old starter quickstart, example configuration, Compose deployment, MCP example, and project skills are being replaced and validated against the 1.0 contracts before they are advertised as usable.
 
-```bash
-git clone https://github.com/that1guy15/Milhouse-oss.git milhouse-oss
-cd milhouse-oss
-./setup.sh
-```
-
-Then edit:
-
-```text
-.env
-config/milhouse.toml
-```
-
-Useful local commands:
+Current repository validation:
 
 ```bash
+make test
 make docs-check
 make skill-check
-make test
+make secret-scan
 ```
 
-## Configuration
+These commands validate the current source tree; they do not imply that the Milhouse runtime is complete.
 
-Milhouse uses a public-safe base repo plus private overlays.
+## Source and privacy boundary
 
-Public repo:
+This is a fresh public implementation. The private operational repository is read-only donor material, not the codebase. Reuse is limited to the audited, generalized algorithms listed in [provenance](docs/provenance.md); private history, telemetry, configuration, paths, fixtures, reports, and agent content are prohibited.
 
-```text
-config/example.toml
-.env.example
-```
-
-Private user config:
-
-```text
-~/milhouse-private/
-  .env
-  config/milhouse.toml
-```
-
-The public repo must never contain real tokens, production incident data, raw agent transcripts, ClickHouse data, JSONL spools, generated reports, or private application config.
-
-## Agent Integration
-
-Milhouse is designed for both active MCP access and passive repo context.
-
-For MCP, copy `.mcp.example.json` into the agent environment and point `MILHOUSE_CONFIG` at a private config file.
-
-For passive repo feedback, Milhouse writes files like:
-
-```text
-my-app/.milhouse/
-  FEEDBACK.md
-  AGENT_FEEDBACK.md
-  TEAM_WORKFLOW.md
-  feedback-outbox.jsonl
-```
-
-Application repos should normally be read-only to Milhouse and AI agents except for their configured `.milhouse/` feedback directory.
+Never attach credentials, real telemetry, raw agent content, private incident data, ClickHouse data, JSONL spools, or generated reports to an issue or pull request. See [Security](SECURITY.md) and [Privacy](PRIVACY.md).
 
 ## Documentation
 
-Start here:
-
+- [Authoritative implementation plan](docs/implementation-plan.md)
+- [Implementation status](docs/implementation-status.md)
 - [Architecture](docs/architecture.md)
-- [Project Plan](docs/project-plan.md)
-- [Agents And Tools](docs/agents-and-tools.md)
-- [Feedback Loop](docs/feedback-loop.md)
-- [OpenWiki](docs/openwiki.md)
-- [GitHub Setup](docs/github-setup.md)
-- [Security And Privacy](SECURITY.md)
-- [Publication Checklist](docs/publication-checklist.md)
-
-## Project Skills
-
-This repo ships Codex-compatible skills:
-
-- `skills/milhouse-ops`: operate and extend Milhouse internals.
-- `skills/milhouse-feedback`: consume Milhouse feedback in application repos.
-- `skills/milhouse-oss-maintainer`: sanitize, document, and validate public releases.
+- [Privacy](PRIVACY.md)
+- [Threat model](docs/threat-model.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security reporting](SECURITY.md)
+- [Governance](GOVERNANCE.md)
+- [Support](SUPPORT.md)
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Milhouse is licensed under Apache License 2.0. Contributions require Developer Certificate of Origin sign-off. See [LICENSE](LICENSE) and [CONTRIBUTING.md](CONTRIBUTING.md).

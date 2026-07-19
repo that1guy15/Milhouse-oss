@@ -1,0 +1,6 @@
+interface:
+  display_name: "Milhouse Compound"
+  short_description: "Capture sanitized engineering learnings"
+  default_prompt: "Use $milhouse-compound to turn this verified Milhouse outcome into durable sanitized project knowledge."
+policy:
+  allow_implicit_invocation: false

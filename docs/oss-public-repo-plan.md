@@ -1,60 +1,17 @@
-# OSS Public Repo Plan
+# OSS Source Boundary
 
-Milhouse OSS should be created as a fresh, sanitized repository instead of publishing a private operational tree directly.
+Milhouse OSS is a fresh, sanitized implementation. The exact build and reuse decisions are normative in [the implementation plan](implementation-plan.md), especially sections 1, 7, 8, and 14.
 
-## Goal
+## Public baseline
 
-Create a public project that anyone can fork or download, configure with their own settings, and use to add observability and feedback loops to AI-assisted development workflows.
+The tracked public baseline at `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` supplies project intent, community scaffolding, and skills. Existing runtime files are pre-alpha scaffolding and are replaced only through their owning work-package gates.
 
-## Keep
+## Private donor boundary
 
-- local-first collectors
-- JSONL spool-before-export
-- local ClickHouse store
-- redaction
-- replay/export
-- feedback item lifecycle
-- MCP read surface
-- repo `.milhouse/` feedback briefs
-- `/doh` postmortems
-- weekly reports
-- fixture-based tests
+The private baseline at `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` remains read-only. It may inform algorithms and provider-format behavior only through the file-level disposition in `docs/provenance.md` and section 7 of the plan.
 
-## Generalize
+Never transfer private history, generated telemetry, state, logs, reports, credentials, local paths, account IDs, incidents, configuration, fixtures, prompts, responses, transcripts, or tool output. Every intentional code/algorithm adaptation receives a fresh public implementation, provenance entry, synthetic tests, and independent review.
 
-- application-specific collectors become generic service/admin/workflow collectors
-- hardcoded app names become config targets
-- personal launchd labels become templates
-- provider tokens become env-var references
-- private docs become generic runbooks
+## Public completion
 
-## Exclude
-
-- generated telemetry
-- local logs
-- raw agent transcripts
-- private incidents
-- private configs
-- real domains, account IDs, RUM tags, tokens, and local paths
-- current private git history unless fully audited and intentionally preserved
-
-## Initial Public Deliverables
-
-- README
-- Apache-2.0 license
-- contribution guide
-- security policy
-- code of conduct
-- setup script
-- example config
-- MCP example
-- Codex and Claude Code docs
-- project skills
-- architecture docs
-- feedback loop docs
-- publication checklist
-- CI and secret-scan workflows
-
-## Complete Means
-
-A new user can clone the repo, run `./setup.sh`, edit config, run tests, and understand how to connect Milhouse to their app and agents without seeing any private project context.
+The repository is not ready for publication merely because source work compiles. Engineering completion, release-candidate readiness, and release completion are separate states. All W00-W18 gates, clean-host checks, security/provenance review, artifact validation, soak periods, and separately authorized publication steps must pass.

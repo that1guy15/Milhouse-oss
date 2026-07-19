@@ -8,17 +8,24 @@ test:
 
 docs-check:
 	test -f README.md
+	test -f AGENTS.md
+	test -f CODEX.md
+	test -f CLAUDE.md
 	test -f docs/architecture.md
 	test -f docs/project-plan.md
 	test -f docs/agents-and-tools.md
 	test -f docs/feedback-loop.md
+	test -f docs/implementation-plan.md
+	test -f docs/implementation-status.md
+	test -f docs/provenance.md
+	test -f docs/skill-evaluations.md
+	test -f docs/adr/README.md
+	test -f docs/adr/0015-agent-engineering-workflow.md
+	test -f docs/solutions/README.md
 	test -f SECURITY.md
 
 skill-check:
-	test -f skills/milhouse-ops/SKILL.md
-	test -f skills/milhouse-feedback/SKILL.md
-	test -f skills/milhouse-oss-maintainer/SKILL.md
-	python3 -c 'from pathlib import Path; [(__import__("sys").exit(f"invalid skill: {p}") if not (t := p.read_text()).startswith("---\n") or "name:" not in t.split("---", 2)[1] or "description:" not in t.split("---", 2)[1] else None) for p in Path("skills").glob("*/SKILL.md")]; print("skills present")'
+	python3 scripts/validate_skills.py
 
 secret-scan:
 	@if command -v gitleaks >/dev/null 2>&1; then \

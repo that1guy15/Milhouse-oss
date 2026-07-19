@@ -1,1 +1,22 @@
+# Sole accountable maintainer. In solo-maintainer mode, CODEOWNERS identifies
+# ownership but is not a required self-approval gate. Re-enable required
+# CODEOWNER approval when another trusted maintainer is appointed.
 * @that1guy15
+
+# Security, privacy, persistence, and release-sensitive areas.
+/SECURITY.md @that1guy15
+/PRIVACY.md @that1guy15
+/docs/threat-model.md @that1guy15
+/src/milhouse/privacy/ @that1guy15
+/src/milhouse/spool/ @that1guy15
+/src/milhouse/state/ @that1guy15
+/src/milhouse/storage/ @that1guy15
+/.github/workflows/ @that1guy15
+/ops/ @that1guy15
+/docs/adr/ @that1guy15
+/AGENTS.md @that1guy15
+/CODEX.md @that1guy15
+/CLAUDE.md @that1guy15
+/.agents/ @that1guy15
+/skills/ @that1guy15
+/docs/solutions/ @that1guy15

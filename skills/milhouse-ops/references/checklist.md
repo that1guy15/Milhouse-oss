@@ -2,17 +2,20 @@
 
 Before changing internals:
 
-- Identify the affected component.
-- Confirm the config shape.
-- Confirm expected event model.
-- Add fake fixtures.
-- Keep spool-before-export behavior.
-- Redact secrets, prompts, tokens, URLs with credentials, and user content.
-- Update docs and examples.
+- Identify one authorized work package and exact gate assertions.
+- Confirm dependencies and current status.
+- Read the relevant plan clauses, ADRs, source, and tests.
+- Define the behavioral proof and synthetic fixtures.
+- Identify privacy, durability, migration, and compatibility risk.
+- Assign non-overlapping ownership before parallel writes.
 
 Before reporting complete:
 
-- `make test`
-- `make docs-check`
-- `make skill-check`
-- list any unverified live behavior
+- Reproduce and explain the causal root of every corrected defect.
+- Inspect the integrated diff and simplify without contract drift.
+- Confirm redaction-before-persistence and spool-before-export where applicable.
+- Run the active package gate and record evidence.
+- Run `make test`, `make docs-check`, and `make skill-check`.
+- List unverified live behavior and externally pending evidence.
+- Obtain report-only `milhouse-gate-review`; resolve every P0/P1.
+- Do not mark the gate passed from agent confidence.

@@ -1,4 +1,4 @@
 interface:
   display_name: "Milhouse OSS Maintainer"
-  short_description: "Prepare safe Milhouse OSS releases"
-  default_prompt: "Use $milhouse-oss-maintainer to sanitize, document, and validate Milhouse for public release."
+  short_description: "Maintain Milhouse repository delivery"
+  default_prompt: "Use $milhouse-oss-maintainer to prepare and advance an authorized Milhouse repository or release operation."

@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Milhouse. Do not include credentials, private telemetry, raw agent transcripts, or customer data.
+        Thanks for helping improve Milhouse. Do not include credentials, private telemetry, local paths, raw prompts/responses/tool output, generated reports, or customer data.
   - type: textarea
     id: summary
     attributes:

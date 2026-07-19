@@ -5,6 +5,7 @@ body:
     attributes:
       value: |
         Use this for Milhouse architecture, storage, MCP, collector, feedback-loop, or agent workflow design discussions.
+        Do not include credentials, real telemetry, private paths, raw agent content, generated reports, or user/customer data.
   - type: textarea
     id: context
     attributes:

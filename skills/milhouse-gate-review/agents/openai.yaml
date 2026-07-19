@@ -1,0 +1,4 @@
+interface:
+  display_name: "Milhouse Gate Review"
+  short_description: "Review changes against Milhouse gates"
+  default_prompt: "Use $milhouse-gate-review to review this change against its Milhouse gate and report evidence-backed findings."

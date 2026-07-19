@@ -1,161 +1,56 @@
-# Milhouse Architecture
+# Milhouse architecture
 
-Milhouse is a local-first observability and operations feedback platform for AI-assisted engineering teams.
+> Pre-alpha architecture summary. The normative contracts are sections 2-4 of `docs/implementation-plan.md` and their ratifying ADRs.
 
-The core idea is simple: collect signals from production, deploy systems, developer tools, and AI agents; normalize them into a small analytical model; store them locally first; and feed actionable findings back into humans and agents.
+Milhouse is a local-first observability and verified-feedback control plane for a single operator or small engineering team across multiple targets.
 
-## Design Principles
-
-- Local-first by default.
-- Spool before export.
-- Alert before external dependencies are required.
-- Redact by default.
-- Expose read-focused MCP tools before adding write automation.
-- Keep application repos read-only except configured `.milhouse/` feedback directories.
-- Treat workflow failures as team/system failures until the evidence says otherwise.
-
-## High-Level Flow
+## Durable flow
 
 ```mermaid
 flowchart LR
-  subgraph Sources
-    PROD["Production apps"]
-    CI["GitHub Actions / CI"]
-    BROWSER["Browser errors"]
-    BACKEND["Backend errors"]
-    AGENTS["Codex / Claude Code"]
-    OPERATOR["Human operator"]
-  end
-
-  subgraph Milhouse
-    COLLECT["Collectors"]
-    REDACT["Redaction"]
-    SPOOL["JSONL spool"]
-    STORE["Local ClickHouse"]
-    CURATE["Feedback curator"]
-    POST["/doh postmortems"]
-    REPORT["Reports and alerts"]
-    MCP["MCP server"]
-  end
-
-  subgraph Consumers
-    HUMAN["Telegram / Markdown reports"]
-    CODEX["Codex"]
-    CLAUDE["Claude Code"]
-    REPO["Repo .milhouse briefs"]
-    GH["GitHub issues"]
-  end
-
-  PROD --> COLLECT
-  CI --> COLLECT
-  BROWSER --> COLLECT
-  BACKEND --> COLLECT
-  AGENTS --> COLLECT
-  OPERATOR --> POST
-  COLLECT --> REDACT --> SPOOL --> STORE
-  STORE --> CURATE --> REPORT
-  STORE --> MCP
-  CURATE --> REPO
-  CURATE --> GH
-  POST --> CURATE
-  REPORT --> HUMAN
-  MCP --> CODEX
-  MCP --> CLAUDE
-  REPO --> CODEX
-  REPO --> CLAUDE
+  INPUT["Bounded untrusted/authenticated inputs"] --> VALIDATE["Allowlist validation and trust classification"]
+  VALIDATE --> REDACT["Redaction and privacy policy"]
+  REDACT --> SPOOL["Durable segmented JSONL spool"]
+  SPOOL --> STATE["SQLite control state"]
+  SPOOL --> CH["ClickHouse analytical copy"]
+  STATE --> DERIVE["Alerts, incidents, feedback, verification"]
+  DERIVE --> SPOOL
+  SPOOL --> QUERY["Typed bounded query service"]
+  STATE --> QUERY
+  CH --> QUERY
+  QUERY --> CLI["CLI"]
+  QUERY --> MCP["Local stdio MCP"]
+  QUERY --> REPORTS["Reports and .milhouse briefs"]
+  REPORTS --> OPTIONAL["Opt-in Telegram / GitHub Issues"]
 ```
 
-## Components
+Every acknowledged record is redacted and durably committed to a self-describing spool segment before export or derived projection. A filesystem rename and SQLite commit are not treated as one transaction: startup/writer reconciliation registers valid orphan segments and reports missing files as unhealthy.
 
-### Collectors
+## Storage responsibilities
 
-Collectors ingest signals and convert them to normalized event records.
+- **Segmented JSONL spool:** authoritative retained redacted record log and replay source.
+- **SQLite:** spool/delivery ledger, cursors, leases, idempotency, alert/incident/feedback projections, and privacy-safe index metadata.
+- **ClickHouse:** rebuildable analytical copy and bounded report/query acceleration.
 
-Initial collector families:
+ClickHouse failure never prevents unrelated durable collection. Deterministic record IDs and checkpoints provide at-least-once delivery with effectively-once logical results.
 
-- site canaries
-- Cloudflare analytics and Worker events
-- GitHub Actions deploy events
-- backend error reports
-- browser error reports
-- generic admin/workflow status APIs
-- Codex session summaries
-- Claude Code session summaries
-- feedback outbox files
+## Trust and privacy
 
-### Spool
+- Allowlist normalization and redaction precede spool, state, logs, ClickHouse, terminal output, reports, diagnostics, notifications, and MCP.
+- Restricted input is discarded; only separately normalized safe audit metadata may survive.
+- Raw prompts, responses, transcripts, and tool output are never persisted in 1.0.
+- Agent summaries/traces are structured, bounded, and disabled by default.
+- Hosted storage, receiver remote bind, notifications, GitHub writes, and MCP writes are independent opt-ins.
+- Third-party entry-point plugins are explicitly installed/allowlisted trusted code, not a sandbox.
 
-Every event is written to local JSONL before export. This lets Milhouse keep collecting when ClickHouse, network, or third-party APIs are unavailable.
+## Processes and interfaces
 
-### Store
+- `milhouse run` is the scheduler process.
+- `milhouse receiver serve` is a separate optional loopback receiver.
+- `milhouse mcp serve` uses local stdio and is read-only by default.
+- Application repository writes are limited to the configured `.milhouse/` directory and its ownership protocol.
+- Services are rendered/installed only by explicit commands.
 
-ClickHouse is the default local analytical store. It supports high-volume events, cheap local queries, and fast weekly/reporting workloads. Hosted ClickHouse can be added later as an optional deployment mode, but local ClickHouse is the default.
+## Core domain behavior
 
-### Feedback Curator
-
-The curator turns repeated patterns into `feedback_items`:
-
-- production regressions
-- stuck builds
-- repeated agent tool failures
-- missed validation
-- browser/backend exceptions
-- operator-marked `/doh` failures
-- recurring prompt or planning problems
-
-Feedback items move through:
-
-```text
-open -> accepted -> shipped -> verified
-open -> accepted -> shipped -> regressed
-open -> rejected
-```
-
-An item is not complete because an agent said it acted. It is complete when Milhouse verifies the production or workflow signal improved.
-
-### MCP Server
-
-MCP is the active read surface for agents.
-
-Planned tools:
-
-- `feedback_list`
-- `feedback_get`
-- `feedback_update_status`
-- `events_query`
-- `runs_status`
-- `postmortem_create`
-- `weekly_report_get`
-- `health_summary`
-
-Write operations should be narrow, auditable, and explicit.
-
-### Repo Feedback Briefs
-
-Milhouse also writes passive Markdown context into application repos:
-
-```text
-.milhouse/
-  FEEDBACK.md
-  AGENT_FEEDBACK.md
-  TEAM_WORKFLOW.md
-  feedback-outbox.jsonl
-```
-
-This lets agents see current operational feedback even when MCP is unavailable.
-
-## `/doh`
-
-`/doh` is an operator trigger meaning: the previous request or work set missed intent while being considered complete.
-
-Milhouse should create a postmortem that includes:
-
-- original request
-- agent actions
-- task status at the time
-- missing validation
-- mismatched assumptions
-- operator contribution to ambiguity or scope drift
-- corrective actions
-
-The goal is accountability without turning postmortems into personal blame.
+Alerts, incidents, and feedback use deterministic append-only transitions with monotonic revisions and idempotent derivation. Feedback reaches `verified` or `regressed` only through the verification engine re-observing the configured signal class; an operator or agent cannot assert those outcomes directly.

@@ -1,55 +1,43 @@
-# Security And Privacy
+# Security Policy
 
-Milhouse observes systems and AI workflows. Treat every telemetry source as potentially sensitive.
+Milhouse observes operational systems and AI-assisted workflows. Treat every input, local state file, backup, report, and diagnostic as potentially sensitive.
 
-## Do Not Commit
+## Supported versions
 
-- `.env` or `.env.*` files with real values
-- API tokens, bot tokens, account IDs, RUM tags, webhook URLs, or admin credentials
-- `spool/`, `data/`, `logs/`, `reports/generated/`, or ClickHouse data
-- raw Claude Code, Codex, LangSmith, browser, backend, or terminal transcripts
-- production incident reports containing private user, company, or customer data
-- private application configuration
+Milhouse is pre-alpha and has no supported public release yet. Security fixes apply to the active development branch. The 1.x support policy becomes effective only after `1.0.0` is published.
 
-## Private Overlay Pattern
+## Report a vulnerability privately
 
-Keep public Milhouse code separate from private operational config.
+Do **not** open a public issue or discussion for credential exposure, private-data disclosure, unsafe filesystem/repository writes, remote code execution, authentication bypass, acknowledged-record loss, or replay corruption.
 
-```text
-milhouse/
-  config/example.toml
+Preferred reporting path:
 
-~/milhouse-private/
-  .env
-  config/milhouse.toml
-  docs/private-runbook.md
-```
+1. Open a private report through [GitHub Private Vulnerability Reporting](https://github.com/that1guy15/Milhouse-oss/security/advisories/new).
+2. Include the affected commit/version, minimal synthetic reproduction, impact, and suggested mitigation if known.
+3. Never include a live credential, raw telemetry, customer/user data, private path, or production dump. Replace sensitive values with typed placeholders and safe fingerprints.
 
-Run with:
+If the private-report form is unavailable, contact the repository owner through their GitHub profile **without vulnerability details** and request a private channel. Do not use a public issue as a fallback.
 
-```bash
-MILHOUSE_CONFIG=~/milhouse-private/config/milhouse.toml milhouse health
-```
+Enabling and exercising GitHub Private Vulnerability Reporting with a draft test report is an owner-controlled G00 requirement. Repository documentation does not claim that setting is active until the evidence is recorded in `docs/implementation-status.md`.
 
-## Agent Trace Handling
+## Response and severity
 
-Agent trace ingestion should be opt-in. Before enabling it, decide:
+- **P0:** credential/data exposure, remote code execution, or uncontrolled external mutation.
+- **P1:** acknowledged data loss, unsafe filesystem/application writes, replay corruption, or broken recovery.
+- **P2:** materially incorrect or degraded behavior.
+- **P3:** minor defect.
 
-- what logs are collected
-- how long traces are retained
-- how prompts and tool outputs are redacted
-- whether raw transcripts are stored at all
-- who can query traces through MCP
+P0/P1 reports block release. Maintainers will acknowledge a valid private report as soon as practical, coordinate remediation and disclosure privately, and publish an advisory/CVE when appropriate. Exact response-time commitments will be added with the maintainer support policy before 1.0.
 
-Milhouse should store structured summaries and redacted events by default, not unlimited raw session logs.
+## Security invariants
 
-## Reporting Vulnerabilities
+- Redaction and trust classification precede every persistence and egress surface.
+- Restricted data is rejected; only safe metadata may survive.
+- Raw prompts, responses, transcripts, and tool output are never persisted in 1.0.
+- Acknowledged records are durably spooled before export.
+- ClickHouse and the ingestion receiver are loopback-only by default.
+- MCP is local stdio, bounded, and read-only by default.
+- Third-party plugins are explicitly installed, allowlisted, trusted in-process code—not sandboxed.
+- External notifications and writes are disabled by default and require preview/confirmation policy.
 
-If you find a security issue, report it privately to the repository owner. Include:
-
-- affected version or commit
-- reproduction steps
-- impact
-- suggested mitigation if known
-
-Please do not include live credentials or private user data in the report.
+See [PRIVACY.md](PRIVACY.md), [the threat model](docs/threat-model.md), and [the implementation plan](docs/implementation-plan.md).
