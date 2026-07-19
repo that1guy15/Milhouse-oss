@@ -13,7 +13,7 @@ status and evidence; it does not amend the plan.
 | Plan | Version 1.0, approved for implementation by the owner on 2026-07-18 |
 | Target release | Milhouse OSS 1.0 |
 | Working branch | `codex/w01-quality-foundation` |
-| Git state | Protected `main` at signed squash commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; W01 branch starts from that exact commit |
+| Git state | Protected `main` at signed squash commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; PR #2 is the protected W01 delivery path from that exact parent |
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
 | Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
 | External mutation authority | Owner authorized build-branch pushes, pull requests, and merges to `main` after required checks on 2026-07-19. Tags, package publication, announcements, live-provider calls, and unrelated external mutation remain separately controlled |
@@ -30,13 +30,13 @@ unarchived, and uses protected `main`; Issues and Discussions are enabled;
 secret scanning, push protection, and Dependabot security updates are enabled;
 Private Vulnerability Reporting is enabled as of 2026-07-19. GitHub correctly refused a sole
 administrator self-report, then the documented administrator-side synthetic draft was created,
-read back, and closed without publication, CVE, or private fork. `main` requires `test` and
-`gitleaks`, one approval, CODEOWNER review, last-push approval, stale-review
-dismissal, and admin enforcement. On 2026-07-19 the owner authorized the
-solo-maintainer path and engineering changed only the review sub-rule to zero
-approvals, no required CODEOWNER approval, and no last-push approval. Strict
-`test`/`gitleaks` checks, pull requests, admin enforcement, no force-push, and
-no deletion remain.
+read back, and closed without publication, CVE, or private fork. On 2026-07-19 the owner authorized
+the solo-maintainer path and engineering changed the review sub-rule to zero approvals, no required
+CODEOWNER approval, and no last-push approval. After the W01 aggregate first passed, the temporary
+`test`/`gitleaks` contexts were replaced by the single strict GitHub Actions `required-ci` context.
+Pull requests, stale-review dismissal, conversation resolution, administrator enforcement, no
+force-push, and no deletion remain. An intentional W01 failure subsequently proved the required
+aggregate blocks merge.
 
 ## Status and evidence rules
 
@@ -73,7 +73,7 @@ evidence. A later regression returns the affected gate to **In progress**.
 | Package | Depends on | State | Gate evidence required before `Passed` | External owner/reviewer action |
 |---|---|---|---|---|
 | W00 — authority, governance, ADRs | Owner plan approval | **Passed** | PR #1 merged as signed squash commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; reviewed head tree matched protected `main`; post-merge `test` and `gitleaks` passed | E01 and E02 complete for G00; third-party PVR delivery remains E01/E05 at G17 |
-| W01 — package and quality toolchain | G00 | **In progress** | [G01 evidence](gate-evidence/G01.md): local quality, coverage, audit, license, build, artifact-install, and fresh-bootstrap assertions pass; exact-candidate scans, hosted failure/green proof, independent review, protected merge, and post-merge verification remain | Replace the temporary `test`/`gitleaks` contexts with aggregate `required-ci` after the W01 workflow exists |
+| W01 — package and quality toolchain | G00 | **In progress** | [G01 evidence](gate-evidence/G01.md): local quality, coverage, audit, license, build, artifact-install, fresh-bootstrap, exact-candidate scans, and hosted failure/green assertions pass; evidence-head checks, independent review, protected merge, and post-merge verification remain | Aggregate `required-ci` migration and solo-maintainer protected-PR path are complete |
 | W02 — domain, config, identity, privacy | G01 | Pending | Strict examples/schema; cross-process deterministic IDs; adversarial no-secret egress tests; critical branch coverage | None beyond review |
 | W03 — SQLite, spool, replay, retention | G02 | Pending | Every durable-write kill point; concurrency; corruption recovery; replay of 10,000 records twice; permissions; privacy-expiry behavior | Access to a supported local filesystem/host if not available to engineering |
 | W04 — ClickHouse and recovery | G02; G04b also requires G03 | Pending | G04a auth/migrations/checksums; G04b idempotent delivery, 24-hour simulated outage drain, and verified native restore | Docker-capable supported host if not available to engineering |
