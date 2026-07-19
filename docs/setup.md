@@ -90,7 +90,7 @@ For packaging-sensitive changes, also run:
 
 The active gate and exact required evidence remain in
 [implementation status](implementation-status.md). Passing local commands does not by itself mark
-G01 passed.
+any implementation gate passed.
 
 ## Next steps
 

@@ -4,9 +4,10 @@ Milhouse is a local-first observability and verified engineering-feedback contro
 teams and AI-assisted development workflows.
 
 > **Status: pre-alpha implementation; no public release.** The W01 package and quality-toolchain
-> foundation is under active validation. The repository contains a typed Python package, a modular
-> Click root command, and package-resource scaffolding, but the operational commands and runtime
-> described below are not implemented yet. Do not use this build for production data.
+> foundation has passed G01; W02 domain, configuration, identity, and privacy work is next. The
+> repository contains a typed Python package, a modular Click root command, and package-resource
+> scaffolding, but the operational commands and runtime described below are not implemented yet. Do
+> not use this build for production data.
 
 The normative scope, contracts, work order, gates, and Definition of Done are in [the authoritative implementation plan](docs/implementation-plan.md). Progress and validation evidence are tracked in [implementation status](docs/implementation-status.md).
 
@@ -71,8 +72,8 @@ Current repository validation:
 ./scripts/run_make.py secret-scan
 ```
 
-These commands validate the current source tree; they do not imply that W01 has passed or that the
-Milhouse runtime is complete.
+These commands validate the current source tree. W01 has passed, but that does not imply that the
+Milhouse runtime or any later work package is complete.
 
 ## Source and privacy boundary
 

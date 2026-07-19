@@ -8,7 +8,7 @@ Milhouse is pre-alpha and is being built through the gates in `docs/implementati
 
 ## Development setup
 
-The active W01 candidate uses Python 3.11-3.14, exactly uv 0.11.29, and the checked-in
+The accepted W01 toolchain uses Python 3.11-3.14, exactly uv 0.11.29, and the checked-in
 `uv.lock`. Install the exact uv version through its supported installer or package manager, then
 bootstrap the repository:
 
