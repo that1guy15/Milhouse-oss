@@ -1,79 +1,43 @@
-# Feedback Loop
+# Verified feedback loop
 
-Milhouse closes the loop between what the team builds, how it behaves in production, how AI agents work, and what the operator needs to improve next.
+> Pre-alpha contract summary. Section 4.6 of `docs/implementation-plan.md` is normative.
 
-## Loop
-
-```mermaid
-sequenceDiagram
-  participant User as Operator
-  participant Agent as Codex / Claude Code
-  participant App as Application
-  participant MH as Milhouse
-  participant Store as ClickHouse
-  participant Brief as Repo .milhouse Brief
-  participant Report as Telegram / Weekly Report
-
-  User->>Agent: Request work
-  Agent->>App: Build, test, deploy
-  App->>MH: Emit deploy, error, browser, backend, and usage events
-  Agent->>MH: Emit session summary and tool failures
-  MH->>Store: Store redacted normalized events
-  MH->>MH: Curate patterns into feedback_items
-  MH->>Brief: Write repo-local feedback
-  MH->>Report: Send summaries and urgent alerts
-  Agent->>Brief: Read feedback next session
-  Agent->>MH: Update feedback status with PR/commit
-  MH->>App: Re-check production signal
-  MH->>Store: Mark verified or regressed
-```
-
-## Feedback Item Lifecycle
+Milhouse converts repeated, redacted operational evidence into actionable feedback and keeps the lifecycle append-only and reproducible.
 
 ```text
-open -> accepted -> shipped -> verified
-open -> accepted -> shipped -> regressed
-open -> rejected
+failure/workflow signal
+-> redacted durable record
+-> alert/incident and deterministic curator rule
+-> open feedback item
+-> accepted with owner
+-> shipped with change and validation evidence
+-> same-class observation by the verification engine
+-> verified or regressed
 ```
 
-Completion requires verification against the same class of signal that created the item.
+## Lifecycle
 
-## Inputs
+```text
+open      -> accepted | rejected
+accepted  -> open | shipped | rejected
+shipped   -> verified | regressed
+regressed -> accepted | rejected
+rejected  -> open
+verified  -> regressed
+```
 
-- production incidents
-- backend exceptions
-- browser exceptions
-- deploy failures
-- stuck workflow jobs
-- site canary failures
-- agent tool failures
-- repeated validation misses
-- operator `/doh` marks
-- weekly trend summaries
+Every transition records deterministic transition ID, previous/new state, monotonic revision, expected revision, derived actor identity, rationale, request ID, and evidence. State-changing writes use compare-and-swap semantics. Current state is a projection, not an in-place source of truth.
 
-## Outputs
+Only the verification engine may emit `verified` or `regressed`; 1.0 has no operator override. `request-verification` schedules an observation but cannot choose the result.
 
-- MCP queryable feedback
-- repo `.milhouse/FEEDBACK.md`
-- repo `.milhouse/AGENT_FEEDBACK.md`
-- repo `.milhouse/TEAM_WORKFLOW.md`
-- GitHub issues when configured
-- Telegram weekly summary
-- postmortem report
+## Surfaces
+
+- bounded CLI and local MCP reads;
+- explicitly enabled narrow feedback writes;
+- generated `.milhouse/FEEDBACK.md` and `AGENT_FEEDBACK.md`;
+- human-owned `.milhouse/TEAM_WORKFLOW.md`, created only when absent;
+- opt-in GitHub Issue and Telegram summaries that never decide verification state.
 
 ## `/doh`
 
-`/doh` means the previous work set missed intent while being treated as complete.
-
-Milhouse should investigate:
-
-- user prompt clarity
-- requirements and status docs
-- agent plan and execution
-- validation evidence
-- production or workflow signals
-- what was assumed
-- what was skipped
-- what would prevent recurrence
-
-The operator is assumed to be in scope alongside every agent and process step.
+`/doh` requests a neutral postmortem when completed work missed intent. Operator input, requirements, planning, agent behavior, implementation, validation, documentation, and workflow all remain in scope. Evidence is bounded and treated as untrusted data; personal/profanity heuristics are prohibited.

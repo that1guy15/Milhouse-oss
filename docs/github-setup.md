@@ -1,77 +1,38 @@
-# GitHub Setup
+# GitHub Repository Controls
 
-The intended GitHub repository is:
+Repository settings are external state and require owner authorization. This page records the required end state; it does not claim that a setting is currently enabled. Evidence belongs in `docs/implementation-status.md`.
 
-```text
-https://github.com/that1guy15/Milhouse-oss.git
-```
+Repository: `that1guy15/Milhouse-oss`
+Default branch: `main`
 
-## Current Private-First Setup
+## Required controls
 
-Create the repo as private first, push the starter tree, enable GitHub security features, then make public after review.
+- Issues, pull requests, and private vulnerability reporting enabled.
+- Discussions optional; every template warns against real telemetry or credentials.
+- Secret scanning and push protection enabled.
+- Dependabot alerts/updates, dependency review, and CodeQL enabled by W17.
+- Actions permitted only from the checked-in `.github/workflows/` definitions.
+- Default workflow token permissions read-only; per-job elevation only.
+- Protected release environment with required owner approval and PyPI Trusted Publishing.
 
-Recommended settings:
+## Branch protection
 
-- Issues enabled.
-- Pull requests enabled.
-- Discussions enabled.
-- Wiki optional and disabled by default because OpenWiki docs live in-repo.
-- GitHub Actions enabled after workflow files are activated.
-- Secret scanning enabled.
-- Default branch: `main`.
-- `main` protected with pull request review required.
-- CODEOWNERS requires `@that1guy15` review.
+`main` must require:
 
-## Activating GitHub Actions
+- pull request before merge;
+- aggregate `required-ci` plus all release-plan security/integration dependencies;
+- resolved conversations and dismissal of stale approval;
+- eligible CODEOWNER approval for non-owner changes;
+- a recorded independent reviewer for owner-authored changes until a second CODEOWNER is appointed;
+- DCO sign-off check;
+- no force push or branch deletion.
 
-The workflow templates live in:
+The review path must be tested with a non-production pull request. Do not configure an impossible self-review requirement.
 
-```text
-ops/github/workflows/
-```
+## Workflow source
 
-To activate them, copy them into:
+`.github/workflows/` is the only workflow source. Stale copies under `ops/github/workflows/` were removed in W00. W01/W17 replace the starter workflows with least-privilege, full-SHA-pinned CI and release workflows.
 
-```text
-.github/workflows/
-```
+## Private reporting evidence
 
-The GitHub token used for that commit needs the `workflow` scope. With GitHub CLI:
-
-```bash
-gh auth refresh -h github.com -s workflow
-mkdir -p .github/workflows
-cp ops/github/workflows/*.yml .github/workflows/
-git add .github/workflows
-git commit -m "ci: activate GitHub workflows"
-git push
-```
-
-Once activated, branch protection should require the `test` and `gitleaks` checks to pass before merge.
-
-## Branch Protection
-
-`main` should require:
-
-- pull requests before merge
-- at least one approving review
-- CODEOWNERS review
-- stale review dismissal after new commits
-- resolved conversations
-- status checks when Actions are active
-- no force pushes
-- no branch deletion
-
-## Repository Metadata
-
-Suggested description:
-
-```text
-Local-first observability and feedback loops for AI-assisted engineering teams
-```
-
-Suggested topics:
-
-```text
-observability, ai-agents, clickhouse, mcp, devtools, operations, feedback-loop
-```
+After owner authorization, enable GitHub Private Vulnerability Reporting and create a draft synthetic report without submitting real sensitive data. Record the setting URL, date, actor, and draft result in implementation status. Until then, G00 remains externally pending.

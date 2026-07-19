@@ -1,6 +1,10 @@
 title: "[Idea] "
 labels: ["discussion: idea"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Use synthetic examples only. Do not include credentials, real telemetry, private paths, raw agent content, generated reports, or user/customer data.
   - type: textarea
     id: idea
     attributes:

@@ -1,0 +1,181 @@
+# Milhouse OSS Implementation Status
+
+This file is the durable execution ledger for the
+[authoritative implementation plan](implementation-plan.md). It records gate
+status and evidence; it does not amend the plan.
+
+## Current snapshot
+
+| Field | Value |
+|---|---|
+| Snapshot date | 2026-07-18 |
+| Product phase | **Pre-alpha; not released and not ready for production use** |
+| Plan | Version 1.0, approved for implementation by the owner on 2026-07-18 |
+| Target release | Milhouse OSS 1.0 |
+| Working branch | `codex/build-milhouse-v1` |
+| Git state | `codex/build-milhouse-v1` is anchored to the audited public `origin/main` commit; no W00 implementation commit exists yet |
+| Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
+| Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
+| External publication | Not authorized; no push, tag, package publication, announcement, or live-provider call is implied by build approval |
+| Highest passed gate | None |
+| Active package | W00 — Repository, authority, governance, and ADRs |
+
+The audited public baseline is the source scaffold. The private baseline is a
+read-only behavior and algorithm donor. Its history, configuration, telemetry,
+generated data, private fixtures, and private documentation must never enter
+this repository. See [provenance.md](provenance.md).
+
+Read-only GitHub API evidence captured 2026-07-18: the repository is public,
+unarchived, and uses protected `main`; Issues and Discussions are enabled;
+secret scanning, push protection, and Dependabot security updates are enabled;
+Private Vulnerability Reporting is disabled. `main` requires `test` and
+`gitleaks`, one approval, CODEOWNER review, last-push approval, stale-review
+dismissal, and admin enforcement. This evidence records state only and did not
+change any GitHub setting.
+
+## Status and evidence rules
+
+The only package states are:
+
+- **Pending** — dependencies or deliverables are incomplete; work may not be
+  claimed as accepted.
+- **In progress** — implementation is active, but the gate has not passed.
+- **Externally pending** — all in-scope engineering evidence is ready, but a
+  named owner/reviewer/host/elapsed-time action is still required.
+- **Blocked** — a plan stop condition applies. Record the exact condition and
+  the needed amendment or authority.
+- **Passed** — every gate assertion has current, reviewable evidence and no
+  mandatory check is skipped.
+
+A passing entry must record all of the following in this file or in a linked,
+immutable evidence record:
+
+1. the exact commit and installed artifact hash where applicable;
+2. commands and exit results, including required tests and scans;
+3. the operating system, Python, Docker, and ClickHouse versions where relevant;
+4. migration/schema/config/API versions exercised;
+5. failure-injection or recovery evidence required by the gate;
+6. any independent review and owner authorization;
+7. open defects and their severity/disposition; and
+8. the date and accountable reviewer who accepted the result.
+
+Skipped tests, fixture-only provider behavior presented as live compatibility,
+placeholder commands, and unverified external settings are not passing
+evidence. A later regression returns the affected gate to **In progress**.
+
+## Work-package ledger
+
+| Package | Depends on | State | Gate evidence required before `Passed` | External owner/reviewer action |
+|---|---|---|---|---|
+| W00 — authority, governance, ADRs | Owner plan approval | **Externally pending** | Clean public baseline; correct branch; pre-alpha claims; plan-aligned ADR index; provenance, privacy, threat model, governance, support, and usable review path | Local evidence is complete; E01 private reporting and E02 repository review controls must be applied/tested by the owner |
+| W01 — package and quality toolchain | G00 | Pending | Clean-clone install; wheel/sdist install; CLI help/version; resource inventory; required CI; planted-secret negative test | E02 branch rules make aggregate `required-ci` mandatory |
+| W02 — domain, config, identity, privacy | G01 | Pending | Strict examples/schema; cross-process deterministic IDs; adversarial no-secret egress tests; critical branch coverage | None beyond review |
+| W03 — SQLite, spool, replay, retention | G02 | Pending | Every durable-write kill point; concurrency; corruption recovery; replay of 10,000 records twice; permissions; privacy-expiry behavior | Access to a supported local filesystem/host if not available to engineering |
+| W04 — ClickHouse and recovery | G02; G04b also requires G03 | Pending | G04a auth/migrations/checksums; G04b idempotent delivery, 24-hour simulated outage drain, and verified native restore | Docker-capable supported host if not available to engineering |
+| W05 — runtime/canary vertical slice | G03 and G04 | Pending | Full canary-to-query slice; ClickHouse outage behavior; exact-once logical drain; alert transition cases | None beyond review |
+| W06 — initialization, CLI, demo | G05 | Pending | Nonexpert clean-host flow; idempotent init; credential-free spool demo; health exit codes; installed/source parity | E06 clean-host evidence where engineering lacks the host |
+| W07 — file/authenticated ingestion | G05 | Pending | Incremental outbox behavior; acknowledged rotation; P1 detection for unread loss; bounded/replay-safe receiver; offline CI | Owner acknowledgement is required before any non-loopback receiver test |
+| W08 — feedback and verification | G07 | Pending | Complete transition matrix; claim cannot verify; idempotent curation; SQLite/ClickHouse parity; verified/regressed synthetic stories | None beyond review |
+| W09 — query, reports, repo briefs | G08 | Pending | Metric-window correctness; path/symlink security; bounded/degraded reports; deterministic safe rendering | A configured application repository may be supplied for a final sandbox smoke; fixtures remain the CI basis |
+| W10 — MCP | G09 | Pending | Official-client conformance; read-only default; bounded/privacy-filtered results; dual write enablement and idempotent audit | Local client smoke may require owner-provided supported client environment |
+| W11 — `/doh` postmortems | G08 and G10 | Pending | Neutral evidence model; all required contributors in scope; untrusted rendering; missing-evidence and scenario tests | None beyond review |
+| W12 — provider collectors | G05 | Pending | Per-provider fixture, pagination/rate/cursor/drift/privacy tests; no overlap inflation; least-privilege docs | E04 owner-authorized sandbox smoke is required before each adapter is labelled supported; otherwise it remains experimental |
+| W13 — agent summaries/traces | G05 and G08 | Pending | Disabled default; idempotent incremental parse; visible drift; planted prompt/PII/secret absent from every persistence/egress surface | E04 owner-authorized format smoke is needed for a current supported-label claim |
+| W14 — notifications/action sinks | G09 and G12 | Pending | Disabled default; redacted dry run; idempotent retry; safe Markdown; no secret/audit leakage; issue closure cannot verify | E04 separately authorizes each sandbox Telegram/GitHub write smoke; no production destination is assumed |
+| W15 — scheduler/services | G06, G08, G09, G11, G12, G13, G14 | Pending | Lease exclusion; restart/replay; independent failure containment; freshness; generic service-template clean-host tests | E06 macOS/Ubuntu service-template hosts where unavailable to engineering |
+| W16 — import/recovery/lifecycle | G03, G04, G09, G15 | Pending | Read-only/idempotent legacy import; clean-host point-in-time restore; upgrade/rollback; explicit destructive confirmation; RPO/RTO | E06 clean-host restore hosts; any real private legacy source remains owner-controlled and is never required by CI |
+| W17 — docs/release hardening | G10–G16 | Pending | All doc/config/skill checks; exact artifact contents; installed workflows; scans; SBOM/provenance; no P0/P1 | E01, E02, E03, E05, E06, and E08 protected-release settings/approvals |
+| W18 — performance/soak/RC | G17 | Pending | Fixed-seed benchmarks; platform/recovery drills; 7/14/7-day soaks; two independent clean hosts; exact RC artifacts; no P0/P1 | E06 hosts, E07 elapsed environment, E05 review, and E08 RC/publish decisions |
+
+“Pending” above means “not accepted”; it does not prohibit dependency-safe
+preparatory work allowed by the plan. Dependencies and gates remain normative.
+
+## W00 evidence checklist
+
+| W00 item | Status at this snapshot | Evidence or remaining work |
+|---|---|---|
+| Owner approved plan 1.0 | Complete | Build instruction received 2026-07-18; external mutation remains separately controlled |
+| Workspace uses audited public baseline without private history | Complete | Local branch parent and `origin/main` both resolve to `fb81a7faf2c101e8bb3f08ef9120d82c2b20600b`; only public history is present and private history was never imported |
+| Branch `codex/build-milhouse-v1` | Complete | `git branch --show-current` observed locally on 2026-07-18 |
+| Plan retained and status ledger created | Complete | [implementation-plan.md](implementation-plan.md) and this file |
+| Locked decisions ratified by ADRs | Complete | `docs/adr/README.md` indexes 14 Accepted ratifications; local link/plan-anchor validation passed |
+| README is truthful pre-alpha | Complete | README labels the current command/config/deployment as scaffold and gates every planned capability |
+| Privacy contract | Complete as a W00 document | [../PRIVACY.md](../PRIVACY.md); implementation guarantees are not claimed operational until their gates pass |
+| Threat/data inventory | Complete as a W00 document | [threat-model.md](threat-model.md); implementation controls still require their owning tests |
+| Governance and DCO | Complete as a W00 document | [../GOVERNANCE.md](../GOVERNANCE.md); DCO enforcement/review settings remain E02 |
+| Support policy | Complete as a W00 document | [../SUPPORT.md](../SUPPORT.md) |
+| Provenance inventory | Complete as a W00 document | [provenance.md](provenance.md); update per adapted donor file |
+| Private vulnerability path | Externally pending | Read-only GitHub API check on 2026-07-18 returned `enabled: false`; E01 requires owner authorization to enable and test it |
+| Merge/review path | Externally pending | Live `main` protection requires `test`, `gitleaks`, one approval, CODEOWNER review, last-push approval, stale dismissal, and admin enforcement. Only `@that1guy15` is named, so E02 requires a second trusted reviewer/CODEOWNER or an owner-approved temporary rule change |
+| Apache-2.0 ownership/provenance and DCO | Complete for W00 | Apache-2.0 retained; DCO policy and sign-off workflow documented; donor ledger records no private expression imported. Independent release review remains E05 for G17/G18 |
+| Stale private-first/duplicate workflow instructions removed | Complete | Canonical workflows remain only under `.github/workflows`; stale `ops/github/workflows` copies/instructions removed; OpenWiki marked optional/noncanonical |
+
+G00 is **not passed** until every W00 row is complete and the plan/ADR index,
+merge path, public tree, and private-reference boundary are reviewed together.
+
+## W00 local validation evidence — 2026-07-18
+
+- Branch `codex/build-milhouse-v1`, `HEAD`, and `origin/main` were verified at
+  public baseline `fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` before the W00
+  commit.
+- `make test`: passed (`1 passed` against the imported scaffold).
+- `make docs-check`: passed.
+- `make skill-check`: passed.
+- `make secret-scan`: passed using the repository's current lightweight
+  fallback because local `gitleaks` is not installed; W01 must make the scanner
+  fail closed and G17 still requires full-history gitleaks/independent scans.
+- Targeted current-tree and full-public-history scans found no private personal
+  label/path or credential-shaped value. The only `Tokru` match is the explicit
+  prohibited-donor example in the authoritative plan.
+- All checked-in TOML/JSON and GitHub YAML parsed successfully.
+- `git diff --check`, ADR file/link/plan-anchor validation, and the
+  duplicate-workflow absence checks passed.
+- No private donor command wrote to the donor tree, and no private history,
+  configuration, fixture, telemetry, report, or source file was imported.
+
+Local W00 engineering is complete. G00 remains externally pending solely on
+E01 and E02; W01 must not be claimed passed until those dependencies are
+resolved.
+
+## External action register
+
+These actions cannot be inferred from “build it.” Engineering must prepare the
+exact request/evidence, and the named owner must authorize or perform it.
+
+| ID | Earliest gate | Accountable actor | Required action and evidence | Current state |
+|---|---|---|---|---|
+| E01 | G00/G17 | Repository owner | Enable GitHub private vulnerability reporting and demonstrate a private test report can reach the designated security reviewer without publishing sensitive content | Confirmed disabled by read-only API on 2026-07-18; awaiting owner authorization |
+| E02 | G00/G01/G17 | Repository owner | Apply CODEOWNERS and branch protection to the intended repository; require aggregate `required-ci`; disallow an unreviewable owner-only path; verify an owner-authored PR can be independently approved | Current protected `main` is unreviewable for its sole CODEOWNER's own changes; awaiting second reviewer or approved rule revision |
+| E03 | Before first public package/tag | Project owner | Verify project/distribution-name availability and complete any desired trademark/legal review; approve a plan amendment if names change | Pending |
+| E04 | G12–G14 | Operator/project owner | Supply sandbox-only credentials and explicitly authorize each live provider/session-format/notification/action call; approve the redacted destination and retain the smoke record | Pending; fixture work may proceed |
+| E05 | G17/G18 | Project owner and independent reviewer | Select an independent reviewer for security, provenance, package contents, and release evidence; record reviewer identity, scope, findings, fixes, and acceptance | Pending |
+| E06 | G06/G15–G18 | Project owner/host owner | Supply or authorize required clean macOS 14/latest and Ubuntu 22.04/24.04 hosts when engineering cannot; retain exact environment and artifact-hash evidence | Pending until needed |
+| E07 | G18 | Project owner/elapsed monitor | Keep the approved environment available for the 7-day alpha, 14-day beta, and 7-day RC soaks; preserve continuity evidence and respond to monitor alerts | Pending |
+| E08 | G17/G18/release | Project/release owner | Separately authorize remote push, protected release environment, signed tag/build, Trusted Publishing, GitHub Release, public visibility, and announcement. Approval for one step does not imply the next | Pending; no external mutation authorized |
+| E09 | Release completion | Project owner/release monitor | Authorize public-registry installs, announcement only after verification, and at least 72 hours of post-publication monitoring | Pending |
+
+## Defects, amendments, and stop conditions
+
+No defects or plan amendments are recorded at this initial snapshot.
+
+Add each discovered issue with severity P0–P3, owner, affected gates,
+reproduction/evidence, and disposition. Stop only the affected workstream when a
+locked privacy guarantee is infeasible, donor ownership is uncertain, a safe
+reversible migration cannot be designed, or a change would materially expand
+external writes, hosted operation, raw-content handling, or multi-tenancy.
+
+## Update procedure
+
+For every package:
+
+1. Set it to **In progress** only after its dependencies permit work.
+2. Link the implementation commit, tests, docs, and gate command output.
+3. Record all open defects and external evidence separately.
+4. Have CI or an independent reviewer evaluate the exact candidate.
+5. Mark **Passed** only when every gate clause is satisfied.
+6. Update the highest-passed gate and current snapshot without rewriting prior
+   evidence; retain superseded evidence as dated history or immutable links.
+
+Engineering completion, release-candidate readiness, and release completion are
+three distinct outcomes. G18 can produce a release evidence packet; it does not
+authorize or claim publication.

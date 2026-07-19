@@ -1,36 +1,12 @@
-# OpenWiki
+# Generated documentation
 
-Milhouse should support both human docs and agent-readable generated documentation.
+Human-maintained Markdown under `docs/` and the generated MkDocs Material site are canonical for Milhouse 1.0. Agent instruction files and skills stay concise and link to those docs.
 
-Recommended layers:
+OpenWiki is optional and noncanonical. It is excluded from release gates unless its workflow is explicitly reviewed to prove that it:
 
-1. Human docs in `docs/`.
-2. Agent instructions in `AGENTS.md`, `CODEX.md`, `CLAUDE.md`, and `skills/`.
-3. Generated wiki material in `openwiki/`.
+- sends no private repository data, telemetry, credentials, local paths, or raw agent content to an unintended service;
+- generates only into a declared path without overwriting canonical source;
+- is reproducible and version-pinned;
+- labels generated material and links back to canonical versioned docs.
 
-## OpenWiki Usage
-
-OpenWiki can generate and maintain repo documentation for agents:
-
-- https://github.com/langchain-ai/openwiki
-- https://www.langchain.com/blog/introducing-openwiki-an-open-source-agent-for-repo-documentation
-
-Suggested workflow after implementation files exist:
-
-```bash
-openwiki --init
-openwiki generate
-```
-
-Do not include private telemetry, generated reports, raw traces, `.env`, or private overlays in generated docs.
-
-## Alternatives To Evaluate
-
-- MkDocs Material for human docs.
-- GitHub Pages for hosted public docs.
-- DeepWiki-style generated repo explanations for external readers.
-- Custom MCP docs index for agents.
-
-## Docs Rule
-
-Do not make `AGENTS.md`, `CODEX.md`, or `CLAUDE.md` huge. Keep them short and link to deeper docs.
+Do not run or configure an OpenWiki workflow as part of normal setup. W17 may remove the remaining `openwiki/` scaffold if no safe, maintained workflow is justified.

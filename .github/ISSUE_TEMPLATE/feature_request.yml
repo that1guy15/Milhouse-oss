@@ -3,6 +3,10 @@ description: Propose a new Milhouse capability or integration.
 title: "[Feature]: "
 labels: ["type: feature", "needs triage"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach credentials, real telemetry, private paths, raw agent content, generated reports, or customer/user data. Use synthetic examples only.
   - type: textarea
     id: problem
     attributes:
@@ -28,4 +32,4 @@ body:
       options:
         - label: This can work with fake fixtures and without live credentials.
         - label: This keeps local-first behavior.
-        - label: This does not require storing raw agent transcripts by default.
+        - label: This does not require storing raw prompts, responses, transcripts, or tool output.

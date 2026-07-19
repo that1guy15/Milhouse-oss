@@ -1,6 +1,10 @@
 title: "[Show and tell] "
 labels: ["discussion: show-and-tell"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Share public-safe architecture only. Do not include credentials, real telemetry, private paths, raw agent content, generated reports, or user/customer data.
   - type: textarea
     id: setup
     attributes:

@@ -1,55 +1,67 @@
-# Contributing To Milhouse
+# Contributing to Milhouse
 
-Thanks for helping build Milhouse.
+Milhouse handles operational evidence and agent-workflow summaries. Correctness, privacy, durability, and reproducibility take priority over feature speed.
 
-Milhouse handles operational data, agent traces, and feedback loops, so contribution quality is measured by correctness, privacy, and reproducibility as much as feature speed.
+## Current project state
 
-## Development Setup
+Milhouse is pre-alpha and is being built through the gates in `docs/implementation-plan.md`. Before implementing a change, identify its owning work package and preserve every locked public, storage, privacy, and migration contract.
+
+## Development setup
+
+The supported contributor setup will be finalized in W01. For the current scaffold:
 
 ```bash
 ./setup.sh
 make test
 make docs-check
 make skill-check
+make secret-scan
 ```
 
-## Contribution Rules
+Do not use live provider credentials or production data in tests. Use synthetic fixtures and deterministic clocks.
+
+## Contribution rules
 
 - Keep examples generic and fake.
-- Do not commit `.env`, generated reports, JSONL spools, ClickHouse data, raw agent transcripts, or private incident details.
-- Prefer config-driven providers over hardcoded service names.
-- Keep local-first behavior working.
-- Add or update tests when changing collectors, schema, feedback lifecycle, MCP tools, or redaction.
-- Update docs when changing commands, config, or agent workflows.
+- Never commit credentials, telemetry, JSONL spools, ClickHouse data, generated reports, private incidents, raw prompts/responses/transcripts/tool output, or private paths.
+- Keep the private donor repository read-only. Record any intentional algorithm/code adaptation in `docs/provenance.md`.
+- Preserve local-first, spool-before-export behavior.
+- Keep collectors config-driven and bounded.
+- Write only to explicitly configured Milhouse state and application `.milhouse/` directories.
+- Add tests and documentation with every behavior or interface change.
+- Use a numbered plan amendment before changing a locked contract.
 
-## Pull Request Checklist
+## Developer Certificate of Origin
 
-- Tests pass.
-- Docs checks pass.
-- Skills validate.
-- Config examples parse.
-- No private domains, account IDs, tokens, local paths, or generated telemetry are present.
-- Any new collector has fixture tests.
-- Any new alert or feedback rule documents threshold behavior and false-positive handling.
-- Pull requests target `main` and require maintainer review before merge.
-- CODEOWNERS requires `@that1guy15` review for repository-wide changes.
+Milhouse uses the [Developer Certificate of Origin 1.1](https://developercertificate.org/), not a CLA. Every commit must include a `Signed-off-by` trailer certifying that the contributor has the right to submit it:
 
-## Community Channels
-
-- Use Issues for actionable bugs, features, docs gaps, and integration requests.
-- Use Discussions for architecture questions, design tradeoffs, ideas, and show-and-tell posts.
-- Use private security reporting for credentials, telemetry exposure, or privacy bugs.
-
-## Commit Style
-
-Use concise conventional-style commits when possible:
-
-```text
-feat(collector): add generic workflow status collector
-fix(redaction): mask bearer tokens in browser traces
-docs(agent): describe Codex feedback workflow
+```bash
+git commit -s -m "feat(component): describe the change"
 ```
 
-## Security Issues
+The sign-off name and email must identify the contributor. Pull requests containing unsigned commits cannot merge until the commits are corrected.
 
-Do not open public issues for security or privacy leaks. Follow [SECURITY.md](SECURITY.md).
+## Pull requests
+
+Pull requests target `main` and require:
+
+- passing aggregate `required-ci` and all protected security/integration checks once W17 installs them;
+- at least one approval from an eligible CODEOWNER who did not author the change;
+- resolved review threads;
+- no P0/P1 defect or privacy/provenance uncertainty;
+- plan/status/documentation updates when applicable.
+
+Until a second maintainer is appointed, owner-authored changes require an explicitly recorded independent reviewer in the pull request rather than self-approval. Repository settings and the effective review path are evidence for G00/G17.
+
+## Before opening a pull request
+
+- [ ] Tests, docs checks, skill checks, and secret scans pass.
+- [ ] New collectors have synthetic success, error, rate-limit, drift, and redaction fixtures.
+- [ ] Public commands/config/schema changes match the implementation plan.
+- [ ] No private identifiers, real telemetry, credentials, or generated state are present.
+- [ ] Reused donor behavior is listed in `docs/provenance.md`.
+- [ ] Commits contain DCO sign-off.
+
+## Security and privacy reports
+
+Do not place vulnerability details, leaked values, or private telemetry in a public issue. Follow [SECURITY.md](SECURITY.md).

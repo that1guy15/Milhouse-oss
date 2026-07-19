@@ -1,37 +1,35 @@
 # Publication Checklist
 
-Use this before pushing or making the repository public.
+Publication is not authorized by a source-build instruction. Use this checklist only after G18 and explicit owner approval. The authoritative requirements are in sections 12-14 of `docs/implementation-plan.md`.
 
-## Local Tree
+## Source and privacy
 
-- [ ] `git status --short` reviewed.
-- [ ] `.env` is ignored and untracked.
-- [ ] `.mcp.json` is ignored and untracked.
-- [ ] `spool/`, `data/`, `logs/`, `reports/generated/`, and `.milhouse/` are ignored and untracked.
-- [ ] Config examples use fake domains and env var names.
-- [ ] Docs do not include private incidents, private paths, account IDs, RUM tags, tokens, or raw traces.
+- [ ] W00-W18 evidence is complete and `release-candidate-ready`.
+- [ ] Git tree and full history contain no credentials, private identifiers, paths, telemetry, state, reports, raw agent content, or unreviewed donor material.
+- [ ] Donor provenance is complete and independently reviewed.
+- [ ] Config, fixtures, docs, issues, and examples are synthetic and provider-neutral.
+- [ ] Privacy/threat-model inventories have no unknown owner, classification, egress, or retention.
 
-## Validation
+## Quality and recovery
 
-- [ ] `make test`
-- [ ] `make docs-check`
-- [ ] `make skill-check`
-- [ ] `make secret-scan`
-- [ ] `gitleaks detect --source .`
-- [ ] `trufflehog filesystem .`
+- [ ] Aggregate required CI, integration, security, packaging, docs, compatibility, performance, and soak gates pass on the exact release commit.
+- [ ] Acknowledged-record crash/replay guarantees and clean-host backup/restore/upgrade/rollback drills pass.
+- [ ] No P0/P1 defect is open; every P2 has a recorded disposition.
+- [ ] Independent security, provenance, workflow, and package-content review is signed.
 
-## GitHub
+## Repository and supply chain
 
-- [ ] Remote points to the intended repository.
-- [ ] GitHub secret scanning is enabled.
-- [ ] Branch protection is configured.
-- [ ] GitHub Actions workflows are activated from `ops/github/workflows/` after `workflow` scope is available.
-- [ ] CI is passing.
-- [ ] Issues and PR templates are present.
-- [ ] Repository is private until final review is complete.
+- [ ] Private vulnerability reporting is enabled and test-drafted.
+- [ ] Branch protection, CODEOWNERS, DCO, and independent review path are operational.
+- [ ] All Actions are pinned to full commit SHAs with least-privilege permissions.
+- [ ] Secret scanning/push protection, CodeQL, dependency review, Dependabot, container scan, and license policy are active.
+- [ ] Signed immutable tag, protected release environment, and PyPI Trusted Publishing are configured.
+- [ ] Wheel/sdist are built once, tested unchanged, inventoried, hashed, and accompanied by SBOM/provenance.
 
-## Approval
+## Authorized publication
 
-- [ ] Owner approves public release.
-- [ ] Final diff reviewed by a security-focused agent.
-- [ ] README quickstart verified from a fresh clone.
+- [ ] Owner separately approves protected tag/build and publication.
+- [ ] Exact `1.0.0` artifacts publish through Trusted Publishing and GitHub Release.
+- [ ] Public PyPI installation, spool-only/full demos, MCP reads, upgrade, backup, and restore pass on clean macOS and Ubuntu.
+- [ ] Announcement follows verification, not publication alone.
+- [ ] Seventy-two-hour post-publication monitoring completes without an unresolved release blocker.
