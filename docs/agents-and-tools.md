@@ -6,9 +6,16 @@ The current repository is pre-alpha. Tool names and schemas are normative only i
 `docs/implementation-plan.md`; skills must not advertise product behavior before its work-package
 gate passes.
 
-Authority flows from the implementation plan to accepted ADRs, `AGENTS.md`, project skills, and then
-thin host pointers. `docs/implementation-status.md` supplies current evidence and external authority.
-No skill may override a higher-level contract.
+Authority flows in this exact order:
+
+1. `docs/implementation-plan.md` — normative Milhouse 1.0 contract.
+2. Accepted ADRs — plan-consistent decisions.
+3. `docs/implementation-status.md` — current gate evidence and external authority.
+4. `AGENTS.md` — canonical repository workflow and safety boundary.
+5. Project skills — task-specific procedures.
+6. Host pointer files — runtime-specific discovery only.
+
+No instruction or skill may override a higher-level contract.
 
 ## Repository skills
 

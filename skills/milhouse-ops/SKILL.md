@@ -1,6 +1,6 @@
 ---
-name: milhouse-ops
-description: Build, debug, and validate Milhouse internals against the authoritative W00-W18 plan. Use for implementation or diagnosis involving configuration, privacy, collectors, storage, runtime, CLI, ingestion, feedback, query, MCP, providers, scheduler, recovery, tests, or performance. Not for app-repository feedback consumption, independent gate review, learning capture, or release administration.
+name: "milhouse-ops"
+description: "Build, debug, and validate Milhouse internals against the authoritative W00-W18 plan. Use for implementation or diagnosis involving configuration, privacy, collectors, storage, runtime, CLI, ingestion, feedback, query, MCP, providers, scheduler, recovery, tests, or performance. Not for app-repository feedback consumption, independent gate review, learning capture, or release administration."
 ---
 
 # Milhouse Ops
@@ -35,7 +35,8 @@ administration.
 7. Run targeted tests, then the package gate and repository validation.
 8. Update truthful documentation and evidence. Do not mark a gate passed before an independent
    `milhouse-gate-review` reports no unresolved P0/P1 findings and all required evidence exists.
-9. Invoke `milhouse-compound` only when a verified reusable lesson should be preserved.
+9. Invoke `milhouse-compound` only when explicitly requested and a verified reusable lesson should
+   be preserved.
 
 Read `references/execution-contract.md` when planning delegation, debugging, or evidence capture.
 

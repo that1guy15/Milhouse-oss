@@ -19,8 +19,10 @@ Publication is not authorized by a source-build instruction. Use this checklist 
 
 ## Repository and supply chain
 
-- [x] Private vulnerability reporting is enabled and test-drafted; third-party delivery is rechecked
-      with the independent G17 reviewer.
+- [x] Private vulnerability reporting is enabled and the administrator-side synthetic draft
+      create/read/close path was tested without publication.
+- [ ] Third-party reporter-to-reviewer delivery is tested with the independent G17 reviewer and
+      recorded in E01/E05.
 - [ ] Branch protection, CODEOWNERS, DCO, and independent review path are operational.
 - [ ] All Actions are pinned to full commit SHAs with least-privilege permissions.
 - [ ] Secret scanning/push protection, CodeQL, dependency review, Dependabot, container scan, and license policy are active.

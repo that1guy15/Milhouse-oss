@@ -1,6 +1,6 @@
 ---
-name: milhouse-oss-maintainer
-description: Maintain the public Milhouse repository and delivery path. Use for sanitization, provenance and license review, DCO commits, GitHub pull requests and checks, packaging, artifact inventory, release-readiness evidence, or separately authorized merge, tag, and publication steps. Not for implementing internals, independent review, app feedback, or learning capture.
+name: "milhouse-oss-maintainer"
+description: "Maintain the public Milhouse repository and delivery path. Use for sanitization, provenance and license review, DCO commits, GitHub pull requests and checks, packaging, artifact inventory, release-readiness evidence, or separately authorized merge, tag, and publication steps. Not for implementing internals, independent review, app feedback, or learning capture."
 ---
 
 # Milhouse OSS Maintainer

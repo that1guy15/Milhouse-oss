@@ -1,6 +1,6 @@
 ---
-name: milhouse-compound
-description: Capture one verified, reusable Milhouse engineering learning in sanitized project documentation. Use only when explicitly asked to compound, document, or preserve a solved problem or pattern after verification. Never search raw agent sessions or persist prompts, responses, transcripts, tool output, telemetry, or private donor material.
+name: "milhouse-compound"
+description: "Capture one verified, reusable Milhouse engineering learning in sanitized project documentation. Use only when explicitly asked to compound, document, or preserve a solved problem or pattern after verification. Never search raw agent sessions or persist prompts, responses, transcripts, tool output, telemetry, or private donor material."
 ---
 
 # Milhouse Compound

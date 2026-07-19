@@ -1,6 +1,6 @@
 ---
-name: milhouse-feedback
-description: Consume and act on Milhouse-produced feedback in an application repository. Use for `.milhouse` briefs, available local MCP feedback results, verified operational signals, or postmortem follow-up after the owning Milhouse gates pass. Not for changing Milhouse internals, reviewing its pull requests, or capturing maintainer learnings.
+name: "milhouse-feedback"
+description: "Consume and act on Milhouse-produced feedback in an application repository. Use for `.milhouse` briefs, available local MCP feedback results, verified operational signals, or postmortem follow-up after the owning Milhouse gates pass. Not for changing Milhouse internals, reviewing its pull requests, or capturing maintainer learnings."
 ---
 
 # Milhouse Feedback

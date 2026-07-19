@@ -110,7 +110,7 @@ preparatory work allowed by the plan. Dependencies and gates remain normative.
 | Governance and DCO | Complete as a W00 document | [../GOVERNANCE.md](../GOVERNANCE.md); solo-maintainer pull-request/check policy recorded and applied. Automated DCO enforcement is a W01/W17 control |
 | Support policy | Complete as a W00 document | [../SUPPORT.md](../SUPPORT.md) |
 | Provenance inventory | Complete as a W00 document | [provenance.md](provenance.md); update per adapted donor file |
-| Five-skill engineering workflow | In progress | Owner approved process amendment A01 on 2026-07-19. ADR 0015 pins `EveryInc/compound-engineering-plugin@8163a96e86656a89797869ac61905fe4641f81be` as a concept-only MIT reference and defines five Milhouse-native skills, discovery aliases, read-only review, sanitized learning, and authority guardrails. Static and five-skill fresh-agent validation passed. Gate re-review found both prior P2s resolved and no new P0-P2. DCO commit and exact-head hosted checks remain |
+| Five-skill engineering workflow | In progress | Owner approved process amendment A01 on 2026-07-19. ADR 0015 pins `EveryInc/compound-engineering-plugin@8163a96e86656a89797869ac61905fe4641f81be` as a concept-only MIT reference and defines five Milhouse-native skills, discovery aliases, read-only review, sanitized learning, and authority guardrails. Static and five-skill fresh-agent validation passed. Supplemental pre-merge audits identified seven P2 validation/evidence defects; all seven corrections and negative regressions are staged, with no P0/P1 identified. DCO commit and exact-head hosted checks remain |
 | Private vulnerability path | Complete for G00 | API read-back returned `enabled: true`. The private-report endpoint returned the documented HTTP 403 for the sole repository administrator; GitHub directs administrators to create a draft advisory instead. A clearly marked low-severity synthetic draft was created at 14:41:07Z, read back as private draft, and closed at 14:41:22Z with `published_at: null`, no CVE, no private fork, and zero remaining triage reports. A true third-party delivery smoke is deferred to E05/G17 when an independent reviewer exists |
 | Merge/review path | Complete | Owner authorized solo-maintainer merges on 2026-07-19. Live protection retains PRs, strict `test`/`gitleaks`, admin enforcement, no force-push/deletion, with zero approvals and no impossible CODEOWNER/last-push self-review. PR #1 is mergeable and both protected checks passed at evidence head `11652eff2ec46f9c895c41a1c1a16aa28eac70b8` |
 | Apache-2.0 ownership/provenance and DCO | Complete for W00 | Apache-2.0 retained; DCO policy and sign-off workflow documented; donor ledger records no private expression imported. Independent release review remains E05 for G17/G18 |
@@ -162,6 +162,15 @@ merge path, public tree, and private-reference boundary are reviewed together.
 - The first A01 gate review returned two P2 findings: static CI had been conflated with behavioral
   evidence, and W00 was incorrectly labelled externally pending. Both were corrected. Read-only
   re-review found no new P0-P2 and returned `externally_pending` only for commit and hosted checks.
+- Supplemental pre-merge audits found one P2 in publication-checklist state and four P2s in skill
+  metadata, canonical-source, context-parity, and privacy validation. The checklist now separates
+  the completed administrator draft test from the open G17 third-party smoke. Validation now parses
+  the exact metadata schema, rejects canonical-source symlinks, enforces hierarchy/role/mutation
+  parity, scans every skill/evidence context, and includes negative regressions for each defect.
+- A later validation audit found two additional P2s: SKILL frontmatter could pass malformed YAML,
+  and private Linux user or privileged-home paths were not detected. All five frontmatters now use
+  an exact quoted-string schema with duplicate/type/mapping regressions; Linux skill/evidence path
+  regressions complete the synthetic privacy matrix. The final local suite passes 14 tests.
 - E01 private-path evidence: enabled read-back succeeded; the self-report endpoint returned GitHub's
   expected sole-administrator HTTP 403; an administrator-side `[TEST ONLY]` low-severity draft was
   created at 14:41:07Z, read back privately, and closed at 14:41:22Z. `published_at` remained null,

@@ -1,6 +1,6 @@
 ---
-name: milhouse-gate-review
-description: Independently review a Milhouse diff, branch, pull request, document, gate evidence packet, or release candidate for plan completeness, correctness, privacy, recovery, tests, provenance, and truthful claims. Use before merge or when asked to review or audit; report only and never edit, push, merge, or publish.
+name: "milhouse-gate-review"
+description: "Independently review a Milhouse diff, branch, pull request, document, gate evidence packet, or release candidate for plan completeness, correctness, privacy, recovery, tests, provenance, and truthful claims. Use before merge or when asked to review or audit; report only and never edit, push, merge, or publish."
 ---
 
 # Milhouse Gate Review
