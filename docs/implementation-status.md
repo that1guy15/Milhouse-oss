@@ -129,6 +129,10 @@ merge path, public tree, and private-reference boundary are reviewed together.
 - `make secret-scan`: passed using the repository's current lightweight
   fallback because local `gitleaks` is not installed; W01 must make the scanner
   fail closed and G17 still requires full-history gitleaks/independent scans.
+- W00 PR #1 initially exposed one gitleaks false positive in threat-model test
+  prose. The prose was rewritten and only the exact historical finding
+  fingerprint was suppressed in `.gitleaksignore`; no rule/path/general value
+  allowlist was added.
 - Targeted current-tree and full-public-history scans found no private personal
   label/path or credential-shaped value. The only `Tokru` match is the explicit
   prohibited-donor example in the authoritative plan.

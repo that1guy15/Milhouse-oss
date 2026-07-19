@@ -1,0 +1,2 @@
+# False positive: threat-model test description, no secret value.
+b5863d000e35afef1638f2aa0898d080507c335c:docs/threat-model.md:generic-api-key:52
