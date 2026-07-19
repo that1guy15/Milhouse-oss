@@ -5,8 +5,12 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .venv/
+.tools/
+.coverage
+coverage.xml
 dist/
 build/
+site/
 *.egg-info/
 
 # Local config and secrets
@@ -23,6 +27,7 @@ logs/
 reports/generated/
 .milhouse/
 *.jsonl
+!tests/fixtures/**/*.jsonl
 *.log
 *.sqlite3
 *.sqlite3-wal

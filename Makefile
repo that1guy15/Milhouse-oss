@@ -1,37 +1,138 @@
-.PHONY: setup test docs-check skill-check secret-scan
+ifneq ($(strip $(MAKEFILES)),)
+$(error Milhouse gates refuse MAKEFILES preloads)
+endif
+
+override SHELL := /bin/sh
+override .SHELLFLAGS := -eu -c
+override PYTHON := python3
+override UV := $(PYTHON) -I scripts/run_uv.py
+override UV_RUN := $(UV) run --locked --all-groups --all-extras --exact
+
+_MILHOUSE_MAKEFILE := $(realpath $(lastword $(MAKEFILE_LIST)))
+_MILHOUSE_REPO_ROOT := $(patsubst %/,%,$(dir $(_MILHOUSE_MAKEFILE)))
+ifneq ($(realpath $(CURDIR)),$(_MILHOUSE_REPO_ROOT))
+$(error Milhouse Makefile must be run from its repository root)
+endif
+
+_MILHOUSE_SHORT_MAKEFLAGS := $(filter-out -%,$(firstword $(MAKEFLAGS)))
+_MILHOUSE_UNSAFE_LONG_MAKEFLAGS := $(filter --dry-run --ignore-errors --just-print --question --touch,$(MAKEFLAGS))
+ifneq ($(strip $(findstring i,$(_MILHOUSE_SHORT_MAKEFLAGS))$(findstring n,$(_MILHOUSE_SHORT_MAKEFLAGS))$(findstring q,$(_MILHOUSE_SHORT_MAKEFLAGS))$(findstring t,$(_MILHOUSE_SHORT_MAKEFLAGS))$(_MILHOUSE_UNSAFE_LONG_MAKEFLAGS)),)
+$(error Milhouse gates refuse make dry-run, ignore-error, question, or touch modes)
+endif
+
+_MILHOUSE_TARGETS := setup lock lock-check format format-check lint type-check test test-coverage \
+	repo-check docs-check workflow-check skill-check quality build package-check \
+	artifact-smoke audit license-check private-identifier-check secret-scan \
+	secret-scan-self-test
+
+.PHONY: $(_MILHOUSE_TARGETS)
+$(_MILHOUSE_TARGETS): override SHELL := /bin/sh
+$(_MILHOUSE_TARGETS): override .SHELLFLAGS := -eu -c
+$(_MILHOUSE_TARGETS): override PYTHON := python3
+$(_MILHOUSE_TARGETS): override UV := $(PYTHON) -I scripts/run_uv.py
+$(_MILHOUSE_TARGETS): override UV_RUN := $(UV) run --locked --all-groups --all-extras --exact
 
 setup:
 	./setup.sh
 
+lock:
+	$(UV) lock
+
+lock-check:
+	$(UV) lock --check
+
+format:
+	$(UV_RUN) ruff check --fix src tests scripts
+	$(UV_RUN) ruff format src tests scripts
+
+format-check:
+	$(UV_RUN) ruff format --check src tests scripts
+
+lint:
+	$(UV_RUN) ruff check src tests scripts
+
+type-check:
+	$(UV_RUN) mypy
+
 test:
-	python3 -m pytest
+	$(UV_RUN) python -m pytest
+
+test-coverage:
+	mkdir -p build
+	$(UV_RUN) python -m pytest --cov --cov-branch \
+		--cov-report=term-missing --cov-report=json:build/coverage.json
+	$(UV_RUN) python scripts/check_coverage.py build/coverage.json \
+		--line 90 --branch 85 \
+		--critical 'src/milhouse/resources/__init__.py' \
+		--critical 'scripts/check_artifacts.py' \
+		--critical 'scripts/check_coverage.py' \
+		--critical 'scripts/check_dco.py' \
+		--critical 'scripts/check_links.py' \
+		--critical 'scripts/check_private_identifiers.py' \
+		--critical 'scripts/gitleaks.py' \
+		--critical 'scripts/prepare_environment.py' \
+		--critical 'scripts/required_ci.py' \
+		--critical 'scripts/run_make.py' \
+		--critical 'scripts/run_uv.py' \
+		--critical 'scripts/secret_scan.py' \
+		--critical 'scripts/validate_workflows.py' \
+		--critical 'scripts/milhouse_tools/strict_data.py' \
+		--critical-branch 95
+
+repo-check:
+	/bin/sh -n setup.sh
+	$(UV_RUN) validate-pyproject pyproject.toml
+	$(UV_RUN) python scripts/validate_config.py \
+		--require-repository-policy \
+		pyproject.toml config .github tests/fixtures src/milhouse/resources
 
 docs-check:
-	test -f README.md
-	test -f AGENTS.md
-	test -f CODEX.md
-	test -f CLAUDE.md
-	test -f docs/architecture.md
-	test -f docs/project-plan.md
-	test -f docs/agents-and-tools.md
-	test -f docs/feedback-loop.md
-	test -f docs/implementation-plan.md
-	test -f docs/implementation-status.md
-	test -f docs/provenance.md
-	test -f docs/skill-evaluations.md
-	test -f docs/adr/README.md
-	test -f docs/adr/0015-agent-engineering-workflow.md
-	test -f docs/solutions/README.md
-	test -f SECURITY.md
+	$(UV_RUN) python scripts/check_links.py --repo-root . --external \
+		--max-external 50 --timeout 5 --max-redirects 3 .
+
+workflow-check:
+	$(UV_RUN) python scripts/validate_workflows.py --require-aggregate .github/workflows
+	$(UV_RUN) zizmor --pedantic .github/workflows
 
 skill-check:
-	python3 scripts/validate_skills.py
+	$(UV_RUN) python scripts/validate_skills.py
 
-secret-scan:
-	@if command -v gitleaks >/dev/null 2>&1; then \
-		gitleaks detect --no-git --source .; \
-	else \
-		echo "gitleaks not installed; using lightweight grep fallback"; \
-		find . \( -path ./.git -o -path ./.venv -o -path ./data -o -path ./spool -o -path ./logs -o -path ./reports/generated \) -prune -o -type f -print0 \
-			| xargs -0 grep -nE "(TOKEN|SECRET|PASSWORD|API_KEY)=['\\\"]?[A-Za-z0-9_./+=-]{8,}|account_id = \\\"[0-9a-f]{16,}" || true; \
-	fi
+quality: lock-check format-check lint type-check repo-check docs-check workflow-check skill-check
+
+build:
+	rm -rf ./build ./dist ./src/milhouse_observability.egg-info
+	$(UV_RUN) python -m build --no-isolation
+
+package-check:
+	$(UV_RUN) validate-pyproject pyproject.toml
+	$(UV_RUN) twine check --strict dist/*
+	$(UV_RUN) check-wheel-contents dist/*.whl
+	$(UV_RUN) python scripts/check_artifacts.py --skip-install \
+		--write-hashes build/artifact-sha256.txt
+
+artifact-smoke: lock-check
+	$(UV_RUN) python scripts/check_artifacts.py
+
+audit:
+	mkdir -p build
+	$(UV) export --locked --all-groups --all-extras --no-emit-project \
+		--no-header --format requirements.txt --output-file build/audit-requirements.txt --quiet
+	$(UV_RUN) pip-audit --require-hashes --disable-pip -r build/audit-requirements.txt
+
+license-check:
+	mkdir -p build
+	$(UV_RUN) pip-licenses --from=all --format=json --with-system \
+		--output-file build/license-inventory.json
+	$(UV_RUN) python scripts/check_licenses.py \
+		--inventory build/license-inventory.json \
+		--lock uv.lock --policy config/license-policy.toml
+
+private-identifier-check:
+	$(UV_RUN) python scripts/check_private_identifiers.py --repository .
+
+secret-scan: private-identifier-check
+	$(UV_RUN) python scripts/secret_scan.py tree --source .
+	$(UV_RUN) python scripts/secret_scan.py history --source .
+
+secret-scan-self-test:
+	$(UV_RUN) python scripts/secret_scan.py self-test --source .

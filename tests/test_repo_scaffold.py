@@ -6,7 +6,6 @@ import pytest
 
 from scripts.validate_skills import validate_repository
 
-
 VALIDATION_FILES = (
     "AGENTS.md",
     "CODEX.md",
@@ -92,7 +91,10 @@ def test_skill_metadata_rejects_malformed_or_mis_scoped_yaml(validation_tree_fac
     for old, new in mutations:
         fixture_root = validation_tree_factory()
         metadata = fixture_root / "skills" / "milhouse-ops" / "agents" / "openai.yaml"
-        metadata.write_text(metadata.read_text(encoding="utf-8").replace(old, new, 1), encoding="utf-8")
+        metadata.write_text(
+            metadata.read_text(encoding="utf-8").replace(old, new, 1),
+            encoding="utf-8",
+        )
         assert validate_repository(fixture_root)
 
     fixture_root = validation_tree_factory()
@@ -110,9 +112,7 @@ def test_skill_metadata_rejects_malformed_or_mis_scoped_yaml(validation_tree_fac
 
 def test_skill_frontmatter_rejects_invalid_yaml_and_non_strings(validation_tree_factory) -> None:
     source_root = Path(__file__).resolve().parents[1]
-    source_text = (source_root / "skills" / "milhouse-ops" / "SKILL.md").read_text(
-        encoding="utf-8"
-    )
+    source_text = (source_root / "skills" / "milhouse-ops" / "SKILL.md").read_text(encoding="utf-8")
     name_line = 'name: "milhouse-ops"'
     description_line = next(
         line for line in source_text.splitlines() if line.startswith("description: ")
@@ -137,7 +137,10 @@ def test_canonical_skill_sources_reject_symlinks(validation_tree_factory, tmp_pa
     shutil.copytree(skill_dir, outside_skill)
     shutil.rmtree(skill_dir)
     os.symlink(outside_skill, skill_dir)
-    assert any("skill directory must not be a symlink" in error for error in validate_repository(fixture_root))
+    assert any(
+        "skill directory must not be a symlink" in error
+        for error in validate_repository(fixture_root)
+    )
 
     symlink_cases = (
         "skills/milhouse-ops/SKILL.md",
@@ -168,7 +171,10 @@ def test_context_parity_rejects_authority_and_explicit_routing_drift(
     fixture_root = validation_tree_factory()
     ops = fixture_root / "skills" / "milhouse-ops" / "SKILL.md"
     ops.write_text(
-        ops.read_text(encoding="utf-8").replace("only when explicitly requested and ", "only when "),
+        ops.read_text(encoding="utf-8").replace(
+            "only when explicitly requested and ",
+            "only when ",
+        ),
         encoding="utf-8",
     )
     assert any("explicit-only compound" in error for error in validate_repository(fixture_root))
@@ -232,7 +238,10 @@ def test_publication_checklist_keeps_third_party_pvr_smoke_open(validation_tree_
         ),
         encoding="utf-8",
     )
-    assert any("G17 third-party PVR smoke must remain open" in error for error in validate_repository(fixture_root))
+    assert any(
+        "G17 third-party PVR smoke must remain open" in error
+        for error in validate_repository(fixture_root)
+    )
 
     fixture_root = validation_tree_factory()
     checklist = fixture_root / "docs" / "publication-checklist.md"
@@ -241,4 +250,7 @@ def test_publication_checklist_keeps_third_party_pvr_smoke_open(validation_tree_
         + "\n- [x] Third-party reporter-to-reviewer delivery was not actually tested.\n",
         encoding="utf-8",
     )
-    assert any("G17 third-party PVR smoke must remain open" in error for error in validate_repository(fixture_root))
+    assert any(
+        "G17 third-party PVR smoke must remain open" in error
+        for error in validate_repository(fixture_root)
+    )

@@ -1,0 +1,17 @@
+{
+  "fixture_schema": "milhouse.synthetic-fixture.v1",
+  "records": [
+    {
+      "id": "synthetic-event-001",
+      "kind": "event",
+      "synthetic": true,
+      "target": "fixture-application"
+    },
+    {
+      "id": "synthetic-metric-001",
+      "kind": "metric",
+      "synthetic": true,
+      "target": "fixture-application"
+    }
+  ]
+}

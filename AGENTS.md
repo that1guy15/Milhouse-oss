@@ -75,10 +75,10 @@ permission to inspect raw telemetry or feedback sources.
 Before reporting repository work complete, run:
 
 ```bash
-make test
-make docs-check
-make skill-check
+./scripts/run_make.py test
+./scripts/run_make.py docs-check
+./scripts/run_make.py skill-check
 ```
 
-For public, provenance-sensitive, or privacy-sensitive changes, also run `make secret-scan` and
-inspect `git diff --check` and `git status --short`.
+For public, provenance-sensitive, or privacy-sensitive changes, also run
+`./scripts/run_make.py secret-scan` and inspect `git diff --check` and `git status --short`.

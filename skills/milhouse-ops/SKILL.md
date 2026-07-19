@@ -60,15 +60,15 @@ Read `references/execution-contract.md` when planning delegation, debugging, or 
 Run:
 
 ```bash
-make test
-make docs-check
-make skill-check
+./scripts/run_make.py test
+./scripts/run_make.py docs-check
+./scripts/run_make.py skill-check
 ```
 
 For data-sensitive or public-repository work, also run:
 
 ```bash
-make secret-scan
+./scripts/run_make.py secret-scan
 git status --short
 ```
 

@@ -53,10 +53,10 @@ self-approval evidence for a sole maintainer.
 Run:
 
 ```bash
-make test
-make docs-check
-make skill-check
-make secret-scan
+./scripts/run_make.py test
+./scripts/run_make.py docs-check
+./scripts/run_make.py skill-check
+./scripts/run_make.py secret-scan
 git diff --check
 git status --short
 ```

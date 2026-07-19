@@ -36,7 +36,8 @@ Do not edit instruction files automatically. Do not create a learning merely to 
 3. Remove names, local paths, credentials, private identifiers, raw quotes, payloads, and source
    content. Use work-package, gate, component, and evidence identifiers instead.
 4. Record applicability and when the pattern must not be used.
-5. Run `git diff --check`, `make docs-check`, `make skill-check`, and `make secret-scan`.
+5. Run `git diff --check`, `./scripts/run_make.py docs-check`,
+   `./scripts/run_make.py skill-check`, and `./scripts/run_make.py secret-scan`.
 6. Hand the artifact to `milhouse-oss-maintainer`; never commit, push, or publish automatically.
 
 Selecting this skill authorizes only the explicitly requested sanitized documentation write.
