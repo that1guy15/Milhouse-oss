@@ -13,7 +13,7 @@ status and evidence; it does not amend the plan.
 | Plan | Version 1.0, approved for implementation by the owner on 2026-07-18 |
 | Target release | Milhouse OSS 1.0 |
 | Working branch | `codex/build-milhouse-v1` |
-| Git state | W00 local checkpoint `b5863d000e35afef1638f2aa0898d080507c335c` on `codex/build-milhouse-v1`, based directly on audited public `origin/main` |
+| Git state | W00 PR #1 evidence head `5202d6df0b2da1d9a975fec7333aa6c9e9dcd6b8` on `codex/build-milhouse-v1`, based directly on audited public `origin/main` |
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
 | Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
 | External mutation authority | Owner authorized build-branch pushes, pull requests, and merges to `main` after required checks on 2026-07-19. Tags, package publication, announcements, live-provider calls, and unrelated external mutation remain separately controlled |
@@ -70,7 +70,7 @@ evidence. A later regression returns the affected gate to **In progress**.
 
 | Package | Depends on | State | Gate evidence required before `Passed` | External owner/reviewer action |
 |---|---|---|---|---|
-| W00 — authority, governance, ADRs | Owner plan approval | **Externally pending** | Clean public baseline; correct branch; pre-alpha claims; plan-aligned ADR index; provenance, privacy, threat model, governance, support, and usable review path | Local evidence is complete; E02 settings are applied and this branch/PR tests them. E01 private reporting still requires authorization |
+| W00 — authority, governance, ADRs | Owner plan approval | **Externally pending** | Clean public baseline; correct branch; pre-alpha claims; plan-aligned ADR index; provenance, privacy, threat model, governance, support, and usable review path | Local evidence and the E02 protected PR-path test are complete. E01 private reporting still requires authorization |
 | W01 — package and quality toolchain | G00 | Pending | Clean-clone install; wheel/sdist install; CLI help/version; resource inventory; required CI; planted-secret negative test | Replace the temporary `test`/`gitleaks` contexts with aggregate `required-ci` after the W01 workflow exists |
 | W02 — domain, config, identity, privacy | G01 | Pending | Strict examples/schema; cross-process deterministic IDs; adversarial no-secret egress tests; critical branch coverage | None beyond review |
 | W03 — SQLite, spool, replay, retention | G02 | Pending | Every durable-write kill point; concurrency; corruption recovery; replay of 10,000 records twice; permissions; privacy-expiry behavior | Access to a supported local filesystem/host if not available to engineering |
@@ -109,17 +109,17 @@ preparatory work allowed by the plan. Dependencies and gates remain normative.
 | Support policy | Complete as a W00 document | [../SUPPORT.md](../SUPPORT.md) |
 | Provenance inventory | Complete as a W00 document | [provenance.md](provenance.md); update per adapted donor file |
 | Private vulnerability path | Externally pending | Read-only GitHub API check on 2026-07-18 returned `enabled: false`; E01 requires owner authorization to enable and test it |
-| Merge/review path | In progress | Owner authorized solo-maintainer merges on 2026-07-19. Live protection now retains PRs, strict `test`/`gitleaks`, admin enforcement, no force-push/deletion, with zero approvals and no impossible CODEOWNER/last-push self-review. This W00 PR supplies the end-to-end test |
+| Merge/review path | Complete | Owner authorized solo-maintainer merges on 2026-07-19. Live protection retains PRs, strict `test`/`gitleaks`, admin enforcement, no force-push/deletion, with zero approvals and no impossible CODEOWNER/last-push self-review. PR #1 is mergeable and both protected checks passed at evidence head `5202d6df0b2da1d9a975fec7333aa6c9e9dcd6b8` |
 | Apache-2.0 ownership/provenance and DCO | Complete for W00 | Apache-2.0 retained; DCO policy and sign-off workflow documented; donor ledger records no private expression imported. Independent release review remains E05 for G17/G18 |
 | Stale private-first/duplicate workflow instructions removed | Complete | Canonical workflows remain only under `.github/workflows`; stale `ops/github/workflows` copies/instructions removed; OpenWiki marked optional/noncanonical |
 
 G00 is **not passed** until every W00 row is complete and the plan/ADR index,
 merge path, public tree, and private-reference boundary are reviewed together.
 
-## W00 local validation evidence — 2026-07-18
+## W00 validation evidence — 2026-07-18 through 2026-07-19
 
-- DCO-signed local W00 checkpoint:
-  `b5863d000e35afef1638f2aa0898d080507c335c`; it has not been pushed.
+- The DCO-signed W00 commits through evidence head
+  `5202d6df0b2da1d9a975fec7333aa6c9e9dcd6b8` are pushed to PR #1.
 - Branch `codex/build-milhouse-v1`, `HEAD`, and `origin/main` were verified at
   public baseline `fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` before the W00
   commit.
@@ -133,6 +133,11 @@ merge path, public tree, and private-reference boundary are reviewed together.
   prose. The prose was rewritten and only the exact historical finding
   fingerprint was suppressed in `.gitleaksignore`; no rule/path/general value
   allowlist was added.
+- At evidence head `5202d6df0b2da1d9a975fec7333aa6c9e9dcd6b8`,
+  GitHub reported PR #1 mergeable and both protected `test` and `gitleaks`
+  checks successful. Live branch protection retained strict checks, admin
+  enforcement, required conversation resolution, and disabled force pushes
+  and deletion.
 - Targeted current-tree and full-public-history scans found no private personal
   label/path or credential-shaped value. The only `Tokru` match is the explicit
   prohibited-donor example in the authoritative plan.
@@ -142,9 +147,9 @@ merge path, public tree, and private-reference boundary are reviewed together.
 - No private donor command wrote to the donor tree, and no private history,
   configuration, fixture, telemetry, report, or source file was imported.
 
-Local W00 engineering is complete. G00 remains externally pending solely on
-E01 plus completion of the E02 PR-path test; W01 must not be claimed passed
-until those dependencies are resolved.
+Local W00 engineering and the E02 PR-path test are complete. G00 remains
+externally pending solely on E01; W01 must not begin until that dependency is
+resolved.
 
 ## External action register
 
@@ -154,7 +159,7 @@ exact request/evidence, and the named owner must authorize or perform it.
 | ID | Earliest gate | Accountable actor | Required action and evidence | Current state |
 |---|---|---|---|---|
 | E01 | G00/G17 | Repository owner | Enable GitHub private vulnerability reporting and demonstrate a private test report can reach the designated security reviewer without publishing sensitive content | Confirmed disabled by read-only API on 2026-07-18; awaiting owner authorization |
-| E02 | G00/G01/G17 | Repository owner | Maintain a usable solo-maintainer PR path; retain strict protected checks/admin enforcement/no force-push/deletion; move to required human/CODEOWNER review when a second maintainer exists | Authorized and settings applied 2026-07-19. W00 branch/PR is the path test; W01 replaces contexts with aggregate `required-ci` |
+| E02 | G00/G01/G17 | Repository owner | Maintain a usable solo-maintainer PR path; retain strict protected checks/admin enforcement/no force-push/deletion; move to required human/CODEOWNER review when a second maintainer exists | Complete for G00 on 2026-07-19: PR #1 was mergeable and `test`/`gitleaks` passed under the applied policy. W01 replaces contexts with aggregate `required-ci` |
 | E03 | Before first public package/tag | Project owner | Verify project/distribution-name availability and complete any desired trademark/legal review; approve a plan amendment if names change | Pending |
 | E04 | G12–G14 | Operator/project owner | Supply sandbox-only credentials and explicitly authorize each live provider/session-format/notification/action call; approve the redacted destination and retain the smoke record | Pending; fixture work may proceed |
 | E05 | G17/G18 | Project owner and independent reviewer | Select an independent reviewer for security, provenance, package contents, and release evidence; record reviewer identity, scope, findings, fixes, and acceptance | Pending |
