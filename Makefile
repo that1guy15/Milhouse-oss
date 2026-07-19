@@ -75,6 +75,7 @@ test-coverage:
 		--critical 'scripts/run_make.py' \
 		--critical 'scripts/run_uv.py' \
 		--critical 'scripts/secret_scan.py' \
+		--critical 'scripts/validate_config.py' \
 		--critical 'scripts/validate_workflows.py' \
 		--critical 'scripts/milhouse_tools/strict_data.py' \
 		--critical-branch 95

@@ -17,5 +17,9 @@
   package inventory and empty-environment smoke checks, repository validators, and fail-closed
   security tooling.
 - Add least-privilege immutable-action CI with a fail-closed aggregate `required-ci` result.
+- Require every configured Dependabot ecosystem to resolve to a canonical directory and a
+  Milhouse-approved manifest; retain GitHub Actions updates while deferring Python updates until the
+  hosted updater supports the required uv version and container updates until their owning package
+  selects the matching `docker` or `docker-compose` ecosystem.
 - Replace scaffold setup guidance with W01 contributor, development, dependency, package, and
   security workflow documentation while reserving product initialization for W06.

@@ -20,6 +20,7 @@ CRITICAL_COVERAGE_FILES = {
     "scripts/run_make.py",
     "scripts/run_uv.py",
     "scripts/secret_scan.py",
+    "scripts/validate_config.py",
     "scripts/validate_workflows.py",
     "scripts/milhouse_tools/strict_data.py",
 }
