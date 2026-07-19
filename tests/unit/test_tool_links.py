@@ -1,4 +1,5 @@
 import socket
+import ssl
 from pathlib import Path
 
 import pytest
@@ -255,6 +256,7 @@ def test_connected_client_uses_only_approved_address_and_original_tls_hostname(
 ) -> None:
     connected: list[tuple[str, int]] = []
     server_names: list[str] = []
+    minimum_versions: list[ssl.TLSVersion | None] = []
 
     class FakeSocket:
         def settimeout(self, timeout: float) -> None:
@@ -270,8 +272,12 @@ def test_connected_client_uses_only_approved_address_and_original_tls_hostname(
     monkeypatch.setattr(check_links.socket, "socket", lambda *_args: raw)
 
     class FakeContext:
+        def __init__(self) -> None:
+            self.minimum_version: ssl.TLSVersion | None = None
+
         def wrap_socket(self, stream: FakeSocket, *, server_hostname: str) -> FakeSocket:
             assert stream is raw
+            minimum_versions.append(self.minimum_version)
             server_names.append(server_hostname)
             return stream
 
@@ -289,6 +295,7 @@ def test_connected_client_uses_only_approved_address_and_original_tls_hostname(
         assert client.sock is raw
         assert connected == [("8.8.4.4", 443)]
         assert server_names == ["example.test"]
+        assert minimum_versions == [ssl.TLSVersion.TLSv1_2]
     finally:
         client.close()
 

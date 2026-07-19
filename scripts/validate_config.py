@@ -24,7 +24,8 @@ else:
         require_mapping,
     )
 
-EXPECTED_PYTEST_ADDOPTS = ("--strict-config", "--strict-markers", "--showlocals")
+EXPECTED_PYTEST_ADDOPTS = ("--strict-config", "--strict-markers")
+COMPETING_PYTEST_CONFIGS = ("pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg")
 EXPECTED_PYTEST_MARKERS = (
     "contract: public and repository contract tests",
     "e2e: installed or end-to-end workflow tests",
@@ -151,6 +152,11 @@ def _exact_keys(value: dict[str, object], expected: set[str], label: str) -> Non
 
 def validate_pyproject_policy(value: object, path: Path) -> None:
     """Protect the semantic settings that define repository quality gates."""
+
+    for name in COMPETING_PYTEST_CONFIGS:
+        competing = path.parent / name
+        if competing.exists() or competing.is_symlink():
+            raise DataError(f"{path}: competing pytest configuration {name!r} is prohibited")
 
     root = require_mapping(value, str(path))
     tool = require_mapping(root.get("tool"), f"{path}:tool")

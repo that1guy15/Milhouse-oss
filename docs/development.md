@@ -105,7 +105,11 @@ The repository topology mirrors the plan:
 
 Normal CI cannot call a live provider or require a production credential. Secret-shaped adversarial
 test values are generated only in disposable runtime locations and are never committed, copied into
-documentation, or printed.
+documentation, or printed. Global pytest configuration deliberately omits local-variable display;
+privacy-sensitive tests must also keep runtime canaries out of parameters, assertion operands,
+captured output, command arguments, environment variables, and persisted Hypothesis examples.
+Repository validation rejects root `pytest.ini`, `.pytest.ini`, `tox.ini`, and `setup.cfg` files so
+none can silently replace the reviewed `pyproject.toml` pytest policy.
 
 W01 enforces at least 90% line coverage and 85% branch coverage separately across both the
 `milhouse` package and owned Python tooling under `scripts`; tooling is not hidden behind a

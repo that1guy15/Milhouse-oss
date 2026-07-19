@@ -107,7 +107,6 @@ select = ["B", "E", "F", "I", "RUF", "UP"]
 addopts = [
   "--strict-config",
   "--strict-markers",
-  "--showlocals",
 ]
 testpaths = ["tests"]
 markers = [

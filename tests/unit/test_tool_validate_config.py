@@ -22,7 +22,7 @@ def _gate_policy() -> dict[str, object]:
         "tool": {
             "pytest": {
                 "ini_options": {
-                    "addopts": ["--strict-config", "--strict-markers", "--showlocals"],
+                    "addopts": ["--strict-config", "--strict-markers"],
                     "markers": list(EXPECTED_PYTEST_MARKERS),
                     "testpaths": ["tests"],
                 }
@@ -257,6 +257,42 @@ def test_pyproject_semantic_gate_policy_rejects_pytest_selection_overrides(
 
     with pytest.raises(DataError, match="prohibited selector"):
         validate_pyproject_policy(document, REPO_ROOT / "pyproject.toml")
+
+
+def test_pyproject_semantic_gate_policy_rejects_local_value_diagnostics() -> None:
+    document = _gate_policy()
+    tool = document["tool"]
+    assert isinstance(tool, dict)
+    pytest_config = tool["pytest"]
+    assert isinstance(pytest_config, dict)
+    ini_options = pytest_config["ini_options"]
+    assert isinstance(ini_options, dict)
+    addopts = ini_options["addopts"]
+    assert isinstance(addopts, list)
+    addopts.append("--showlocals")
+
+    with pytest.raises(DataError, match="pytest addopts"):
+        validate_pyproject_policy(document, REPO_ROOT / "pyproject.toml")
+
+
+@pytest.mark.parametrize("name", ("pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg"))
+def test_pyproject_semantic_gate_policy_rejects_competing_pytest_configuration(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    (tmp_path / name).write_text("[pytest]\n", encoding="utf-8")
+
+    with pytest.raises(DataError, match="competing pytest configuration"):
+        validate_pyproject_policy(_gate_policy(), tmp_path / "pyproject.toml")
+
+
+def test_pyproject_semantic_gate_policy_rejects_dangling_competing_symlink(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pytest.ini").symlink_to(tmp_path / "missing.ini")
+
+    with pytest.raises(DataError, match="competing pytest configuration"):
+        validate_pyproject_policy(_gate_policy(), tmp_path / "pyproject.toml")
 
 
 def test_dependabot_policy_requires_uv_and_exact_bounded_schedules() -> None:

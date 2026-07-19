@@ -218,7 +218,9 @@ def _connected_client(
         raw.settimeout(timeout)
         raw.connect(endpoint.address)
         if scheme == "https":
-            connected = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+            context = ssl.create_default_context()
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            connected = context.wrap_socket(raw, server_hostname=host)
         client = http.client.HTTPConnection(host, port, timeout=timeout)
         client.sock = connected
         return client

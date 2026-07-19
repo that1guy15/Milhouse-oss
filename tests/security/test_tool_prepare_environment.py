@@ -87,6 +87,19 @@ def test_linux_mount_identity_reads_the_pinned_descriptor_only(
         prepare_environment._descriptor_mount_id(19)
 
 
+def test_descriptor_mount_identity_is_disabled_on_non_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(prepare_environment, "_linux_mount_checks_required", lambda: False)
+    monkeypatch.setattr(
+        prepare_environment,
+        "Path",
+        lambda _value: pytest.fail("non-Linux platforms must not inspect procfs"),
+    )
+
+    assert prepare_environment._descriptor_mount_id(-1) is None
+
+
 def test_mode_rollback_failure_is_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -236,11 +249,15 @@ def test_descriptor_postconditions_reject_mount_and_mode_changes(
         os.close(directory_descriptor)
 
 
-def test_directory_chain_rejects_missing_snapshot_and_missing_component(tmp_path: Path) -> None:
+def test_directory_chain_rejects_missing_snapshot_and_missing_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = tmp_path / "root"
     root.mkdir()
     root_descriptor = os.open(root, os.O_RDONLY)
     try:
+        monkeypatch.setattr(prepare_environment, "_descriptor_mount_id", lambda _fd: None)
         root_info = os.fstat(root_descriptor)
         root_snapshot = prepare_environment.EntrySnapshot(
             (),
@@ -257,6 +274,24 @@ def test_directory_chain_rejects_missing_snapshot_and_missing_component(tmp_path
                 root_descriptor,
                 ("missing",),
                 {(): root_snapshot},
+                restricted=False,
+            )
+
+        wrong_kind = prepare_environment.EntrySnapshot(
+            ("missing",),
+            root_info,
+            0o600,
+            "regular",
+            mount_id=None,
+        )
+        with pytest.raises(
+            prepare_environment.EnvironmentSafetyError,
+            match="changed during validation",
+        ):
+            prepare_environment._open_directory_chain(
+                root_descriptor,
+                ("missing",),
+                {(): root_snapshot, ("missing",): wrong_kind},
                 restricted=False,
             )
 
@@ -283,6 +318,7 @@ def test_directory_chain_rejects_missing_snapshot_and_missing_component(tmp_path
 
 def test_tree_verification_rejects_inventory_changes_and_missing_snapshots(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     environment = tmp_path / "environment"
     environment.mkdir()
@@ -290,6 +326,7 @@ def test_tree_verification_rejects_inventory_changes_and_missing_snapshots(
     parent_descriptor = os.open(tmp_path, os.O_RDONLY)
     root_descriptor = os.open(environment, os.O_RDONLY)
     try:
+        monkeypatch.setattr(prepare_environment, "_descriptor_mount_id", lambda _fd: None)
         root_info = os.fstat(root_descriptor)
         root_snapshot = prepare_environment.EntrySnapshot(
             (),
@@ -328,6 +365,53 @@ def test_tree_verification_rejects_inventory_changes_and_missing_snapshots(
         os.close(parent_descriptor)
 
 
+def test_entry_binding_rejects_an_unexpected_nonmutable_snapshot_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = tmp_path / "environment"
+    environment.mkdir(mode=0o700)
+    target = tmp_path / "target"
+    target.write_text("outside\n", encoding="utf-8")
+    link = environment / "link"
+    link.symlink_to(target)
+    parent_descriptor = os.open(tmp_path, os.O_RDONLY)
+    root_descriptor = os.open(environment, os.O_RDONLY)
+    try:
+        monkeypatch.setattr(prepare_environment, "_descriptor_mount_id", lambda _fd: None)
+        root_info = os.fstat(root_descriptor)
+        root_snapshot = prepare_environment.EntrySnapshot(
+            (),
+            root_info,
+            0o700,
+            "directory",
+            mount_id=None,
+        )
+        link_snapshot = prepare_environment.EntrySnapshot(
+            ("link",),
+            os.stat(link, follow_symlinks=False),
+            None,
+            "symlink",
+            mount_id=None,
+        )
+
+        with pytest.raises(
+            prepare_environment.EnvironmentSafetyError,
+            match="changed during validation",
+        ):
+            prepare_environment._verify_entry_binding(
+                parent_descriptor,
+                environment.name,
+                root_descriptor,
+                root_descriptor,
+                link_snapshot,
+                {(): root_snapshot, ("link",): link_snapshot},
+            )
+    finally:
+        os.close(root_descriptor)
+        os.close(parent_descriptor)
+
+
 def test_environment_rejects_invalid_trusted_interpreter_and_root_path(tmp_path: Path) -> None:
     with pytest.raises(
         prepare_environment.EnvironmentSafetyError,
@@ -343,6 +427,42 @@ def test_environment_rejects_invalid_trusted_interpreter_and_root_path(tmp_path:
         match="environment path must name a directory",
     ):
         prepare_environment.prepare_environment(Path("/"))
+
+
+def test_trusted_interpreter_name_swap_to_directory_is_rejected_before_environment_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    interpreter = tmp_path / "python"
+    interpreter.write_text("synthetic executable\n", encoding="utf-8")
+    interpreter.chmod(0o700)
+    detached = tmp_path / "detached-python"
+    environment = tmp_path / "environment"
+    original_open = prepare_environment.os.open
+    swapped = False
+
+    def swap_before_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if not swapped and os.fspath(path) == os.fspath(interpreter):
+            interpreter.rename(detached)
+            interpreter.mkdir(mode=0o700)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(prepare_environment.os, "open", swap_before_open)
+
+    with pytest.raises(
+        prepare_environment.EnvironmentSafetyError,
+        match="trusted Python interpreter must be an executable regular file",
+    ):
+        prepare_environment.prepare_environment(environment, trusted_python=interpreter)
+
+    assert swapped
+    assert detached.read_text(encoding="utf-8") == "synthetic executable\n"
+    assert stat.S_IMODE(detached.stat().st_mode) == 0o700
+    assert interpreter.is_dir()
+    assert stat.S_IMODE(interpreter.stat().st_mode) == 0o700
+    assert not environment.exists()
 
 
 def test_owned_tree_is_restricted_without_following_symlinks(tmp_path: Path) -> None:
