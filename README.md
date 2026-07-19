@@ -1,8 +1,12 @@
 # Milhouse
 
-Milhouse is a local-first observability and verified engineering-feedback control plane for small teams and AI-assisted development workflows.
+Milhouse is a local-first observability and verified engineering-feedback control plane for small
+teams and AI-assisted development workflows.
 
-> **Status: pre-alpha implementation.** The architecture and Milhouse OSS 1.0 build contract are approved, but the product described below is not yet implemented. The current Python command is a scaffold and must not be treated as production-ready.
+> **Status: pre-alpha implementation; no public release.** The W01 package and quality-toolchain
+> foundation is under active validation. The repository contains a typed Python package, a modular
+> Click root command, and package-resource scaffolding, but the operational commands and runtime
+> described below are not implemented yet. Do not use this build for production data.
 
 The normative scope, contracts, work order, gates, and Definition of Done are in [the authoritative implementation plan](docs/implementation-plan.md). Progress and validation evidence are tracked in [implementation status](docs/implementation-status.md).
 
@@ -23,20 +27,52 @@ Milhouse will:
 
 Milhouse 1.0 will not store raw prompts, responses, agent transcripts, or tool output. It will not require a hosted Milhouse service or send call-home telemetry.
 
-## Build status
+## Current build surface
 
-Implementation follows W00-W18 in the approved plan. Until a work-package gate passes, its behavior is planned rather than available. In particular, the old starter quickstart, example configuration, Compose deployment, MCP example, and project skills are being replaced and validated against the 1.0 contracts before they are advertised as usable.
+Implementation follows W00-W18 in the approved plan. Until a work-package gate passes, its
+behavior is planned rather than available. In particular, the old starter quickstart, example
+configuration, Compose deployment, and MCP example are being replaced and validated against the
+1.0 contracts before they are advertised as usable. Product-command guidance in project skills is
+added only after the owning command exists.
+
+The current command surface is deliberately small:
+
+```bash
+python3 -I scripts/run_uv.py run --locked milhouse --help
+python3 -I scripts/run_uv.py run --locked milhouse --version
+```
+
+Those commands exercise the pre-alpha CLI foundation only. `milhouse init`, collectors, storage,
+feedback, reports, MCP, and services become available in their owning work packages. In particular,
+product initialization is W06 work; contributor setup does not create Milhouse configuration or
+runtime state.
+
+## Contributor quickstart
+
+Contributors need Python 3.11-3.14 and exactly uv 0.11.29. The bootstrap verifies that uv version
+and installs the hash-locked development environment:
+
+```bash
+./setup.sh
+./scripts/run_make.py quality
+./scripts/run_make.py test-coverage
+```
+
+See [setup](docs/setup.md) for prerequisites and [development](docs/development.md) for the complete
+target reference. Dependency purpose and policy are documented in
+[dependencies](docs/dependencies.md).
 
 Current repository validation:
 
 ```bash
-make test
-make docs-check
-make skill-check
-make secret-scan
+./scripts/run_make.py test
+./scripts/run_make.py docs-check
+./scripts/run_make.py skill-check
+./scripts/run_make.py secret-scan
 ```
 
-These commands validate the current source tree; they do not imply that the Milhouse runtime is complete.
+These commands validate the current source tree; they do not imply that W01 has passed or that the
+Milhouse runtime is complete.
 
 ## Source and privacy boundary
 
@@ -49,6 +85,9 @@ Never attach credentials, real telemetry, raw agent content, private incident da
 - [Authoritative implementation plan](docs/implementation-plan.md)
 - [Implementation status](docs/implementation-status.md)
 - [Architecture](docs/architecture.md)
+- [Contributor setup](docs/setup.md)
+- [Development workflow](docs/development.md)
+- [Dependency policy](docs/dependencies.md)
 - [Privacy](PRIVACY.md)
 - [Threat model](docs/threat-model.md)
 - [Contributing](CONTRIBUTING.md)

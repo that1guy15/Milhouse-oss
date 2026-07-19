@@ -1,0 +1,13 @@
+include CHANGELOG.md
+include LICENSE
+include README.md
+include pyproject.toml
+recursive-include src/milhouse *.json *.py *.typed
+global-exclude __pycache__ *.py[cod] .DS_Store
+prune .agents
+prune .github
+prune docs
+prune openwiki
+prune ops
+prune skills
+prune tests

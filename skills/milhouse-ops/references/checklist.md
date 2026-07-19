@@ -15,7 +15,8 @@ Before reporting complete:
 - Inspect the integrated diff and simplify without contract drift.
 - Confirm redaction-before-persistence and spool-before-export where applicable.
 - Run the active package gate and record evidence.
-- Run `make test`, `make docs-check`, and `make skill-check`.
+- Run `./scripts/run_make.py test`, `./scripts/run_make.py docs-check`, and
+  `./scripts/run_make.py skill-check`.
 - List unverified live behavior and externally pending evidence.
 - Obtain report-only `milhouse-gate-review`; resolve every P0/P1.
 - Do not mark the gate passed from agent confidence.

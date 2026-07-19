@@ -9,4 +9,13 @@
   sanitized compound learning, and explicit no-vendoring, privacy, egress, and mutation boundaries.
 - Add privacy, threat-model, governance, support, DCO, and implementation-status artifacts.
 - Remove stale duplicate workflow/publication instructions and harden issue/review privacy guidance.
-- Retain the original OSS starter package/config/setup as explicitly labelled scaffolding for replacement beginning in W01.
+- Begin the W01 foundation with the `milhouse-observability` distribution, typed `milhouse` import
+  package, modular pre-alpha Click entry point, and explicit package-resource manifest.
+- Separate bounded runtime, optional receiver, and development dependencies; add the uv 0.11.29
+  reproducible lock and contributor-only locked setup path.
+- Add the planned test topology, tracked synthetic JSON/JSONL fixtures, coverage enforcement,
+  package inventory and empty-environment smoke checks, repository validators, and fail-closed
+  security tooling.
+- Add least-privilege immutable-action CI with a fail-closed aggregate `required-ci` result.
+- Replace scaffold setup guidance with W01 contributor, development, dependency, package, and
+  security workflow documentation while reserving product initialization for W06.

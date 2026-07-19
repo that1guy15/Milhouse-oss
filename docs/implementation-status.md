@@ -12,13 +12,13 @@ status and evidence; it does not amend the plan.
 | Product phase | **Pre-alpha; not released and not ready for production use** |
 | Plan | Version 1.0, approved for implementation by the owner on 2026-07-18 |
 | Target release | Milhouse OSS 1.0 |
-| Working branch | `codex/build-milhouse-v1` |
-| Git state | Prior hosted W00 evidence head `11652eff2ec46f9c895c41a1c1a16aa28eac70b8` on `codex/build-milhouse-v1`; the staged A01 candidate still requires commit and exact-head checks |
+| Working branch | `codex/w01-quality-foundation` |
+| Git state | Protected `main` at signed squash commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; W01 branch starts from that exact commit |
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
 | Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
 | External mutation authority | Owner authorized build-branch pushes, pull requests, and merges to `main` after required checks on 2026-07-19. Tags, package publication, announcements, live-provider calls, and unrelated external mutation remain separately controlled |
-| Highest passed gate | None |
-| Active package | W00 — Repository, authority, governance, and ADRs |
+| Highest passed gate | G00 |
+| Active package | W01 — Package and quality-toolchain foundation |
 
 The audited public baseline is the source scaffold. The private baseline is a
 read-only behavior and algorithm donor. Its history, configuration, telemetry,
@@ -72,8 +72,8 @@ evidence. A later regression returns the affected gate to **In progress**.
 
 | Package | Depends on | State | Gate evidence required before `Passed` | External owner/reviewer action |
 |---|---|---|---|---|
-| W00 — authority, governance, ADRs | Owner plan approval | **In progress** | Clean public baseline; correct branch; pre-alpha claims; plan-aligned ADR index; provenance, privacy, threat model, governance, support, and usable review path | E01 and E02 are complete for G00. A01 review, commit, and exact-head hosted checks remain |
-| W01 — package and quality toolchain | G00 | Pending | Clean-clone install; wheel/sdist install; CLI help/version; resource inventory; required CI; planted-secret negative test | Replace the temporary `test`/`gitleaks` contexts with aggregate `required-ci` after the W01 workflow exists |
+| W00 — authority, governance, ADRs | Owner plan approval | **Passed** | PR #1 merged as signed squash commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; reviewed head tree matched protected `main`; post-merge `test` and `gitleaks` passed | E01 and E02 complete for G00; third-party PVR delivery remains E01/E05 at G17 |
+| W01 — package and quality toolchain | G00 | **In progress** | [G01 evidence](gate-evidence/G01.md): local quality, coverage, audit, license, build, artifact-install, and fresh-bootstrap assertions pass; exact-candidate scans, hosted failure/green proof, independent review, protected merge, and post-merge verification remain | Replace the temporary `test`/`gitleaks` contexts with aggregate `required-ci` after the W01 workflow exists |
 | W02 — domain, config, identity, privacy | G01 | Pending | Strict examples/schema; cross-process deterministic IDs; adversarial no-secret egress tests; critical branch coverage | None beyond review |
 | W03 — SQLite, spool, replay, retention | G02 | Pending | Every durable-write kill point; concurrency; corruption recovery; replay of 10,000 records twice; permissions; privacy-expiry behavior | Access to a supported local filesystem/host if not available to engineering |
 | W04 — ClickHouse and recovery | G02; G04b also requires G03 | Pending | G04a auth/migrations/checksums; G04b idempotent delivery, 24-hour simulated outage drain, and verified native restore | Docker-capable supported host if not available to engineering |
@@ -110,14 +110,16 @@ preparatory work allowed by the plan. Dependencies and gates remain normative.
 | Governance and DCO | Complete as a W00 document | [../GOVERNANCE.md](../GOVERNANCE.md); solo-maintainer pull-request/check policy recorded and applied. Automated DCO enforcement is a W01/W17 control |
 | Support policy | Complete as a W00 document | [../SUPPORT.md](../SUPPORT.md) |
 | Provenance inventory | Complete as a W00 document | [provenance.md](provenance.md); update per adapted donor file |
-| Five-skill engineering workflow | In progress | Owner approved process amendment A01 on 2026-07-19. ADR 0015 pins `EveryInc/compound-engineering-plugin@8163a96e86656a89797869ac61905fe4641f81be` as a concept-only MIT reference and defines five Milhouse-native skills, discovery aliases, read-only review, sanitized learning, and authority guardrails. Static and five-skill fresh-agent validation passed. Supplemental pre-merge audits identified seven P2 validation/evidence defects; all seven corrections and negative regressions are staged, with no P0/P1 identified. DCO commit and exact-head hosted checks remain |
+| Five-skill engineering workflow | Complete | ADR 0015 pins `EveryInc/compound-engineering-plugin@8163a96e86656a89797869ac61905fe4641f81be` as a concept-only MIT reference. Five Milhouse-native skills, aliases, canonical instructions, sanitized evaluations, and strict negative validation merged in signed commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; final review found no P0-P2 and protected post-merge checks passed |
 | Private vulnerability path | Complete for G00 | API read-back returned `enabled: true`. The private-report endpoint returned the documented HTTP 403 for the sole repository administrator; GitHub directs administrators to create a draft advisory instead. A clearly marked low-severity synthetic draft was created at 14:41:07Z, read back as private draft, and closed at 14:41:22Z with `published_at: null`, no CVE, no private fork, and zero remaining triage reports. A true third-party delivery smoke is deferred to E05/G17 when an independent reviewer exists |
-| Merge/review path | Complete | Owner authorized solo-maintainer merges on 2026-07-19. Live protection retains PRs, strict `test`/`gitleaks`, admin enforcement, no force-push/deletion, with zero approvals and no impossible CODEOWNER/last-push self-review. PR #1 is mergeable and both protected checks passed at evidence head `11652eff2ec46f9c895c41a1c1a16aa28eac70b8` |
+| Merge/review path | Complete | Owner authorized solo-maintainer merges on 2026-07-19. PR #1 merged through the repository's squash-only policy as signed commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; the reviewed head tree matched protected `main`, and both post-merge checks passed |
 | Apache-2.0 ownership/provenance and DCO | Complete for W00 | Apache-2.0 retained; DCO policy and sign-off workflow documented; donor ledger records no private expression imported. Independent release review remains E05 for G17/G18 |
 | Stale private-first/duplicate workflow instructions removed | Complete | Canonical workflows remain only under `.github/workflows`; stale `ops/github/workflows` copies/instructions removed; OpenWiki marked optional/noncanonical |
 
-G00 is **not passed** until every W00 row is complete and the plan/ADR index,
-merge path, public tree, and private-reference boundary are reviewed together.
+G00 **passed** on 2026-07-19 at protected-main commit
+`79b9fdca3c567b1de48a3136fbe4ba0dd981926a` after the plan/ADR index, merge path,
+public tree, private-reference boundary, seven supplemental P2 dispositions, and exact-tree hosted
+checks were reviewed together.
 
 ## W00 validation evidence — 2026-07-18 through 2026-07-19
 
@@ -171,14 +173,19 @@ merge path, public tree, and private-reference boundary are reviewed together.
   and private Linux user or privileged-home paths were not detected. All five frontmatters now use
   an exact quoted-string schema with duplicate/type/mapping regressions; Linux skill/evidence path
   regressions complete the synthetic privacy matrix. The final local suite passes 14 tests.
+- Final report-only review of head `46f99e0a3af6741cfb2089b4672116ec0e04defc` found no remaining
+  P0-P2. Protected `test` and `gitleaks` passed on that exact head before merge.
+- PR #1 merged at 15:23:58Z as signed squash commit
+  `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`. Its tree exactly matched the reviewed head; protected
+  post-merge [`test`](https://github.com/that1guy15/Milhouse-oss/actions/runs/29692758580) and
+  [`gitleaks`](https://github.com/that1guy15/Milhouse-oss/actions/runs/29692758558) both passed.
 - E01 private-path evidence: enabled read-back succeeded; the self-report endpoint returned GitHub's
   expected sole-administrator HTTP 403; an administrator-side `[TEST ONLY]` low-severity draft was
   created at 14:41:07Z, read back privately, and closed at 14:41:22Z. `published_at` remained null,
   no CVE or private fork was created, and the remaining triage count was zero.
 
-The original W00 engineering and E02 PR-path test are complete. E01 is complete for G00 using
-GitHub's documented sole-administrator path. A01 review, commit, and exact-head hosted checks remain;
-W01 must not begin until they resolve and G00 passes.
+W00, E01 for G00, E02, and A01 are complete. The independent third-party PVR delivery smoke remains
+deferred to E01/E05 at G17. W01 began from the exact protected-main G00 commit.
 
 ## External action register
 

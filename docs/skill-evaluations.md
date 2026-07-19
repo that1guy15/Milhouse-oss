@@ -19,8 +19,10 @@ validates metadata, structure, references, context parity, and discovery aliases
 
 These evaluations test skill procedure and authority boundaries, not deterministic model selection.
 Four skills are configured for implicit invocation; the compound skill intentionally requires
-explicit invocation. `make skill-check` tests the exact five-skill registry and alias resolution
-without invoking an external model in CI.
+explicit invocation. `./scripts/run_make.py skill-check` tests the exact five-skill registry and
+alias resolution without invoking an external model in CI.
 
-The gate-review findings above are not waived by this matrix. G00 remains in progress until both P2
-corrections are applied, the candidate is re-reviewed, and hosted checks pass on the exact PR head.
+The matrix itself did not waive the two G00 review findings. They were corrected, the exact
+candidate was re-reviewed, and hosted checks later passed before G00 merged; the immutable outcome
+is recorded in [implementation status](implementation-status.md). This W00 evaluation is not gate
+evidence for W01 or a later package.

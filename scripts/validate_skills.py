@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_SHA = "8163a96e86656a89797869ac61905fe4641f81be"
 EXPECTED_SKILLS = {
@@ -204,9 +203,9 @@ class SkillValidator:
         if not self.require_regular_file(path):
             return
         metadata = self.parse_exact_yaml(path)
-        expected_sections = {"interface", "policy"} if skill_name == "milhouse-compound" else {
-            "interface"
-        }
+        expected_sections = (
+            {"interface", "policy"} if skill_name == "milhouse-compound" else {"interface"}
+        )
         if set(metadata) != expected_sections:
             self.error(path, f"sections must be exactly {sorted(expected_sections)}")
 
@@ -291,7 +290,8 @@ class SkillValidator:
         if actual_entries != EXPECTED_SKILLS:
             self.error(
                 "skills",
-                f"expected exact registry {sorted(EXPECTED_SKILLS)}, found {sorted(actual_entries)}",
+                f"expected exact registry {sorted(EXPECTED_SKILLS)}, "
+                f"found {sorted(actual_entries)}",
             )
         for skill_name in sorted(EXPECTED_SKILLS):
             self.validate_skill(skill_name)
