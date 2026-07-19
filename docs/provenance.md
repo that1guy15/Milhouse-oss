@@ -18,6 +18,23 @@ add a completed file-level ledger row before its work-package gate can pass.
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` | Starting scaffold, public documentation intent, public community files, and sanitized generic examples after truth review | Generated/cache files, stale claims, duplicate workflows, or any file that fails current privacy/provenance review |
 | Private behavior reference | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` | Read-only algorithm, behavior, provider-format, and failure-mode reference limited to the dispositions below | Git history, branches, configuration, secrets, telemetry, logs, state, reports, private docs, local paths, personal labels, private fixtures, raw sessions, or wholesale source-tree import |
 
+## External workflow reference
+
+| Reference and immutable revision | License | Permitted conceptual use | Excluded use |
+|---|---|---|---|
+| `EveryInc/compound-engineering-plugin@8163a96e86656a89797869ac61905fe4641f81be` (version 3.19.0 at review) | MIT, Copyright 2025 Every | Implementation-readiness, progressive disclosure, bounded delegation, causal debugging, behavior-preserving simplification, risk-selected report-only review, explicit PR states, deterministic feedback-state concepts, and grounded durable learning | No plugin installation, vendoring, runtime dependency, agents, scripts, assets, configuration, session-history processing, raw feedback persistence, secret propagation, implicit mutation, or external code/context egress |
+
+The reference was reviewed at the pinned commit, including `CONCEPTS.md`, `skills/ce-plan`,
+`skills/ce-work`, `skills/ce-code-review`, `skills/ce-debug`, `skills/ce-sweep`, `skills/ce-handoff`,
+`skills/ce-compound`, and managed-install code under `src/targets/`. Milhouse independently expresses
+the adapted process in ADR 0015 and its five project skills. No upstream source expression, prompt,
+agent, script, asset, or configuration was copied in this W00 adaptation.
+
+Any future copied or substantially adapted upstream material requires an exact source-path-to-public-
+path ledger row, a description of Milhouse privacy and authority changes, tests, independent review,
+and preservation of the upstream MIT copyright and license notice. Concept/reference-only reuse does
+not authorize later copying.
+
 The implementation branch preserves the audited public repository history and
 is anchored to the exact public baseline. The private repository is not a base,
 subtree, submodule, remote to merge, or source of git history. It must remain
@@ -51,16 +68,16 @@ accurate for the implemented gate, and free of generated/private data.”
 |---|---|---|
 | `LICENSE` | Retain Apache-2.0 text and verify package inclusion | G00, G01, G17 |
 | `README.md` | Retain product intent; rewrite all capability/status claims to remain pre-alpha until their gates pass | G00 and each feature gate |
-| `AGENTS.md`, `CODEX.md`, `CLAUDE.md` | Retain short safety intent; update from real commands only after implementation | G00, G17 |
+| `AGENTS.md`, `CODEX.md`, `CLAUDE.md` | Establish the G00 engineering-process hierarchy and thin host pointers; refresh product-command guidance only after owning gates pass | G00, owning gates, G17 |
 | `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, issue/PR templates | Retain and align with DCO, private security reporting, and no-sensitive-data policy | G00, G17 |
 | `docs/architecture.md`, `docs/project-plan.md`, `docs/feedback-loop.md`, setup/publication documents | Treat as source requirements; reconcile to the authoritative plan rather than allowing conflicts | G00, G17 |
-| `docs/implementation-plan.md` | Retain unchanged as the normative plan; amend only through its change-control process | All gates |
+| `docs/implementation-plan.md` | Retain as the normative plan; amend only through its change-control process | All gates |
 | `.github/workflows/` | Scaffolding only; replace/harden with least privilege, immutable action SHAs, aggregate `required-ci`, and no fork secrets | G01, G17 |
 | `ops/github/workflows/` if present | Remove duplicate copies; `.github/workflows/` is canonical | G00, G17 |
 | `pyproject.toml`, `setup.sh`, `Makefile` | Scaffolding only; replace/expand through package/toolchain gates | G01, G06, G17 |
 | `src/milhouse/`, `tests/`, `config/`, `ops/clickhouse/`, service templates | Scaffolding only; rewrite or expand against v1 contracts with synthetic fixtures | Owning W01–W16 gates |
 | `.env.example`, `.mcp.example.json` | Retain only fake/provider-neutral keys and local-safe examples; never copy a real overlay | G01, G02, G10, G17 |
-| `skills/` | Retain concise intent; validate and update only after corresponding commands exist | G17 |
+| `skills/`, `.agents/skills/` | Establish five concise engineering-process skills and discovery aliases at G00; validate and refresh product-command claims only after corresponding gates pass | G00, owning gates, G17 |
 | `openwiki/` | Optional and noncanonical; retain only if its workflow is verified to avoid private data and unintended telemetry | G17 |
 | Caches, local environments, generated reports/state/logs/spool/database files | Exclude unconditionally | G00 and every release scan |
 

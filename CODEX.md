@@ -1,51 +1,10 @@
-# Codex Guide
+# Codex Host Guide
 
-Codex should use this repository as the public Milhouse source of truth. `docs/implementation-plan.md` is the normative 1.0 build contract and `docs/implementation-status.md` is the evidence ledger.
+Read and follow `AGENTS.md`; it is the canonical repository instruction. Invoke the five project
+skills as `$milhouse-ops`, `$milhouse-feedback`, `$milhouse-gate-review`, `$milhouse-compound`, and
+`$milhouse-oss-maintainer` through the relative aliases in `.agents/skills/`.
 
-## Skills
-
-Use:
-
-- `$milhouse-ops` when changing collectors, storage, reports, MCP, config, redaction, setup, or tests.
-- `$milhouse-feedback` when reading Milhouse output from an app repo.
-- `$milhouse-oss-maintainer` when preparing public releases, sanitizing examples, or checking repo hygiene.
-
-Execute W00-W18 in dependency order. Do not copy the private repository as a base, change a locked contract implicitly, or mark a gate complete without its recorded evidence.
-
-## Tools
-
-Expected local tools:
-
-- shell
-- git
-- Python 3.11+
-- pytest
-- ruff
-- Docker or Compose
-- ClickHouse client or HTTP
-- gitleaks or trufflehog
-- MCP-compatible agent client
-
-Use `apply_patch` for manual edits.
-
-## Validation
-
-Before saying work is complete:
-
-```bash
-make test
-make docs-check
-make skill-check
-```
-
-For public release work:
-
-```bash
-make secret-scan
-git status --short
-```
-
-## Privacy
-
-Never copy private telemetry, logs, raw agent sessions, local paths, tokens, account IDs, or production incident details into this repo.
-Milhouse 1.0 never persists raw prompts, responses, transcripts, or tool output.
+Use bounded subagents only under the ownership rules in `milhouse-ops` or the read-only rules in
+`milhouse-gate-review`. In the Codex shared workspace, do not assume subagent filesystem isolation.
+Use `apply_patch` for manual source edits. GitHub and other external mutations remain governed by
+`AGENTS.md` and `docs/implementation-status.md`.

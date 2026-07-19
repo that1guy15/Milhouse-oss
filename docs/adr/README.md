@@ -4,7 +4,9 @@ These ADRs ratify the locked decisions in the [Milhouse OSS Authoritative Implem
 
 The implementation plan remains the normative build contract. If an ADR and the plan disagree, the plan controls and the ADR must be corrected. Changing a public contract, privacy guarantee, stored schema, lifecycle, or release gate requires the amendment process in [plan section 1](../implementation-plan.md#1-authority-and-change-control), not an implicit ADR edit.
 
-All ADRs below are accepted as plan-version 1.0 ratifications dated 2026-07-18.
+ADRs 0001-0014 are plan-version 1.0 ratifications dated 2026-07-18. ADR 0015 is
+an owner-approved process adaptation dated 2026-07-19; it changes no public API,
+stored schema, privacy promise, or product scope.
 
 | ADR | Ratified decision |
 |---|---|
@@ -22,10 +24,12 @@ All ADRs below are accepted as plan-version 1.0 ratifications dated 2026-07-18.
 | [0012](0012-application-repository-boundary.md) | Application-repository ownership and `.milhouse` boundary |
 | [0013](0013-packaging-versioning-and-release.md) | Packaging, versioning, artifacts, and release train |
 | [0014](0014-support-governance-security-and-provenance.md) | Support, governance, security response, and provenance |
+| [0015](0015-agent-engineering-workflow.md) | Agent engineering loop, five focused skills, read-only review, sanitized learning, discovery, and authority boundaries |
 
 ## Status vocabulary
 
 - **Accepted (ratification):** fixed by implementation-plan version 1.0 and binding on the build.
+- **Accepted (process adaptation):** owner-approved execution control subordinate to Plan 1.0.
 - **Superseded:** replaced only by an approved numbered amendment and successor ADR.
 
 No ADR in this index is proposed or undecided.

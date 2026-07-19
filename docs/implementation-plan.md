@@ -23,6 +23,13 @@ The following rules apply during implementation:
 6. Any reused private code must be recorded in `docs/provenance.md`, generalized in a fresh public commit, independently reviewed, and covered by OSS tests.
 7. Publication, pushing, package release, live-provider calls, and external messages remain separate owner-authorized actions even after the code is ready.
 
+Process amendment A01, approved by the owner on 2026-07-19 and ratified by ADR 0015, establishes the
+agent engineering workflow without changing a public API, stored schema, privacy promise, product
+scope, or release gate. Instruction authority is: this plan, accepted ADRs,
+`docs/implementation-status.md` for current evidence and authority, `AGENTS.md`, project skills, then
+host-specific pointers. Selecting a skill grants no source, Git, GitHub, provider, external-model,
+tag, publication, announcement, or messaging authority beyond the current status ledger.
+
 ## 2. Product contract
 
 ### 2.1 Product definition
@@ -1011,6 +1018,8 @@ CLI rules:
 
 ```text
 Milhouse-oss/
+  .agents/
+    skills/                  # relative aliases to the five canonical skill folders
   .github/
     CODEOWNERS
     dependabot.yml
@@ -1027,6 +1036,8 @@ Milhouse-oss/
   docs/
     adr/
     runbooks/
+    solutions/               # sanitized reusable engineering knowledge, never sessions
+    skill-evaluations.md      # sanitized fresh-agent behavior evidence, never transcripts
     implementation-plan.md
     implementation-status.md
     architecture.md
@@ -1062,6 +1073,11 @@ Milhouse-oss/
   schema/
     json/
   skills/
+    milhouse-ops/
+    milhouse-feedback/
+    milhouse-gate-review/
+    milhouse-compound/
+    milhouse-oss-maintainer/
   src/milhouse/
     cli/
     core/
@@ -1095,7 +1111,10 @@ Milhouse-oss/
     packaging/
     fixtures/
   CHANGELOG.md
+  AGENTS.md
+  CLAUDE.md
   CODE_OF_CONDUCT.md
+  CODEX.md
   CONTRIBUTING.md
   GOVERNANCE.md
   LICENSE
@@ -1116,7 +1135,12 @@ Migrations, config/report/service templates, JSON schemas, and other runtime res
 
 W00 begins from the tracked files at the audited public baseline, not its local caches or generated environment. Apache license, community templates, issue/discussion forms, and documentation intent are retained after truth/provenance review. Existing architecture/project/feedback documents are source requirements reconciled into this plan; they are not allowed to override its locked contracts.
 
-The current public Python package, config examples, Compose file, setup wrapper, workflows, skills, and CLI are scaffolding. Each is replaced or expanded through its owning work package and may be claimed in README only after its gate passes. The duplicate `ops/github/workflows` copies are removed in favor of `.github/workflows`; OpenWiki remains optional/noncanonical; agent instructions and skills are updated last from real commands.
+The current public Python package, config examples, Compose file, setup wrapper, workflows, and CLI
+are scaffolding. Each is replaced or expanded through its owning work package and may be claimed in
+README only after its gate passes. Five engineering-process skills, their discovery aliases, and the
+canonical instruction hierarchy are established at G00; command-bearing product guidance is added
+only after its owning gate passes and is revalidated at W17. The duplicate `ops/github/workflows`
+copies are removed in favor of `.github/workflows`; OpenWiki remains optional and noncanonical.
 
 The private system is an algorithm and behavior reference, not the new base.
 
@@ -1197,13 +1221,27 @@ Legacy import is explicit, dry-run-first, repeatable, and source-preserving.
 - Every import produces counts, hashes, ID mappings, exclusions, quarantines, and a machine-readable reconciliation report.
 - A second import produces identical logical results.
 
+### 7.7 External engineering-workflow reference
+
+Milhouse uses `EveryInc/compound-engineering-plugin` at immutable commit
+`8163a96e86656a89797869ac61905fe4641f81be` (MIT, Copyright 2025 Every) as a
+conceptual process reference only. ADR 0015 independently adapts implementation readiness,
+progressive disclosure, bounded delegation, causal debugging, simplification, risk-selected
+report-only review, explicit PR states, and grounded durable learning.
+
+Milhouse does not install, vendor, execute, or depend on that plugin and imports none of its agents,
+scripts, assets, configuration, or session tooling. Raw-session discovery, raw-feedback persistence,
+standing source-write authority, implicit GitHub mutation, external code/context egress, and plaintext
+credential propagation are explicitly prohibited. Any future copied or substantially adapted
+expression requires file-level provenance and preservation of the upstream MIT notice.
+
 ## 8. Ordered implementation work packages
 
 The sequence is dependency-bound. Parallel work is allowed only after the shared contract gate noted below.
 
 ### 8.0 Resolved decision register
 
-Sections 2 through 7 are the resolved decision register. They lock product scope and naming; supported platforms; process topology; technology stack; configuration and every first-party integration schema; installation identity/key lifecycle; record/payload/identity/metric semantics; spool/SQLite/ClickHouse commit and recovery; alert/incident/feedback state; trust/privacy/egress policy; plugin trust model; repository ownership; receiver signing; scheduler jobs; reports, notifications, postmortems, MCP, CLI, packaging, migration, and legacy import. W00 ADRs ratify and cross-reference these outcomes; they do not reopen them. If implementation discovers an unstated public or stored contract, plan status returns to Draft until a plan amendment resolves it.
+Sections 2 through 7 are the resolved decision register. They lock product scope and naming; supported platforms; process topology; technology stack; configuration and every first-party integration schema; installation identity/key lifecycle; record/payload/identity/metric semantics; spool/SQLite/ClickHouse commit and recovery; alert/incident/feedback state; trust/privacy/egress policy; plugin trust model; repository ownership; receiver signing; scheduler jobs; reports, notifications, postmortems, MCP, CLI, packaging, migration, legacy import, and the five-skill engineering workflow and authority boundary. W00 ADRs ratify and cross-reference these outcomes; they do not reopen them. If implementation discovers an unstated public or stored contract, plan status returns to Draft until a plan amendment resolves it.
 
 ```mermaid
 flowchart LR
@@ -1256,6 +1294,9 @@ Deliverables:
 - ratify ADRs for product scope, naming, config, records/identity, spool/state, ClickHouse, feedback, privacy, plugins, scheduler, MCP, receiver, packaging, and support; each ADR must reproduce and cross-reference this plan rather than choose new outcomes;
 - correct README status to pre-alpha until the corresponding gates pass;
 - create `PRIVACY.md`, threat model, support, governance, and provenance inventory;
+- ratify ADR 0015; establish the five canonical engineering skills, `.agents/skills` relative
+  discovery aliases, canonical `AGENTS.md`, thin host pointers, external-reference provenance, and
+  executable skill validation;
 - enable a workable private vulnerability-reporting and review path;
 - confirm Apache-2.0 ownership/provenance and DCO policy;
 - remove stale private-first publication and duplicate-workflow instructions.
@@ -1266,6 +1307,10 @@ Gate G00:
 - the private repository is documented as donor-only and remains untouched;
 - the merge/review path is actually usable;
 - the plan and ADR index agree.
+- required CI proves all five engineering skills are non-placeholder, plan-aligned, privacy-safe,
+  metadata-valid, reference-complete, and discoverable through resolving relative aliases;
+- sanitized fresh-agent evidence separately exercises every skill's positive procedure and
+  adjacent-negative boundary without persisting raw prompts, responses, or transcripts.
 
 ### W01 — Package and quality-toolchain foundation
 
@@ -1590,7 +1635,8 @@ Deliverables:
 
 - truthful README and five-minute demo;
 - complete human docs listed in the target layout;
-- updated AGENTS/CODEX/CLAUDE guidance and all Milhouse skills matching actual commands;
+- revalidated canonical AGENTS guidance, host pointers, discovery aliases, and all command-bearing
+  skill text against the completed product;
 - MkDocs Material human site; OpenWiki optional and noncanonical, with corrected safe workflow or removal;
 - DCO, contributor guide, governance, support, security response, compatibility, and provenance;
 - CI, integration, security, nightly, docs, and protected release workflows;
@@ -1821,15 +1867,31 @@ Credential exposure, unsafe repository writes, acknowledged-event loss, replay c
 When implementation starts:
 
 1. Create the implementation branch and status file.
-2. Execute work packages in dependency order.
-3. Use sub-agents only on bounded modules after shared contracts are frozen.
-4. Never allow parallel branches to alter config, record, identity, feedback, spool, or migration contracts independently.
-5. For each package, implement tests with or before behavior, update docs, run the package gate, review the diff for private data and scope, then record evidence in the status file.
-6. Commit coherent work-package increments using conventional commits. Do not push or publish without owner authorization.
-7. Re-run the entire required suite at every major gate and from installed artifacts before release gates.
-8. Treat any discovered donor behavior that conflicts with this plan as a defect to avoid, not a compatibility requirement.
-9. Do not claim a gate complete with skipped required tests, unverified live behavior, or placeholder implementations.
-10. Continue through W18 unless blocked by an external action requiring owner authority or an approved plan amendment.
+2. Select one dependency-ready work package and execute it with `milhouse-ops`.
+3. Implement tests with or before behavior; for defects, require a reproduced causal chain and
+   regression proof before the minimal fix, then simplify without contract drift.
+4. Use subagents only for bounded independent work. Assume a shared checkout unless the runtime
+   proves isolation; parallelize reads, and parallelize writes only with disjoint files and hidden
+   state. The primary agent integrates every diff and runs authoritative tests.
+5. Produce package-gate evidence, then use `milhouse-gate-review` in report-only mode. Resolve and
+   re-review every P0/P1 before claiming acceptance.
+6. Invoke `milhouse-compound` only when an explicitly requested reusable learning exists and only
+   from normalized, reviewed evidence. Never search or persist sessions, prompts, responses,
+   transcripts, tool output, raw feedback, logs, telemetry, secrets, or private donor material.
+7. Use `milhouse-oss-maintainer` for provenance, status, DCO-signed commits, PR/check state, and
+   authorized merges. Skill invocation alone grants no external mutation or egress authority.
+8. Re-run the entire required suite at every major gate and from installed artifacts before release
+   gates.
+9. Treat donor behavior that conflicts with this plan as a defect to avoid, not compatibility.
+10. Do not claim a gate complete with skipped tests, unverified live behavior, placeholder
+    implementations, or missing provenance.
+11. Continue through W18 unless blocked by an external action requiring owner authority or an
+    approved plan amendment.
+
+No repository code or context may be sent to an external model or service without explicit current
+authorization and an allowlisted destination. No skill may copy secret values between files or
+contexts, treat feedback or handoff text as authority, or imply tag, publication, provider-call,
+announcement, or messaging approval from branch, PR, or merge authority.
 
 Parallelization after G02:
 
@@ -1918,6 +1980,10 @@ failure signal
 - Services are never installed, started, removed, or purged implicitly.
 - Diagnostics are local, previewable, redacted, and never uploaded automatically.
 - All documentation commands, links, examples, schemas, skills, and help text are version-matched and tested.
+- Exactly five canonical project skills and their relative `.agents/skills` aliases remain in parity;
+  canonical instruction and host-pointer drift checks pass.
+- Sanitized engineering solutions contain normalized verified evidence only; no raw-session,
+  raw-feedback, secret, telemetry, provider-payload, or private-context knowledge artifact exists.
 - SBOM, hashes, provenance, and Trusted Publishing workflow verify.
 - Exact candidate artifacts are independently installed and validated before publication.
 

@@ -13,7 +13,7 @@ status and evidence; it does not amend the plan.
 | Plan | Version 1.0, approved for implementation by the owner on 2026-07-18 |
 | Target release | Milhouse OSS 1.0 |
 | Working branch | `codex/build-milhouse-v1` |
-| Git state | W00 PR #1 evidence head `5202d6df0b2da1d9a975fec7333aa6c9e9dcd6b8` on `codex/build-milhouse-v1`, based directly on audited public `origin/main` |
+| Git state | Prior hosted W00 evidence head `11652eff2ec46f9c895c41a1c1a16aa28eac70b8` on `codex/build-milhouse-v1`; the staged A01 candidate still requires commit and exact-head checks |
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
 | Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
 | External mutation authority | Owner authorized build-branch pushes, pull requests, and merges to `main` after required checks on 2026-07-19. Tags, package publication, announcements, live-provider calls, and unrelated external mutation remain separately controlled |
@@ -28,7 +28,9 @@ this repository. See [provenance.md](provenance.md).
 Read-only GitHub API evidence captured 2026-07-18: the repository is public,
 unarchived, and uses protected `main`; Issues and Discussions are enabled;
 secret scanning, push protection, and Dependabot security updates are enabled;
-Private Vulnerability Reporting is disabled. `main` requires `test` and
+Private Vulnerability Reporting is enabled as of 2026-07-19. GitHub correctly refused a sole
+administrator self-report, then the documented administrator-side synthetic draft was created,
+read back, and closed without publication, CVE, or private fork. `main` requires `test` and
 `gitleaks`, one approval, CODEOWNER review, last-push approval, stale-review
 dismissal, and admin enforcement. On 2026-07-19 the owner authorized the
 solo-maintainer path and engineering changed only the review sub-rule to zero
@@ -70,7 +72,7 @@ evidence. A later regression returns the affected gate to **In progress**.
 
 | Package | Depends on | State | Gate evidence required before `Passed` | External owner/reviewer action |
 |---|---|---|---|---|
-| W00 — authority, governance, ADRs | Owner plan approval | **Externally pending** | Clean public baseline; correct branch; pre-alpha claims; plan-aligned ADR index; provenance, privacy, threat model, governance, support, and usable review path | Local evidence and the E02 protected PR-path test are complete. E01 private reporting still requires authorization |
+| W00 — authority, governance, ADRs | Owner plan approval | **In progress** | Clean public baseline; correct branch; pre-alpha claims; plan-aligned ADR index; provenance, privacy, threat model, governance, support, and usable review path | E01 and E02 are complete for G00. A01 review, commit, and exact-head hosted checks remain |
 | W01 — package and quality toolchain | G00 | Pending | Clean-clone install; wheel/sdist install; CLI help/version; resource inventory; required CI; planted-secret negative test | Replace the temporary `test`/`gitleaks` contexts with aggregate `required-ci` after the W01 workflow exists |
 | W02 — domain, config, identity, privacy | G01 | Pending | Strict examples/schema; cross-process deterministic IDs; adversarial no-secret egress tests; critical branch coverage | None beyond review |
 | W03 — SQLite, spool, replay, retention | G02 | Pending | Every durable-write kill point; concurrency; corruption recovery; replay of 10,000 records twice; permissions; privacy-expiry behavior | Access to a supported local filesystem/host if not available to engineering |
@@ -101,15 +103,16 @@ preparatory work allowed by the plan. Dependencies and gates remain normative.
 | Workspace uses audited public baseline without private history | Complete | Local branch parent and `origin/main` both resolve to `fb81a7faf2c101e8bb3f08ef9120d82c2b20600b`; only public history is present and private history was never imported |
 | Branch `codex/build-milhouse-v1` | Complete | `git branch --show-current` observed locally on 2026-07-18 |
 | Plan retained and status ledger created | Complete | [implementation-plan.md](implementation-plan.md) and this file |
-| Locked decisions ratified by ADRs | Complete | `docs/adr/README.md` indexes 14 Accepted ratifications; local link/plan-anchor validation passed |
+| Locked decisions ratified by ADRs | Complete | `docs/adr/README.md` indexes 14 plan ratifications plus accepted process ADR 0015; local link and plan-anchor validation passed |
 | README is truthful pre-alpha | Complete | README labels the current command/config/deployment as scaffold and gates every planned capability |
 | Privacy contract | Complete as a W00 document | [../PRIVACY.md](../PRIVACY.md); implementation guarantees are not claimed operational until their gates pass |
 | Threat/data inventory | Complete as a W00 document | [threat-model.md](threat-model.md); implementation controls still require their owning tests |
 | Governance and DCO | Complete as a W00 document | [../GOVERNANCE.md](../GOVERNANCE.md); solo-maintainer pull-request/check policy recorded and applied. Automated DCO enforcement is a W01/W17 control |
 | Support policy | Complete as a W00 document | [../SUPPORT.md](../SUPPORT.md) |
 | Provenance inventory | Complete as a W00 document | [provenance.md](provenance.md); update per adapted donor file |
-| Private vulnerability path | Externally pending | Read-only GitHub API check on 2026-07-18 returned `enabled: false`; E01 requires owner authorization to enable and test it |
-| Merge/review path | Complete | Owner authorized solo-maintainer merges on 2026-07-19. Live protection retains PRs, strict `test`/`gitleaks`, admin enforcement, no force-push/deletion, with zero approvals and no impossible CODEOWNER/last-push self-review. PR #1 is mergeable and both protected checks passed at evidence head `5202d6df0b2da1d9a975fec7333aa6c9e9dcd6b8` |
+| Five-skill engineering workflow | In progress | Owner approved process amendment A01 on 2026-07-19. ADR 0015 pins `EveryInc/compound-engineering-plugin@8163a96e86656a89797869ac61905fe4641f81be` as a concept-only MIT reference and defines five Milhouse-native skills, discovery aliases, read-only review, sanitized learning, and authority guardrails. Static and five-skill fresh-agent validation passed. Gate re-review found both prior P2s resolved and no new P0-P2. DCO commit and exact-head hosted checks remain |
+| Private vulnerability path | Complete for G00 | API read-back returned `enabled: true`. The private-report endpoint returned the documented HTTP 403 for the sole repository administrator; GitHub directs administrators to create a draft advisory instead. A clearly marked low-severity synthetic draft was created at 14:41:07Z, read back as private draft, and closed at 14:41:22Z with `published_at: null`, no CVE, no private fork, and zero remaining triage reports. A true third-party delivery smoke is deferred to E05/G17 when an independent reviewer exists |
+| Merge/review path | Complete | Owner authorized solo-maintainer merges on 2026-07-19. Live protection retains PRs, strict `test`/`gitleaks`, admin enforcement, no force-push/deletion, with zero approvals and no impossible CODEOWNER/last-push self-review. PR #1 is mergeable and both protected checks passed at evidence head `11652eff2ec46f9c895c41a1c1a16aa28eac70b8` |
 | Apache-2.0 ownership/provenance and DCO | Complete for W00 | Apache-2.0 retained; DCO policy and sign-off workflow documented; donor ledger records no private expression imported. Independent release review remains E05 for G17/G18 |
 | Stale private-first/duplicate workflow instructions removed | Complete | Canonical workflows remain only under `.github/workflows`; stale `ops/github/workflows` copies/instructions removed; OpenWiki marked optional/noncanonical |
 
@@ -118,8 +121,8 @@ merge path, public tree, and private-reference boundary are reviewed together.
 
 ## W00 validation evidence — 2026-07-18 through 2026-07-19
 
-- The DCO-signed W00 commits through evidence head
-  `5202d6df0b2da1d9a975fec7333aa6c9e9dcd6b8` are pushed to PR #1.
+- The DCO-signed W00 commits through prior evidence head
+  `11652eff2ec46f9c895c41a1c1a16aa28eac70b8` are pushed to PR #1.
 - Branch `codex/build-milhouse-v1`, `HEAD`, and `origin/main` were verified at
   public baseline `fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` before the W00
   commit.
@@ -133,7 +136,7 @@ merge path, public tree, and private-reference boundary are reviewed together.
   prose. The prose was rewritten and only the exact historical finding
   fingerprint was suppressed in `.gitleaksignore`; no rule/path/general value
   allowlist was added.
-- At evidence head `5202d6df0b2da1d9a975fec7333aa6c9e9dcd6b8`,
+- At prior evidence head `11652eff2ec46f9c895c41a1c1a16aa28eac70b8`,
   GitHub reported PR #1 mergeable and both protected `test` and `gitleaks`
   checks successful. Live branch protection retained strict checks, admin
   enforcement, required conversation resolution, and disabled force pushes
@@ -146,10 +149,27 @@ merge path, public tree, and private-reference boundary are reviewed together.
   duplicate-workflow absence checks passed.
 - No private donor command wrote to the donor tree, and no private history,
   configuration, fixture, telemetry, report, or source file was imported.
+- A01 local validation passed: `make docs-check`, `make skill-check`, `make test`
+  (`2 passed` on Python 3.12.8/macOS), `make secret-scan`, `git diff --check`,
+  JSON parsing, local Markdown-link resolution, and all five upstream
+  `quick_validate.py` skill checks. Local secret scanning used the documented
+  lightweight fallback because gitleaks is not installed; hosted gitleaks remains required.
+- The deterministic negative fixture correctly rejected an injected `TODO` placeholder. The
+  disposable fixture was outside the repository and was deleted after the test; no raw agent
+  content was retained.
+- [skill-evaluations.md](skill-evaluations.md) records sanitized behavior and adjacent-negative
+  evidence for all five skills without raw prompts, responses, transcripts, or tool output.
+- The first A01 gate review returned two P2 findings: static CI had been conflated with behavioral
+  evidence, and W00 was incorrectly labelled externally pending. Both were corrected. Read-only
+  re-review found no new P0-P2 and returned `externally_pending` only for commit and hosted checks.
+- E01 private-path evidence: enabled read-back succeeded; the self-report endpoint returned GitHub's
+  expected sole-administrator HTTP 403; an administrator-side `[TEST ONLY]` low-severity draft was
+  created at 14:41:07Z, read back privately, and closed at 14:41:22Z. `published_at` remained null,
+  no CVE or private fork was created, and the remaining triage count was zero.
 
-Local W00 engineering and the E02 PR-path test are complete. G00 remains
-externally pending solely on E01; W01 must not begin until that dependency is
-resolved.
+The original W00 engineering and E02 PR-path test are complete. E01 is complete for G00 using
+GitHub's documented sole-administrator path. A01 review, commit, and exact-head hosted checks remain;
+W01 must not begin until they resolve and G00 passes.
 
 ## External action register
 
@@ -158,7 +178,7 @@ exact request/evidence, and the named owner must authorize or perform it.
 
 | ID | Earliest gate | Accountable actor | Required action and evidence | Current state |
 |---|---|---|---|---|
-| E01 | G00/G17 | Repository owner | Enable GitHub private vulnerability reporting and demonstrate a private test report can reach the designated security reviewer without publishing sensitive content | Confirmed disabled by read-only API on 2026-07-18; awaiting owner authorization |
+| E01 | G00/G17 | Repository owner | Enable GitHub private vulnerability reporting and test private advisory visibility and closeout without publishing sensitive content | Complete for G00 on 2026-07-19: enabled read-back passed; sole-admin self-report produced GitHub's documented 403; admin-side synthetic draft create/read/close passed with no publication, CVE, fork, or remaining triage report. Re-run a true third-party reporter-to-reviewer smoke with E05 at G17 |
 | E02 | G00/G01/G17 | Repository owner | Maintain a usable solo-maintainer PR path; retain strict protected checks/admin enforcement/no force-push/deletion; move to required human/CODEOWNER review when a second maintainer exists | Complete for G00 on 2026-07-19: PR #1 was mergeable and `test`/`gitleaks` passed under the applied policy. W01 replaces contexts with aggregate `required-ci` |
 | E03 | Before first public package/tag | Project owner | Verify project/distribution-name availability and complete any desired trademark/legal review; approve a plan amendment if names change | Pending |
 | E04 | G12–G14 | Operator/project owner | Supply sandbox-only credentials and explicitly authorize each live provider/session-format/notification/action call; approve the redacted destination and retain the smoke record | Pending; fixture work may proceed |
@@ -170,7 +190,9 @@ exact request/evidence, and the named owner must authorize or perform it.
 
 ## Defects, amendments, and stop conditions
 
-No defects or plan amendments are recorded at this initial snapshot.
+| ID | Date | Decision | Scope and disposition |
+|---|---|---|---|
+| A01 | 2026-07-19 | Owner-approved Compound Engineering process adaptation | Ratified by ADR 0015. Uses `EveryInc/compound-engineering-plugin@8163a96e86656a89797869ac61905fe4641f81be` as a concept-only MIT reference. Establishes five Milhouse-native skills, discovery aliases, read-only gate review, sanitized learning, and explicit privacy, egress, and mutation boundaries. No public API, stored schema, privacy promise, product scope, or release gate changed |
 
 Add each discovered issue with severity P0–P3, owner, affected gates,
 reproduction/evidence, and disposition. Stop only the affected workstream when a

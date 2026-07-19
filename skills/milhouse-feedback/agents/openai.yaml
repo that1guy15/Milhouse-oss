@@ -1,4 +1,4 @@
 interface:
   display_name: "Milhouse Feedback"
-  short_description: "Consume Milhouse feedback in app repos"
-  default_prompt: "Use $milhouse-feedback to review Milhouse signals and update the project feedback loop."
+  short_description: "Act on normalized Milhouse feedback"
+  default_prompt: "Use $milhouse-feedback to act on normalized Milhouse feedback with verification evidence."

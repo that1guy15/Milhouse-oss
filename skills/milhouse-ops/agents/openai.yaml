@@ -1,4 +1,4 @@
 interface:
   display_name: "Milhouse Ops"
-  short_description: "Operate and extend Milhouse safely"
-  default_prompt: "Use $milhouse-ops to inspect, modify, and validate Milhouse observability internals."
+  short_description: "Build and validate Milhouse work packages"
+  default_prompt: "Use $milhouse-ops to implement, debug, and validate the active Milhouse work package."
