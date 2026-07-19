@@ -8,4 +8,4 @@ amend, the [authoritative plan](../implementation-plan.md). The concise package 
 A record may describe an in-progress candidate. Only an explicit conclusion tied to an exact
 commit and every required result marks a gate passed.
 
-- [G01 package and quality-toolchain foundation](G01.md)
+- [G01 package and quality-toolchain foundation](G01.md) — passed 2026-07-19

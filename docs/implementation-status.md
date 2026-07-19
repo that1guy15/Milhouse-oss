@@ -12,13 +12,13 @@ status and evidence; it does not amend the plan.
 | Product phase | **Pre-alpha; not released and not ready for production use** |
 | Plan | Version 1.0, approved for implementation by the owner on 2026-07-18 |
 | Target release | Milhouse OSS 1.0 |
-| Working branch | `codex/w01-dependabot-remediation` |
-| Git state | Protected `main` at signed W01 squash commit `f6ba1dabc8251447dd5d09ea3b6b48b11a102d51`; its tree exactly matched reviewed PR #2 head `90bc82364c3a9cfc051277044a1499a1276f5a8e` |
+| Working branch | `codex/g01-close-evidence` |
+| Git state | Protected `main` at signed W01 remediation commit `333c051ea1018a624715b98bf5dad7c885bdeca5`; its tree exactly matched reviewed PR #5 head `2e980b8e75025310e5e33c2ae2acd6da9476b82c`, post-merge required CI passed, and only the retained GitHub Actions updater ran successfully |
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
 | Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
 | External mutation authority | Owner authorized build-branch pushes, pull requests, and merges to `main` after required checks on 2026-07-19. Tags, package publication, announcements, live-provider calls, and unrelated external mutation remain separately controlled |
-| Highest passed gate | G00 |
-| Active package | W01 — Package and quality-toolchain foundation |
+| Highest passed gate | G01 |
+| Active package | G01 evidence closure; W02 is next |
 
 The audited public baseline is the source scaffold. The private baseline is a
 read-only behavior and algorithm donor. Its history, configuration, telemetry,
@@ -73,7 +73,7 @@ evidence. A later regression returns the affected gate to **In progress**.
 | Package | Depends on | State | Gate evidence required before `Passed` | External owner/reviewer action |
 |---|---|---|---|---|
 | W00 — authority, governance, ADRs | Owner plan approval | **Passed** | PR #1 merged as signed squash commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; reviewed head tree matched protected `main`; post-merge `test` and `gitleaks` passed | E01 and E02 complete for G00; third-party PVR delivery remains E01/E05 at G17 |
-| W01 — package and quality toolchain | G00 | **In progress** | [G01 evidence](gate-evidence/G01.md): candidate review, protected merge, exact-tree equality, and post-merge required CI passed; first-run Dependabot jobs exposed a misclassified Docker ecosystem and an incompatible hosted uv version, whose fail-closed policy remediation still requires hosted review, merge, and post-merge verification | Aggregate `required-ci` migration and solo-maintainer protected-PR path are complete |
+| W01 — package and quality toolchain | G00 | **Passed** | [G01 evidence](gate-evidence/G01.md): exact candidate and remediation trees passed local gates, 18-check hosted PR runs, three independent reviews, signed protected merges, exact-tree equality, post-merge required CI, and corrected default-branch updater execution at commit `333c051ea1018a624715b98bf5dad7c885bdeca5` | G01 accepted by engineering on 2026-07-19 under the owner-authorized solo-maintainer path; aggregate `required-ci` and protection controls remain active |
 | W02 — domain, config, identity, privacy | G01 | Pending | Strict examples/schema; cross-process deterministic IDs; adversarial no-secret egress tests; critical branch coverage | None beyond review |
 | W03 — SQLite, spool, replay, retention | G02 | Pending | Every durable-write kill point; concurrency; corruption recovery; replay of 10,000 records twice; permissions; privacy-expiry behavior | Access to a supported local filesystem/host if not available to engineering |
 | W04 — ClickHouse and recovery | G02; G04b also requires G03 | Pending | G04a auth/migrations/checksums; G04b idempotent delivery, 24-hour simulated outage drain, and verified native restore | Docker-capable supported host if not available to engineering |
@@ -131,9 +131,9 @@ checks were reviewed together.
 - `make test`: passed (`1 passed` against the imported scaffold).
 - `make docs-check`: passed.
 - `make skill-check`: passed.
-- `make secret-scan`: passed using the repository's current lightweight
-  fallback because local `gitleaks` is not installed; W01 must make the scanner
-  fail closed and G17 still requires full-history gitleaks/independent scans.
+- `make secret-scan`: passed using the repository's then-current lightweight
+  fallback because local `gitleaks` was not installed. W01 subsequently made tree/history scans
+  fail closed and self-testing; G17 still requires independent release scans.
 - W00 PR #1 initially exposed one gitleaks false positive in threat-model test
   prose. The prose was rewritten and only the exact historical finding
   fingerprint was suppressed in `.gitleaksignore`; no rule/path/general value
@@ -195,7 +195,7 @@ exact request/evidence, and the named owner must authorize or perform it.
 | ID | Earliest gate | Accountable actor | Required action and evidence | Current state |
 |---|---|---|---|---|
 | E01 | G00/G17 | Repository owner | Enable GitHub private vulnerability reporting and test private advisory visibility and closeout without publishing sensitive content | Complete for G00 on 2026-07-19: enabled read-back passed; sole-admin self-report produced GitHub's documented 403; admin-side synthetic draft create/read/close passed with no publication, CVE, fork, or remaining triage report. Re-run a true third-party reporter-to-reviewer smoke with E05 at G17 |
-| E02 | G00/G01/G17 | Repository owner | Maintain a usable solo-maintainer PR path; retain strict protected checks/admin enforcement/no force-push/deletion; move to required human/CODEOWNER review when a second maintainer exists | Complete for G00 on 2026-07-19: PR #1 was mergeable and `test`/`gitleaks` passed under the applied policy. W01 replaces contexts with aggregate `required-ci` |
+| E02 | G00/G01/G17 | Repository owner | Maintain a usable solo-maintainer PR path; retain strict protected checks/admin enforcement/no force-push/deletion; move to required human/CODEOWNER review when a second maintainer exists | Complete for G00/G01 on 2026-07-19: protected PRs #1, #2, and #5 merged through the authorized path; the sole strict aggregate `required-ci` context, admin enforcement, conversation resolution, and no force-push/deletion controls remain active. Revisit human/CODEOWNER review at G17 or when a second maintainer exists |
 | E03 | Before first public package/tag | Project owner | Verify project/distribution-name availability and complete any desired trademark/legal review; approve a plan amendment if names change | Pending |
 | E04 | G12–G14 | Operator/project owner | Supply sandbox-only credentials and explicitly authorize each live provider/session-format/notification/action call; approve the redacted destination and retain the smoke record | Pending; fixture work may proceed |
 | E05 | G17/G18 | Project owner and independent reviewer | Select an independent reviewer for security, provenance, package contents, and release evidence; record reviewer identity, scope, findings, fixes, and acceptance | Pending |
