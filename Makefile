@@ -67,6 +67,9 @@ test-coverage:
 		--critical 'src/milhouse/core/canonical.py' \
 		--critical 'src/milhouse/domain/identity.py' \
 		--critical 'src/milhouse/domain/records.py' \
+		--critical 'src/milhouse/privacy/pseudonym.py' \
+		--critical 'src/milhouse/privacy/render.py' \
+		--critical 'src/milhouse/privacy/sanitize.py' \
 		--critical 'scripts/check_artifacts.py' \
 		--critical 'scripts/check_coverage.py' \
 		--critical 'scripts/check_dco.py' \
