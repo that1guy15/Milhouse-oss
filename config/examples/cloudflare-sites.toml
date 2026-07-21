@@ -1,34 +1,140 @@
+config_version = 1
+
 [project]
 name = "cloudflare-example"
 default_target = "marketing-site"
-feedback_dir = ".milhouse"
+timezone = "UTC"
 
-[store]
-kind = "clickhouse"
-dsn_env = "MILHOUSE_CLICKHOUSE_DSN"
-jsonl_spool = "spool"
-state_dir = "data/state"
+[paths]
+home = "../../data/cloudflare-sites"
+spool = "spool"
+reports = "reports"
+logs = "logs"
+backups = "backups"
 
-[cloudflare]
+[secrets]
+env_files = ["../../.env"]
+
+[identity]
+pseudonym_key_path = "control/pseudonym.key"
+
+[plugins]
+allow_third_party = false
+
+[runtime]
+mode = "full"
+log_level = "INFO"
+max_batch_records = 500
+max_batch_bytes = 5242880
+
+[storage.clickhouse]
+enabled = true
+url_env = "MILHOUSE_CLICKHOUSE_URL"
+username_env = "MILHOUSE_CLICKHOUSE_USER"
+password_env = "MILHOUSE_CLICKHOUSE_PASSWORD"
+database = "milhouse"
+connect_timeout_seconds = 5
+
+[privacy]
+strict = true
+agent_summaries_enabled = false
+agent_trace_events_enabled = false
+trace_excerpts_enabled = false
+hash_local_paths = true
+
+[retention]
+events_days = 30
+metrics_days = 90
+runs_days = 180
+alerts_days = 365
+feedback_days = 365
+agent_summaries_days = 30
+trace_events_days = 14
+reports_days = 90
+logs_days = 14
+
+[scheduler]
+enabled = true
+jitter_seconds = 5
+shutdown_timeout_seconds = 30
+
+[reports.daily]
+enabled = true
+
+[reports.weekly]
+enabled = true
+
+[[jobs]]
+id = "collect-site-canary"
+type = "collector"
+collector = "marketing-canary"
+enabled = true
+schedule = "interval"
+interval_seconds = 60
+timeout_seconds = 15
+missed_run_policy = "run_once"
+
+[[jobs]]
+id = "collect-cloudflare-metrics"
+type = "collector"
+collector = "cloudflare-metrics"
+enabled = true
+schedule = "interval"
+interval_seconds = 300
+timeout_seconds = 60
+missed_run_policy = "run_once"
+
+[mcp]
+enabled = true
+transport = "stdio"
+allow_writes = false
+default_limit = 100
+maximum_limit = 500
+maximum_window_days = 30
+
+[postmortem]
+auto_on_doh_marker = true
+default_window_hours = 24
+scan_project_docs = true
+
+[receiver]
+enabled = false
+bind = "127.0.0.1"
+port = 8787
+allow_remote = false
+max_body_bytes = 262144
+requests_per_minute = 60
+clock_skew_seconds = 300
+
+[[targets]]
+id = "marketing-site"
+name = "Marketing Site"
+kind = "cloudflare_worker"
+environment = "production"
+base_url = "https://www.example.com"
+
+[[providers]]
+id = "cloudflare-primary"
+type = "cloudflare"
 account_id_env = "MILHOUSE_CLOUDFLARE_ACCOUNT_ID"
 token_env = "MILHOUSE_CLOUDFLARE_TOKEN"
 workers_token_env = "MILHOUSE_CLOUDFLARE_WORKERS_TOKEN"
 
-[[targets]]
-name = "marketing-site"
-kind = "cloudflare-worker"
-environment = "production"
-base_url = "https://www.example.com"
-
-[[collectors.site_canary]]
+[[collectors]]
+id = "marketing-canary"
+type = "site_canary"
 target = "marketing-site"
 url = "https://www.example.com"
-interval_seconds = 60
-timeout_seconds = 10
-expected_status = 200
+expected_statuses = [200]
+request_timeout_seconds = 10
 
-[[collectors.cloudflare_web_analytics]]
+[[collectors]]
+id = "cloudflare-metrics"
+type = "cloudflare"
 target = "marketing-site"
-enabled = false
-zone_tag_env = "MILHOUSE_EXAMPLE_ZONE_TAG"
-rum_site_tag_env = "MILHOUSE_EXAMPLE_RUM_SITE_TAG"
+provider = "cloudflare-primary"
+zone_account_mapping = { example-zone = "primary" }
+metric_families = ["requests", "errors"]
+late_arrival_overlap_seconds = 300
+page_size = 100
+window_seconds = 300

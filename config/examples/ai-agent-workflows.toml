@@ -1,32 +1,146 @@
+config_version = 1
+
 [project]
 name = "agent-workflow-example"
 default_target = "example-app"
-feedback_dir = ".milhouse"
+timezone = "UTC"
 
-[store]
-kind = "clickhouse"
-dsn_env = "MILHOUSE_CLICKHOUSE_DSN"
-jsonl_spool = "spool"
-state_dir = "data/state"
+[paths]
+home = "../../data/ai-agent-workflows"
+spool = "spool"
+reports = "reports"
+logs = "logs"
+backups = "backups"
+
+[secrets]
+env_files = []
+
+[identity]
+pseudonym_key_path = "control/pseudonym.key"
+
+[plugins]
+allow_third_party = false
+
+[runtime]
+mode = "spool_only"
+log_level = "INFO"
+max_batch_records = 250
+max_batch_bytes = 2097152
+
+[storage.clickhouse]
+enabled = false
+url_env = "MILHOUSE_CLICKHOUSE_URL"
+username_env = "MILHOUSE_CLICKHOUSE_USER"
+password_env = "MILHOUSE_CLICKHOUSE_PASSWORD"
+database = "milhouse"
+connect_timeout_seconds = 5
 
 [privacy]
-strict_redaction = true
-agent_trace_enabled = true
-store_raw_agent_transcripts = false
-retain_days = 14
+strict = true
+agent_summaries_enabled = true
+agent_trace_events_enabled = true
+trace_excerpts_enabled = false
+hash_local_paths = true
 
-[[collectors.agent_sessions]]
-agent = "codex"
-enabled = true
-source = "local-session-summary"
-paths = []
+[retention]
+events_days = 30
+metrics_days = 90
+runs_days = 180
+alerts_days = 365
+feedback_days = 365
+agent_summaries_days = 30
+trace_events_days = 14
+reports_days = 90
+logs_days = 14
 
-[[collectors.agent_sessions]]
-agent = "claude-code"
+[scheduler]
 enabled = true
-source = "local-session-summary"
-paths = []
+jitter_seconds = 5
+shutdown_timeout_seconds = 30
 
-[[collectors.feedback_outbox]]
+[reports.daily]
+enabled = false
+
+[reports.weekly]
 enabled = true
-repo_globs = ["~/work/*/.milhouse/feedback-outbox.jsonl"]
+
+[[jobs]]
+id = "collect-codex-sessions"
+type = "collector"
+collector = "codex-sessions"
+enabled = true
+schedule = "interval"
+interval_seconds = 300
+timeout_seconds = 60
+missed_run_policy = "run_once"
+
+[[jobs]]
+id = "collect-claude-sessions"
+type = "collector"
+collector = "claude-sessions"
+enabled = true
+schedule = "interval"
+interval_seconds = 300
+timeout_seconds = 60
+missed_run_policy = "run_once"
+
+[[jobs]]
+id = "curate-feedback"
+type = "feedback_curation"
+enabled = true
+schedule = "interval"
+interval_seconds = 300
+timeout_seconds = 60
+missed_run_policy = "run_once"
+
+[mcp]
+enabled = true
+transport = "stdio"
+allow_writes = false
+default_limit = 100
+maximum_limit = 500
+maximum_window_days = 30
+
+[postmortem]
+auto_on_doh_marker = true
+default_window_hours = 24
+scan_project_docs = true
+
+[receiver]
+enabled = false
+bind = "127.0.0.1"
+port = 8787
+allow_remote = false
+max_body_bytes = 262144
+requests_per_minute = 60
+clock_skew_seconds = 300
+
+[[targets]]
+id = "example-app"
+name = "Example App"
+kind = "local_app"
+environment = "development"
+repo_path = "/absolute/path/to/example-app"
+
+[[collectors]]
+id = "codex-sessions"
+type = "codex_session"
+target = "example-app"
+sessions_root = "/absolute/path/to/codex/sessions"
+target_repo_mapping = { example-repo = "example-app" }
+trace_categories = ["summary", "tool_event"]
+
+[[collectors]]
+id = "claude-sessions"
+type = "claude_session"
+target = "example-app"
+projects_root = "/absolute/path/to/claude/projects"
+target_repo_mapping = { example-repo = "example-app" }
+trace_categories = ["summary", "tool_event"]
+
+[[collectors]]
+id = "feedback-outbox"
+type = "file_outbox"
+target = "example-app"
+path = ".milhouse/feedback-outbox.jsonl"
+producer_allowlist = ["codex", "claude-code"]

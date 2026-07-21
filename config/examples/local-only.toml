@@ -1,28 +1,102 @@
+config_version = 1
+
 [project]
 name = "local-lab"
 default_target = "local-tool"
-feedback_dir = ".milhouse"
+timezone = "UTC"
 
-[store]
-kind = "clickhouse"
-dsn_env = "MILHOUSE_CLICKHOUSE_DSN"
-jsonl_spool = "spool"
-state_dir = "data/state"
+[paths]
+home = "../../data/local-only"
+spool = "spool"
+reports = "reports"
+logs = "logs"
+backups = "backups"
+
+[secrets]
+env_files = []
+
+[identity]
+pseudonym_key_path = "control/pseudonym.key"
+
+[plugins]
+allow_third_party = false
+
+[runtime]
+mode = "spool_only"
+log_level = "INFO"
+max_batch_records = 100
+max_batch_bytes = 1048576
+
+[storage.clickhouse]
+enabled = false
+url_env = "MILHOUSE_CLICKHOUSE_URL"
+username_env = "MILHOUSE_CLICKHOUSE_USER"
+password_env = "MILHOUSE_CLICKHOUSE_PASSWORD"
+database = "milhouse"
+connect_timeout_seconds = 5
 
 [privacy]
-strict_redaction = true
-agent_trace_enabled = false
-store_raw_agent_transcripts = false
+strict = true
+agent_summaries_enabled = false
+agent_trace_events_enabled = false
+trace_excerpts_enabled = false
+hash_local_paths = true
+
+[retention]
+events_days = 30
+metrics_days = 90
+runs_days = 180
+alerts_days = 365
+feedback_days = 365
+agent_summaries_days = 30
+trace_events_days = 14
+reports_days = 90
+logs_days = 14
+
+[scheduler]
+enabled = false
+jitter_seconds = 5
+shutdown_timeout_seconds = 30
+
+[reports.daily]
+enabled = false
+
+[reports.weekly]
+enabled = false
+
+[mcp]
+enabled = true
+transport = "stdio"
+allow_writes = false
+default_limit = 100
+maximum_limit = 500
+maximum_window_days = 30
+
+[postmortem]
+auto_on_doh_marker = false
+default_window_hours = 24
+scan_project_docs = false
+
+[receiver]
+enabled = false
+bind = "127.0.0.1"
+port = 8787
+allow_remote = false
+max_body_bytes = 262144
+requests_per_minute = 60
+clock_skew_seconds = 300
 
 [[targets]]
-name = "local-tool"
-kind = "local-app"
+id = "local-tool"
+name = "Local Tool"
+kind = "local_app"
 environment = "development"
 base_url = "http://localhost:3000"
 
-[[collectors.site_canary]]
+[[collectors]]
+id = "local-canary"
+type = "site_canary"
 target = "local-tool"
 url = "http://localhost:3000"
-interval_seconds = 60
-timeout_seconds = 5
-expected_status = 200
+expected_statuses = [200]
+request_timeout_seconds = 5
