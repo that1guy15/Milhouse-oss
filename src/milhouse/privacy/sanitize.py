@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from milhouse.privacy.pseudonym import PrivacyError, Pseudonymizer
 
@@ -51,11 +51,39 @@ def _validate_query_allowlist(keys: frozenset[str]) -> frozenset[str]:
 def _normalize_host(hostname: str) -> str:
     try:
         ascii_host = hostname.encode("idna").decode("ascii").lower()
-    except UnicodeError as error:
-        raise PrivacyError("MH_PRIVACY_URL_HOST", "URL host is invalid") from error
-    if not ascii_host or len(ascii_host) > 253:
-        raise PrivacyError("MH_PRIVACY_URL_HOST", "URL host is invalid")
-    return f"[{ascii_host}]" if ":" in ascii_host else ascii_host
+    except UnicodeError:
+        pass
+    else:
+        if not ascii_host or len(ascii_host) > 253:
+            raise PrivacyError("MH_PRIVACY_URL_HOST", "URL host is invalid")
+        return f"[{ascii_host}]" if ":" in ascii_host else ascii_host
+    raise PrivacyError("MH_PRIVACY_URL_HOST", "URL host is invalid")
+
+
+def _split_url(value: str) -> tuple[SplitResult, int | None]:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        pass
+    else:
+        return parsed, port
+    raise PrivacyError("MH_PRIVACY_URL", "URL is invalid")
+
+
+def _parse_query(value: str) -> list[tuple[str, str]]:
+    try:
+        fields = parse_qsl(
+            value,
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=MAX_QUERY_FIELDS,
+        )
+    except ValueError:
+        pass
+    else:
+        return fields
+    raise PrivacyError("MH_PRIVACY_URL_QUERY", "URL query is invalid")
 
 
 def sanitize_url(
@@ -69,11 +97,7 @@ def sanitize_url(
     allowlist = _validate_query_allowlist(allowed_query_keys)
     if any(character.isspace() for character in normalized):
         raise PrivacyError("MH_PRIVACY_URL", "URL contains whitespace")
-    try:
-        parsed = urlsplit(normalized)
-        port = parsed.port
-    except ValueError as error:
-        raise PrivacyError("MH_PRIVACY_URL", "URL is invalid") from error
+    parsed, port = _split_url(normalized)
     scheme = parsed.scheme.lower()
     if scheme not in {"http", "https"}:
         raise PrivacyError("MH_PRIVACY_URL_SCHEME", "URL scheme is not allowed")
@@ -100,15 +124,7 @@ def sanitize_url(
 
     safe_query: list[tuple[str, str]] = []
     if parsed.query:
-        try:
-            fields = parse_qsl(
-                parsed.query,
-                keep_blank_values=True,
-                strict_parsing=False,
-                max_num_fields=MAX_QUERY_FIELDS,
-            )
-        except ValueError as error:
-            raise PrivacyError("MH_PRIVACY_URL_QUERY", "URL query is invalid") from error
+        fields = _parse_query(parsed.query)
         for key, query_value in fields:
             if key in allowlist and _QUERY_VALUE_PATTERN.fullmatch(query_value) is not None:
                 safe_query.append((key, query_value))

@@ -6,6 +6,7 @@ from milhouse.privacy.allowlist import (
     FieldRule,
     apply_field_allowlist,
 )
+from milhouse.privacy.egress import EgressDisposition, EgressSurface, require_egress
 from milhouse.privacy.keys import (
     PSEUDONYM_KEY_MODE,
     PseudonymKeyCommitUncertain,
@@ -27,6 +28,8 @@ __all__ = [
     "PSEUDONYM_KEY_BYTES",
     "PSEUDONYM_KEY_MODE",
     "AllowedFields",
+    "EgressDisposition",
+    "EgressSurface",
     "FieldAllowlist",
     "FieldRule",
     "LayeredRedactor",
@@ -40,6 +43,7 @@ __all__ = [
     "load_pseudonym_key",
     "recover_pseudonym_key_creation",
     "render_untrusted_evidence",
+    "require_egress",
     "sanitize_local_path",
     "sanitize_url",
     "validate_pseudonym_kind",

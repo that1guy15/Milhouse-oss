@@ -20,6 +20,7 @@ CRITICAL_COVERAGE_FILES = {
     "src/milhouse/core/logging.py",
     "src/milhouse/domain/identity.py",
     "src/milhouse/domain/records.py",
+    "src/milhouse/privacy/egress.py",
     "src/milhouse/privacy/keys.py",
     "src/milhouse/privacy/allowlist.py",
     "src/milhouse/privacy/pseudonym.py",

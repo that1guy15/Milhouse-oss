@@ -1,4 +1,9 @@
+import traceback
+
+import pytest
+
 from milhouse.privacy import (
+    PrivacyError,
     Pseudonymizer,
     render_untrusted_evidence,
     sanitize_local_path,
@@ -42,3 +47,43 @@ def test_keyed_fingerprints_correlate_rejections_without_raw_value_disclosure() 
     assert first == second
     assert first.startswith("mh_fp1_e2_rejected_")
     assert rejected not in first
+
+
+def test_malformed_url_parser_failure_cannot_retain_the_rejected_value() -> None:
+    private_value = "synthetic-private-port-314159"
+
+    with pytest.raises(PrivacyError) as captured:
+        sanitize_url(f"https://example.invalid:{private_value}/")
+
+    error = captured.value
+    graph = (
+        str(error),
+        repr(error),
+        repr(error.args),
+        repr(error.__cause__),
+        repr(error.__context__),
+        "".join(traceback.format_exception(error)),
+    )
+    assert error.code == "MH_PRIVACY_URL"
+    assert all(private_value not in value for value in graph)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("value", "code"),
+    (
+        ("https://\u200d.invalid/", "MH_PRIVACY_URL_HOST"),
+        (
+            "https://example.invalid/?" + "&".join(f"field{index}=value" for index in range(101)),
+            "MH_PRIVACY_URL_QUERY",
+        ),
+    ),
+)
+def test_url_parser_failures_are_detached_from_internal_exceptions(value: str, code: str) -> None:
+    with pytest.raises(PrivacyError) as captured:
+        sanitize_url(value)
+
+    assert captured.value.code == code
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
