@@ -1,58 +1,200 @@
+config_version = 1
+
 [project]
 name = "example-team"
 default_target = "example-app"
-feedback_dir = ".milhouse"
+timezone = "UTC"
 
-[store]
-kind = "clickhouse"
-dsn_env = "MILHOUSE_CLICKHOUSE_DSN"
-jsonl_spool = "spool"
-state_dir = "data/state"
-clickhouse_database = "milhouse"
+[paths]
+home = "../data"
+spool = "spool"
+reports = "reports"
+logs = "logs"
+backups = "backups"
+
+[secrets]
+env_files = ["../.env"]
+
+[identity]
+pseudonym_key_path = "control/pseudonym.key"
+
+[plugins]
+allow_third_party = false
+
+[runtime]
+mode = "full"
+log_level = "INFO"
+max_batch_records = 500
+max_batch_bytes = 5242880
+
+[storage.clickhouse]
+enabled = true
+url_env = "MILHOUSE_CLICKHOUSE_URL"
+username_env = "MILHOUSE_CLICKHOUSE_USER"
+password_env = "MILHOUSE_CLICKHOUSE_PASSWORD"
+database = "milhouse"
+connect_timeout_seconds = 5
 
 [privacy]
-strict_redaction = true
-agent_trace_enabled = false
-retain_days = 30
-store_raw_agent_transcripts = false
+strict = true
+agent_summaries_enabled = false
+agent_trace_events_enabled = false
+trace_excerpts_enabled = false
+hash_local_paths = true
 
-[[targets]]
-name = "example-app"
-kind = "web-service"
-environment = "production"
-base_url = "https://example.com"
+[retention]
+events_days = 30
+metrics_days = 90
+runs_days = 180
+alerts_days = 365
+feedback_days = 365
+agent_summaries_days = 30
+trace_events_days = 14
+reports_days = 90
+logs_days = 14
 
-[[collectors.site_canary]]
-target = "example-app"
-url = "https://example.com/health"
+[scheduler]
+enabled = true
+jitter_seconds = 5
+shutdown_timeout_seconds = 30
+
+[reports.daily]
+enabled = true
+
+[reports.weekly]
+enabled = true
+
+[[jobs]]
+id = "replay-pending"
+type = "spool_replay"
+enabled = true
+schedule = "interval"
 interval_seconds = 60
-timeout_seconds = 10
-expected_status = 200
+timeout_seconds = 30
+missed_run_policy = "run_once"
 
-[[collectors.browser_errors]]
-target = "example-app"
-source = "http"
-endpoint = "/milhouse/browser-error"
-enabled = false
+[[jobs]]
+id = "collect-example-canary"
+type = "collector"
+collector = "example-canary"
+enabled = true
+schedule = "interval"
+interval_seconds = 60
+timeout_seconds = 15
+missed_run_policy = "run_once"
 
-[[collectors.backend_errors]]
-target = "example-app"
-source = "http"
-endpoint = "/milhouse/backend-error"
-enabled = false
+[[jobs]]
+id = "verify-feedback"
+type = "feedback_verification"
+enabled = true
+schedule = "interval"
+interval_seconds = 300
+timeout_seconds = 60
+missed_run_policy = "run_once"
 
-[[collectors.deploy_events]]
-target = "example-app"
-source = "github-actions"
-enabled = false
+[[jobs]]
+id = "weekly-report"
+type = "weekly_report"
+enabled = true
+schedule = "weekly"
+weekday = "monday"
+local_time = "08:00"
+timeout_seconds = 120
+missed_run_policy = "run_once"
 
 [mcp]
 enabled = true
-read_only_by_default = true
+transport = "stdio"
+allow_writes = false
+default_limit = 100
+maximum_limit = 500
+maximum_window_days = 30
 
-[notifications.telegram]
+[postmortem]
+auto_on_doh_marker = true
+default_window_hours = 24
+scan_project_docs = true
+
+[receiver]
+enabled = false
+bind = "127.0.0.1"
+port = 8787
+allow_remote = false
+max_body_bytes = 262144
+requests_per_minute = 60
+clock_skew_seconds = 300
+
+[[receiver.sources]]
+id = "example-backend"
+type = "hmac_v1"
+target = "example-app"
+secret_env = "MILHOUSE_INGEST_EXAMPLE_SECRET"
+allowed_paths = [
+  "/v1/ingest/events",
+  "/v1/ingest/backend-errors",
+  "/v1/ingest/browser-errors",
+]
+
+[[receiver.sources]]
+id = "example-github-webhook"
+type = "github_webhook"
+target = "example-app"
+secret_env = "MILHOUSE_GITHUB_WEBHOOK_SECRET"
+repository = "example/example-app"
+
+[[targets]]
+id = "example-app"
+name = "Example App"
+kind = "web_service"
+environment = "production"
+base_url = "https://example.com"
+repo_path = "/absolute/path/to/example-app"
+
+[[collectors]]
+id = "example-canary"
+type = "site_canary"
+target = "example-app"
+url = "https://example.com/health"
+expected_statuses = [200]
+request_timeout_seconds = 10
+
+[[providers]]
+id = "example-cloudflare"
+type = "cloudflare"
+account_id_env = "MILHOUSE_CLOUDFLARE_ACCOUNT_ID"
+token_env = "MILHOUSE_CLOUDFLARE_TOKEN"
+
+[[notifications]]
+id = "team-telegram"
+type = "telegram"
 enabled = false
 bot_token_env = "MILHOUSE_TELEGRAM_BOT_TOKEN"
 chat_id_env = "MILHOUSE_TELEGRAM_CHAT_ID"
-weekly_summary = true
 urgent_alerts = true
+weekly_summary = true
+
+[[alert_rules]]
+id = "example-canary-state"
+type = "canary_state"
+collector = "example-canary"
+consecutive_failures = 2
+consecutive_successes = 2
+cooldown_seconds = 300
+
+[[incident_rules]]
+id = "example-availability-incident"
+target = "example-app"
+alert_rule_ids = ["example-canary-state"]
+group_dimensions = []
+correlation_horizon_seconds = 900
+quiet_window_seconds = 300
+
+[[feedback_rules]]
+id = "example-canary-recurrence"
+type = "recurrence"
+target = "example-app"
+record_names = ["canary.state_changed"]
+minimum_occurrences = 2
+window_seconds = 86400
+priority = "P1"
+actionability = "needs_approval"
