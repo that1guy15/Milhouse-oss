@@ -14,6 +14,7 @@ CRITICAL_COVERAGE_FILES = {
     "src/milhouse/config/secrets.py",
     "src/milhouse/resources/__init__.py",
     "src/milhouse/core/canonical.py",
+    "src/milhouse/core/clock.py",
     "src/milhouse/domain/identity.py",
     "src/milhouse/domain/records.py",
     "src/milhouse/privacy/keys.py",

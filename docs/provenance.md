@@ -90,7 +90,7 @@ does not mean copying a private module unchanged.
 
 | Private donor path at the fixed revision | Approved disposition | New OSS owner area | Mandatory guardrail | W00/current import state |
 |---|---|---|---|---|
-| `src/milhouse/timeutils.py` | Adapt small pure helper ideas | `src/milhouse/core/clock.py` | Inject the clock; strict UTC/DST behavior and fuzz tests | Not imported |
+| `src/milhouse/timeutils.py` | Adapt small pure helper ideas | `src/milhouse/core/clock.py` | Inject the clock; strict UTC/DST behavior and fuzz tests | W02 candidate adapts only the single-unit elapsed-duration idea from the fixed revision into a fresh caller-bounded ASCII parser and injected wall/monotonic clock; no donor expression, fixtures, history, defaulting, permissive parsing, or direct wall-clock behavior was imported; synthetic unit/property/security tests and independent diff review are required before merge |
 | `src/milhouse/exporters/base.py` | Adapt result/protocol ideas | `src/milhouse/delivery/base.py` | v1 idempotency and checkpoint contracts replace donor state behavior | Not imported |
 | `src/milhouse/exporters/clickhouse.py` | Reference serialization/type mapping only | `src/milhouse/storage/clickhouse/` | New migrations, authentication, dedupe, spool checkpoints, and failure model | Not imported |
 | `src/milhouse/collectors/site_canary.py` | Adapt HTTP observation behavior | `src/milhouse/collectors/site_canary.py` | New config/domain/privacy/runtime boundaries; collector cannot persist directly | Not imported |

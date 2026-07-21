@@ -5,13 +5,24 @@ from milhouse.core.canonical import (
     canonical_json_bytes,
     canonical_json_text,
 )
-from milhouse.core.clock import Clock, FixedClock, SystemClock, format_timestamp
+from milhouse.core.clock import (
+    Clock,
+    FixedClock,
+    MonotonicClock,
+    SystemClock,
+    TimeError,
+    WallClock,
+    format_timestamp,
+)
 
 __all__ = [
     "CanonicalizationError",
     "Clock",
     "FixedClock",
+    "MonotonicClock",
     "SystemClock",
+    "TimeError",
+    "WallClock",
     "canonical_json_bytes",
     "canonical_json_text",
     "format_timestamp",
