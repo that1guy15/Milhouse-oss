@@ -36,3 +36,5 @@
   publication; ACL-free private `0700` parent and `0600` key enforcement; owner/link/identity and
   published-byte validation; wrong-key detection; value-safe failures; and explicit recovery from
   uncertain publication commits.
+- Add injectable UTC wall and process-local monotonic clocks plus a strict internal ASCII elapsed-
+  duration parser whose lower and upper bounds are supplied by each owning caller.

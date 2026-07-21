@@ -69,6 +69,7 @@ test-coverage:
 		--critical 'src/milhouse/config/secrets.py' \
 		--critical 'src/milhouse/resources/__init__.py' \
 		--critical 'src/milhouse/core/canonical.py' \
+		--critical 'src/milhouse/core/clock.py' \
 		--critical 'src/milhouse/domain/identity.py' \
 		--critical 'src/milhouse/domain/records.py' \
 		--critical 'src/milhouse/privacy/keys.py' \
