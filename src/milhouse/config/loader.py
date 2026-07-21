@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
-import errno
+import hashlib
+import hmac
+import json
 import os
 import re
-import stat
 import tomllib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from milhouse.config.errors import ConfigError
+from milhouse.config.filesystem import (
+    FileIdentity,
+    FileSelection,
+    FileSnapshot,
+    SecureFileError,
+    SecureFileErrorKind,
+    inspect_regular_file_no_follow,
+    open_regular_file_no_follow,
+)
 from milhouse.config.models import CONFIG_VERSION, MilhouseConfig
 
 CONFIG_PATH_ENV_VAR = "MILHOUSE_CONFIG"
@@ -20,13 +32,96 @@ MAX_CONFIG_BYTES = 1_048_576
 _TOML_LOCATION_PATTERN = re.compile(r"at line (\d+), column (\d+)")
 
 
-class ConfigError(Exception):
-    """A stable, value-free configuration loading or validation failure."""
+@dataclass(frozen=True, slots=True, repr=False)
+class ConfigFileSelection:
+    """Path and identity of the exact config file securely read by ``load_config``."""
 
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.message = message
+    path: Path
+    parent_identity: FileIdentity
+    snapshot: FileSnapshot
+    config_digest: str
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+    def __repr__(self) -> str:
+        return "ConfigFileSelection(selected=True)"
+
+    __str__ = __repr__
+
+
+def _config_open_error(error: SecureFileError) -> ConfigError:
+    if error.kind is SecureFileErrorKind.INVALID:
+        return ConfigError("config.path.invalid", "config path is invalid")
+    if error.kind is SecureFileErrorKind.NOT_FOUND:
+        return ConfigError("config.file.not_found", "config file was not found")
+    if error.kind is SecureFileErrorKind.NOT_REGULAR:
+        return ConfigError("config.file.not_regular", "config path must be a regular file")
+    if error.kind is SecureFileErrorKind.SECURITY_UNSUPPORTED:
+        return ConfigError(
+            "config.file.security_unsupported",
+            "safe config file opening is unavailable",
+        )
+    return ConfigError("config.file.unreadable", "config file could not be opened")
+
+
+def _bind_selection(selection: FileSelection, *, config_digest: str) -> ConfigFileSelection:
+    return ConfigFileSelection(
+        path=selection.path,
+        parent_identity=selection.parent_identity,
+        snapshot=selection.snapshot,
+        config_digest=config_digest,
+    )
+
+
+def validated_config_digest(config: MilhouseConfig) -> str:
+    """Return a deterministic opaque binding for one fully validated config model."""
+
+    try:
+        payload = json.dumps(
+            config.model_dump(mode="json"),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except Exception:
+        raise ConfigError(
+            "config.selection.mismatch",
+            "validated config does not match the selected file generation",
+        ) from None
+    return hashlib.sha256(payload).hexdigest()
+
+
+def verify_config_file_selection(selection: ConfigFileSelection) -> ConfigFileSelection:
+    """Refuse a selected config path whose parent, file identity, or content changed."""
+
+    try:
+        current = inspect_regular_file_no_follow(selection.path)
+    except SecureFileError:
+        raise ConfigError(
+            "config.file.changed", "config path changed after it was selected"
+        ) from None
+    if (
+        current.path != selection.path
+        or current.parent_identity != selection.parent_identity
+        or current.snapshot != selection.snapshot
+    ):
+        raise ConfigError("config.file.changed", "config path changed after it was selected")
+    return selection
+
+
+def verify_config_generation(
+    config: MilhouseConfig, selection: ConfigFileSelection
+) -> ConfigFileSelection:
+    """Verify that a model and securely selected config file belong to one loaded generation."""
+
+    if not hmac.compare_digest(validated_config_digest(config), selection.config_digest):
+        raise ConfigError(
+            "config.selection.mismatch",
+            "validated config does not match the selected file generation",
+        )
+    return verify_config_file_selection(selection)
 
 
 def resolve_config_path(
@@ -51,53 +146,20 @@ def resolve_config_path(
     return Path(platform_default)
 
 
-def _read_config_text(path: Path) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    flags |= nofollow
-    before: os.stat_result | None = None
-
+def _read_config_text(path: Path) -> tuple[str, FileSelection]:
     try:
-        if nofollow == 0:
-            before = os.lstat(path)
-            if stat.S_ISLNK(before.st_mode):
-                raise ConfigError("config.file.not_regular", "config path must not be a symlink")
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
-        raise ConfigError("config.file.not_found", "config file was not found") from None
-    except ConfigError:
-        raise
-    except ValueError:
-        raise ConfigError("config.path.invalid", "config path is invalid") from None
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise ConfigError(
-                "config.file.not_regular", "config path must not be a symlink"
-            ) from None
-        raise ConfigError("config.file.unreadable", "config file could not be opened") from None
+        opened = open_regular_file_no_follow(path)
+    except SecureFileError as error:
+        raise _config_open_error(error) from None
 
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ConfigError("config.file.not_regular", "config path must be a regular file")
-        if before is not None and (before.st_dev, before.st_ino) != (
-            metadata.st_dev,
-            metadata.st_ino,
-        ):
-            raise ConfigError(
-                "config.file.changed", "config file changed while it was being opened"
-            )
-        if metadata.st_size > MAX_CONFIG_BYTES:
-            raise ConfigError(
-                "config.file.too_large",
-                f"config file exceeds the {MAX_CONFIG_BYTES}-byte bound",
-            )
-    except ConfigError:
+    descriptor = opened.descriptor
+    selection = opened.selection
+    if selection.snapshot.size > MAX_CONFIG_BYTES:
         os.close(descriptor)
-        raise
-    except OSError:
-        os.close(descriptor)
-        raise ConfigError("config.file.unreadable", "config file could not be read") from None
+        raise ConfigError(
+            "config.file.too_large",
+            f"config file exceeds the {MAX_CONFIG_BYTES}-byte bound",
+        )
 
     try:
         stream = os.fdopen(descriptor, "rb", closefd=True)
@@ -109,19 +171,7 @@ def _read_config_text(path: Path) -> str:
         with stream:
             raw = stream.read(MAX_CONFIG_BYTES + 1)
             after_read = os.fstat(stream.fileno())
-            if (
-                metadata.st_dev,
-                metadata.st_ino,
-                metadata.st_size,
-                metadata.st_mtime_ns,
-                metadata.st_ctime_ns,
-            ) != (
-                after_read.st_dev,
-                after_read.st_ino,
-                after_read.st_size,
-                after_read.st_mtime_ns,
-                after_read.st_ctime_ns,
-            ):
+            if selection.snapshot != FileSnapshot.from_stat(after_read):
                 raise ConfigError(
                     "config.file.changed", "config file changed while it was being read"
                 )
@@ -138,11 +188,24 @@ def _read_config_text(path: Path) -> str:
             f"config file exceeds the {MAX_CONFIG_BYTES}-byte bound",
         )
     try:
-        return raw.decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
         raise ConfigError(
             "config.file.unreadable", "config file could not be read as UTF-8"
         ) from None
+
+    try:
+        current = inspect_regular_file_no_follow(selection.path)
+    except SecureFileError:
+        raise ConfigError(
+            "config.file.changed", "config path changed while it was being read"
+        ) from None
+    if (
+        current.parent_identity != selection.parent_identity
+        or current.snapshot != selection.snapshot
+    ):
+        raise ConfigError("config.file.changed", "config path changed while it was being read")
+    return text, selection
 
 
 def _extract_toml_location(message: str) -> str | None:
@@ -187,10 +250,16 @@ def _validate_model(data: Mapping[str, object]) -> MilhouseConfig:
 def load_config_file(path: str | Path) -> MilhouseConfig:
     """Load and strictly validate a bounded, regular-file TOML config document."""
 
-    text = _read_config_text(Path(path))
+    config, _selection = _load_config_document(path)
+    return config
+
+
+def _load_config_document(path: str | Path) -> tuple[MilhouseConfig, ConfigFileSelection]:
+    text, selection = _read_config_text(Path(path))
     data = _parse_toml(text)
     _check_config_version(data)
-    return _validate_model(data)
+    config = _validate_model(data)
+    return config, _bind_selection(selection, config_digest=validated_config_digest(config))
 
 
 def load_config(
@@ -198,18 +267,22 @@ def load_config(
     *,
     platform_default: str | Path,
     env: Mapping[str, str] | None = None,
-) -> tuple[MilhouseConfig, Path]:
+) -> tuple[MilhouseConfig, ConfigFileSelection]:
     """Resolve the config path by precedence, then load and validate it."""
 
     path = resolve_config_path(cli_path, platform_default=platform_default, env=env)
-    return load_config_file(path), path
+    return _load_config_document(path)
 
 
 __all__ = [
     "CONFIG_PATH_ENV_VAR",
     "MAX_CONFIG_BYTES",
     "ConfigError",
+    "ConfigFileSelection",
     "load_config",
     "load_config_file",
     "resolve_config_path",
+    "validated_config_digest",
+    "verify_config_file_selection",
+    "verify_config_generation",
 ]

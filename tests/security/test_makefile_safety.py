@@ -8,6 +8,10 @@ import sys
 from pathlib import Path
 
 CRITICAL_COVERAGE_FILES = {
+    "src/milhouse/config/filesystem.py",
+    "src/milhouse/config/loader.py",
+    "src/milhouse/config/paths.py",
+    "src/milhouse/config/secrets.py",
     "src/milhouse/resources/__init__.py",
     "src/milhouse/core/canonical.py",
     "src/milhouse/domain/identity.py",

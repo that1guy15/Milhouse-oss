@@ -4,17 +4,30 @@ import pytest
 from click.testing import CliRunner
 
 from milhouse.cli import main
+from milhouse.cli.root import CliState
 from milhouse.config import generate_json_schema_bytes
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG = REPOSITORY_ROOT / "config/example.toml"
 
 
-def test_root_help_exposes_config_commands_and_global_path_option() -> None:
+def test_cli_state_representation_never_contains_local_paths() -> None:
+    private_config = "/private/config-fragment-0123456789.toml"
+    private_env = "/private/env-fragment-0123456789.env"
+    state = CliState(config_path=private_config, env_file=private_env)
+
+    assert repr(state) == "CliState(config_path_set=True, env_file_set=True)"
+    assert str(state) == repr(state)
+    assert private_config not in repr(state)
+    assert private_env not in repr(state)
+
+
+def test_root_help_exposes_config_commands_and_global_path_options() -> None:
     result = CliRunner().invoke(main, ["--help"])
 
     assert result.exit_code == 0
     assert "--config PATH" in result.output
+    assert "--env-file PATH" in result.output
     assert "config" in result.output
 
 
@@ -83,7 +96,7 @@ def test_config_validate_failure_is_stable_and_value_safe(tmp_path: Path) -> Non
         ["--config", str(config_path), "config", "validate"],
     )
 
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert "config.schema.invalid" in result.stderr
     assert secret_looking_value not in result.output
     assert secret_looking_value not in result.stderr

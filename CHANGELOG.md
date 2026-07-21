@@ -23,3 +23,12 @@
   selects the matching `docker` or `docker-compose` ecosystem.
 - Replace scaffold setup guidance with W01 contributor, development, dependency, package, and
   security workflow documentation while reserving product initialization for W06.
+- Add strict configuration v1 models, validated public examples, deterministic JSON Schema export,
+  and offline `config validate` and `config schema` commands.
+- Add deterministic canonical bytes, record IDs and content hashes, immutable record envelopes, and
+  append-only feedback transition validation.
+- Add installation-keyed pseudonyms, URL/path sanitization, untrusted evidence rendering, layered
+  credential/PII redaction, and exact nested field allowlists.
+- Add canonical `STATE_ROOT` resolution with contained runtime children and symlink-escape refusal,
+  plus bounded explicit env-file loading with process/CLI/configured precedence, no discovery or
+  interpolation, safe source metadata, and non-enumerating secret storage.
