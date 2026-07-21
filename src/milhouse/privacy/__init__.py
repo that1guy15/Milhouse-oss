@@ -17,6 +17,7 @@ from milhouse.privacy.pseudonym import (
     PSEUDONYM_KEY_BYTES,
     PrivacyError,
     Pseudonymizer,
+    validate_pseudonym_kind,
 )
 from milhouse.privacy.redact import LayeredRedactor, RedactionResult
 from milhouse.privacy.render import render_untrusted_evidence
@@ -41,4 +42,5 @@ __all__ = [
     "render_untrusted_evidence",
     "sanitize_local_path",
     "sanitize_url",
+    "validate_pseudonym_kind",
 ]

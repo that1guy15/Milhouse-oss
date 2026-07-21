@@ -9,6 +9,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from milhouse.core.clock import format_timestamp
+from milhouse.core.errors import MilhouseValueError
 
 MIN_CANONICAL_INT = -(2**63)
 MAX_CANONICAL_INT = 2**63 - 1
@@ -17,12 +18,8 @@ DEFAULT_MAX_NODES = 10_000
 DEFAULT_MAX_BYTES = 262_144
 
 
-class CanonicalizationError(ValueError):
+class CanonicalizationError(MilhouseValueError):
     """Safe, stable failure raised for values outside CanonicalJSONV1."""
-
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
-        super().__init__(f"{code}: {message}")
 
 
 def _normalize_string(value: str) -> str:

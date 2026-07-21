@@ -23,6 +23,7 @@ from milhouse.core.canonical import (
     CanonicalizationError,
     canonical_json_bytes,
 )
+from milhouse.core.errors import MilhouseValueError
 from milhouse.core.immutable import freeze_dict
 
 MachineIdV1 = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
@@ -71,12 +72,8 @@ def _contains_unsafe_identifier_characters(value: str) -> bool:
     )
 
 
-class IdentityError(ValueError):
+class IdentityError(MilhouseValueError):
     """Safe identity derivation or validation failure."""
-
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
-        super().__init__(f"{code}: {message}")
 
 
 class _StrictModel(BaseModel):

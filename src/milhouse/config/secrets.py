@@ -15,6 +15,7 @@ from typing import Any
 from dotenv.parser import parse_stream
 from pydantic import BaseModel
 
+from milhouse.config._models import MilhouseConfig
 from milhouse.config.errors import ConfigError
 from milhouse.config.filesystem import (
     FileSnapshot,
@@ -23,7 +24,6 @@ from milhouse.config.filesystem import (
     open_regular_file_no_follow,
 )
 from milhouse.config.loader import verify_config_generation
-from milhouse.config.models import MilhouseConfig
 from milhouse.config.paths import RuntimePaths, resolve_config_source_path
 
 MAX_ENV_FILE_BYTES = 1_048_576

@@ -10,6 +10,7 @@ import stat
 from collections.abc import Callable
 from pathlib import Path
 
+from milhouse.config._models import MilhouseConfig
 from milhouse.config.filesystem import (
     FileSelection,
     SecureFileError,
@@ -20,7 +21,6 @@ from milhouse.config.filesystem import (
     sync_parent_directory_no_follow,
 )
 from milhouse.config.loader import verify_config_generation
-from milhouse.config.models import MilhouseConfig
 from milhouse.config.paths import RuntimePaths, verify_runtime_path_generation
 from milhouse.privacy.pseudonym import (
     PSEUDONYM_KEY_BYTES,

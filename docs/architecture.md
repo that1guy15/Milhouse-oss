@@ -38,6 +38,11 @@ ClickHouse failure never prevents unrelated durable collection. Deterministic re
 
 - Allowlist normalization and redaction precede spool, state, logs, ClickHouse, terminal output, reports, diagnostics, notifications, and MCP.
 - Restricted input is discarded; only separately normalized safe audit metadata may survive.
+- Configuration construction crosses the bounded loader API; raw Pydantic models and their
+  value-bearing validation internals are private implementation details.
+- Internal structured events accept catalog-owned machine event identities, allowlisted stable error
+  codes, bounded code-owned numeric metadata, and keyed fingerprints derived inside the logger from
+  a catalog-owned kind; they have no arbitrary-text or exception-detail field.
 - Raw prompts, responses, transcripts, and tool output are never persisted in 1.0.
 - Agent summaries/traces are structured, bounded, and disabled by default.
 - Hosted storage, receiver remote bind, notifications, GitHub writes, and MCP writes are independent opt-ins.

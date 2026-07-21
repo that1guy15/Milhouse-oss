@@ -1,10 +1,10 @@
-"""Strict Pydantic v2 domain models for Milhouse configuration v1."""
+"""Private strict Pydantic v2 models backing safe configuration APIs."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal, Protocol, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -149,7 +149,49 @@ class _HasId(Protocol):
 class StrictModel(BaseModel):
     """Base model shared by every Milhouse configuration node."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        hide_input_in_errors=True,
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unknown_fields(cls, value: object) -> object:
+        if isinstance(value, Mapping) and any(
+            type(key) is not str or key not in cls.model_fields for key in value
+        ):
+            raise ValueError("configuration contains an unknown field")
+        return value
+
+
+def _discriminator_values(annotation: object) -> frozenset[str]:
+    union = get_args(annotation)[0]
+    values: set[str] = set()
+    for model in get_args(union):
+        field = model.model_fields["type"]
+        values.update(value for value in get_args(field.annotation) if type(value) is str)
+    return frozenset(values)
+
+
+def _reject_invalid_discriminator_entries(
+    value: object,
+    *,
+    field: str,
+    allowed: frozenset[str],
+) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    entries = value.get(field)
+    if not isinstance(entries, list):
+        return value
+    if any(
+        isinstance(entry, Mapping)
+        and (type(entry.get("type")) is not str or entry.get("type") not in allowed)
+        for entry in entries
+    ):
+        raise ValueError("configuration contains an invalid discriminator")
+    return value
 
 
 def require_unique_ids(items: Sequence[_HasId], *, label: str) -> frozenset[str]:
@@ -324,6 +366,7 @@ class GithubWebhookSource(_ReceiverSourceBase):
 
 
 ReceiverSource = Annotated[HmacIngestSource | GithubWebhookSource, Field(discriminator="type")]
+_RECEIVER_SOURCE_TYPES = _discriminator_values(ReceiverSource)
 
 
 class ReceiverConfig(StrictModel):
@@ -335,6 +378,15 @@ class ReceiverConfig(StrictModel):
     requests_per_minute: int = Field(ge=1, le=_COUNT_MAX)
     clock_skew_seconds: int = Field(ge=1, le=_SECONDS_MAX)
     sources: list[ReceiverSource] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_invalid_source_types(cls, value: object) -> object:
+        return _reject_invalid_discriminator_entries(
+            value,
+            field="sources",
+            allowed=_RECEIVER_SOURCE_TYPES,
+        )
 
 
 # --- targets -----------------------------------------------------------------
@@ -757,6 +809,13 @@ JobConfig = Annotated[
     Field(discriminator="type"),
 ]
 
+_ROOT_DISCRIMINATED_COLLECTIONS = (
+    ("collectors", _discriminator_values(CollectorConfig)),
+    ("providers", _discriminator_values(ProviderConfig)),
+    ("notifications", _discriminator_values(NotificationConfig)),
+    ("jobs", _discriminator_values(JobConfig)),
+)
+
 
 # --- root configuration ----------------------------------------------------------
 
@@ -794,6 +853,17 @@ class MilhouseConfig(StrictModel):
     alert_rules: list[AlertRuleConfig] = Field(default_factory=list)
     incident_rules: list[IncidentRuleConfig] = Field(default_factory=list)
     feedback_rules: list[FeedbackRuleConfig] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_invalid_root_discriminators(cls, value: object) -> object:
+        for field, allowed in _ROOT_DISCRIMINATED_COLLECTIONS:
+            value = _reject_invalid_discriminator_entries(
+                value,
+                field=field,
+                allowed=allowed,
+            )
+        return value
 
     @model_validator(mode="after")
     def _check_cross_references(self) -> MilhouseConfig:
@@ -917,7 +987,6 @@ __all__ = [
     "JobConfig",
     "MCPConfig",
     "MachineName",
-    "MilhouseConfig",
     "NotificationConfig",
     "NotificationRetryJob",
     "PathsConfig",

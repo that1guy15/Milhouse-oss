@@ -22,6 +22,7 @@ from milhouse.core.canonical import (
     CanonicalizationError,
     canonical_json_bytes,
 )
+from milhouse.core.errors import MilhouseValueError
 from milhouse.core.immutable import freeze_dict, freeze_list
 from milhouse.domain.identity import (
     InstallationIdV1,
@@ -58,12 +59,8 @@ ScalarV1: TypeAlias = bool | int | float | str
 _DIMENSION_KEY = re.compile(r"^[a-z][a-z0-9_.-]*$")
 
 
-class RecordError(ValueError):
+class RecordError(MilhouseValueError):
     """A stable record construction or identity-verification failure."""
-
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
-        super().__init__(f"{code}: {message}")
 
 
 class _StrictRecordModel(BaseModel):

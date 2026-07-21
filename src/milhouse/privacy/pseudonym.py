@@ -8,6 +8,8 @@ import hmac
 import re
 import unicodedata
 
+from milhouse.core.errors import MilhouseValueError
+
 PSEUDONYM_KEY_BYTES = 32
 MAX_PSEUDONYM_INPUT_BYTES = 1_048_576
 MAX_PSEUDONYM_KIND_BYTES = 32
@@ -18,12 +20,8 @@ _FINGERPRINT_DOMAIN = b"milhouse-fingerprint-v1\0"
 _KEY_ID_DOMAIN = b"milhouse-pseudonym-key-id-v1\0"
 
 
-class PrivacyError(ValueError):
+class PrivacyError(MilhouseValueError):
     """A stable privacy failure whose message never contains rejected input."""
-
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
-        super().__init__(f"{code}: {message}")
 
 
 def _base32(value: bytes) -> str:
@@ -44,13 +42,19 @@ def _normalize_text(value: str) -> bytes:
     return encoded
 
 
-def _validate_kind(kind: str) -> bytes:
+def validate_pseudonym_kind(kind: str) -> str:
+    """Return one code-owned kind accepted by every pseudonym operation."""
+
     if type(kind) is not str or _KIND_PATTERN.fullmatch(kind) is None:
         raise PrivacyError("MH_PRIVACY_KIND", "pseudonym kind is invalid")
     encoded = kind.encode("ascii")
     if len(encoded) > MAX_PSEUDONYM_KIND_BYTES:  # pragma: no cover - regex bounds this
         raise PrivacyError("MH_PRIVACY_KIND", "pseudonym kind is invalid")
-    return encoded
+    return kind
+
+
+def _validate_kind(kind: str) -> bytes:
+    return validate_pseudonym_kind(kind).encode("ascii")
 
 
 def validate_pseudonym_epoch(epoch: int) -> int:
@@ -114,4 +118,5 @@ __all__ = [
     "PrivacyError",
     "Pseudonymizer",
     "validate_pseudonym_epoch",
+    "validate_pseudonym_kind",
 ]

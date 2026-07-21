@@ -9,6 +9,8 @@ from importlib import resources
 from pathlib import PurePosixPath
 from typing import Final
 
+from milhouse.core.errors import MilhouseValueError
+
 _DISTRIBUTION: Final = "milhouse-observability"
 _IMPORT_PACKAGE: Final = "milhouse"
 _MANIFEST_VERSION: Final = 1
@@ -17,8 +19,17 @@ _MANIFEST_KEYS: Final = frozenset(
 )
 
 
-class ResourceManifestError(ValueError):
+class ResourceManifestError(MilhouseValueError):
     """Raised when the packaged resource manifest violates its contract."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("MH_RESOURCE_MANIFEST", message)
+
+    @staticmethod
+    def _format_exception(_code: str, message: str) -> str:
+        """Preserve the W01 human rendering while adding a machine code."""
+
+        return message
 
 
 def _validate_resource_path(value: object) -> str:
@@ -88,9 +99,11 @@ def load_manifest() -> ResourceManifest:
     manifest_file = resources.files(__package__).joinpath("manifest.json")
     try:
         decoded = json.loads(manifest_file.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ResourceManifestError("unable to read the packaged resource manifest") from exc
-    return ResourceManifest.from_mapping(decoded)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        failure = ResourceManifestError("unable to read the packaged resource manifest")
+    else:
+        return ResourceManifest.from_mapping(decoded)
+    raise failure
 
 
 def read_resource_text(relative_path: str) -> str:
@@ -106,8 +119,9 @@ def read_resource_text(relative_path: str) -> str:
         target = target.joinpath(part)
     try:
         return target.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        raise ResourceManifestError("unable to read a declared package resource") from exc
+    except (OSError, UnicodeError):
+        failure = ResourceManifestError("unable to read a declared package resource")
+    raise failure
 
 
 __all__ = [

@@ -49,8 +49,12 @@ def test_load_manifest_wraps_invalid_packaged_json(
     (tmp_path / "manifest.json").write_text("{", encoding="utf-8")
     monkeypatch.setattr(resource_module.resources, "files", lambda _package: tmp_path)
 
-    with pytest.raises(ResourceManifestError, match="unable to read"):
+    with pytest.raises(ResourceManifestError, match="unable to read") as captured:
         load_manifest()
+
+    assert captured.value.code == "MH_RESOURCE_MANIFEST"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 def test_resource_reader_rejects_an_undeclared_normalized_path() -> None:
@@ -66,8 +70,12 @@ def test_resource_reader_wraps_a_missing_declared_file(
     monkeypatch.setattr(resource_module, "load_manifest", lambda: manifest)
     monkeypatch.setattr(resource_module.resources, "files", lambda _package: tmp_path)
 
-    with pytest.raises(ResourceManifestError, match="unable to read"):
+    with pytest.raises(ResourceManifestError, match="unable to read") as captured:
         read_resource_text("resources/missing.json")
+
+    assert captured.value.code == "MH_RESOURCE_MANIFEST"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 def test_manifest_json_is_canonical_json() -> None:
