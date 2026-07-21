@@ -32,3 +32,7 @@
 - Add canonical `STATE_ROOT` resolution with contained runtime children and symlink-escape refusal,
   plus bounded explicit env-file loading with process/CLI/configured precedence, no discovery or
   interpolation, safe source metadata, and non-enumerating secret storage.
+- Add runtime-generation-bound pseudonym-key primitives with staged, fsynced, atomic no-overwrite
+  publication; ACL-free private `0700` parent and `0600` key enforcement; owner/link/identity and
+  published-byte validation; wrong-key detection; value-safe failures; and explicit recovery from
+  uncertain publication commits.

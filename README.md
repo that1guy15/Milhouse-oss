@@ -6,9 +6,10 @@ teams and AI-assisted development workflows.
 > **Status: pre-alpha implementation; no public release.** The W01 package and quality-toolchain
 > foundation has passed G01; W02 domain, configuration, identity, trust, and privacy implementation
 > is in progress. The repository now contains strict configuration/schema validation, deterministic
-> record identity and envelopes, privacy/redaction primitives, and secure runtime path and explicit
-> secret-loading foundations. Durable storage, collection, querying, and the operational runtime are
-> not implemented yet. Do not use this build for production data.
+> record identity and envelopes, privacy/redaction primitives, secure runtime path and explicit
+> secret-loading foundations, and secure pseudonym-key material primitives. Durable storage,
+> collection, querying, initialization, and the operational runtime are not implemented yet. Do not
+> use this build for production data.
 
 The normative scope, contracts, work order, gates, and Definition of Done are in [the authoritative implementation plan](docs/implementation-plan.md). Progress and validation evidence are tracked in [implementation status](docs/implementation-status.md).
 
@@ -49,7 +50,9 @@ python3 -I scripts/run_uv.py run --locked milhouse config schema
 Those commands exercise the pre-alpha CLI and offline configuration surface only. `milhouse init`,
 collectors, storage, feedback, reports, MCP, and services become available in their owning work
 packages. In particular, product initialization is W06 work; contributor setup does not create
-Milhouse configuration or runtime state.
+Milhouse configuration or runtime state. The current key-material module is a lower-level primitive:
+W06 still owns private-directory initialization and stale staging-artifact handling, while W16 owns
+backup, restore, identity-continuity, and rotation workflows.
 
 ## Contributor quickstart
 

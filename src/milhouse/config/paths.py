@@ -24,8 +24,8 @@ MILHOUSE_HOME_ENV_VAR = "MILHOUSE_HOME"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
-class RuntimePaths:
-    """Immutable canonical paths whose representation never exposes local path text."""
+class _RuntimePathGeneration:
+    """Private snapshot proving that one set of paths came from a single resolution."""
 
     config_file: Path
     config_dir: Path
@@ -39,9 +39,61 @@ class RuntimePaths:
     configured_env_files: tuple[Path, ...]
 
     def __repr__(self) -> str:
+        return "RuntimePathGeneration(bound=True)"
+
+    __str__ = __repr__
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RuntimePaths:
+    """Immutable canonical paths whose representation never exposes local path text."""
+
+    config_file: Path
+    config_dir: Path
+    config_selection: ConfigFileSelection
+    state_root: Path
+    spool: Path
+    reports: Path
+    logs: Path
+    backups: Path
+    pseudonym_key: Path
+    configured_env_files: tuple[Path, ...]
+    _generation: _RuntimePathGeneration
+
+    def __repr__(self) -> str:
         return f"RuntimePaths(resolved=True, configured_env_files={len(self.configured_env_files)})"
 
     __str__ = __repr__
+
+
+def verify_runtime_path_generation(paths: RuntimePaths) -> RuntimePaths:
+    """Refuse runtime-path fields changed after their authoritative resolution."""
+
+    if not isinstance(paths, RuntimePaths) or not isinstance(
+        paths._generation, _RuntimePathGeneration
+    ):
+        raise _path_error(
+            "config.paths.generation_mismatch",
+            "runtime paths do not match their resolved generation",
+        )
+    current = _RuntimePathGeneration(
+        config_file=paths.config_file,
+        config_dir=paths.config_dir,
+        config_selection=paths.config_selection,
+        state_root=paths.state_root,
+        spool=paths.spool,
+        reports=paths.reports,
+        logs=paths.logs,
+        backups=paths.backups,
+        pseudonym_key=paths.pseudonym_key,
+        configured_env_files=paths.configured_env_files,
+    )
+    if current != paths._generation:
+        raise _path_error(
+            "config.paths.generation_mismatch",
+            "runtime paths do not match their resolved generation",
+        )
+    return paths
 
 
 def _path_error(code: str, message: str) -> ConfigError:
@@ -230,7 +282,7 @@ def resolve_runtime_paths(
     )
     verify_config_generation(config, config_selection)
 
-    return RuntimePaths(
+    generation = _RuntimePathGeneration(
         config_file=config_file,
         config_dir=config_dir,
         config_selection=config_selection,
@@ -242,6 +294,19 @@ def resolve_runtime_paths(
         pseudonym_key=pseudonym_key,
         configured_env_files=configured_env_files,
     )
+    return RuntimePaths(
+        config_file=config_file,
+        config_dir=config_dir,
+        config_selection=config_selection,
+        state_root=state_root,
+        spool=spool,
+        reports=reports,
+        logs=logs,
+        backups=backups,
+        pseudonym_key=pseudonym_key,
+        configured_env_files=configured_env_files,
+        _generation=generation,
+    )
 
 
 __all__ = [
@@ -249,4 +314,5 @@ __all__ = [
     "RuntimePaths",
     "resolve_config_source_path",
     "resolve_runtime_paths",
+    "verify_runtime_path_generation",
 ]
