@@ -12,13 +12,13 @@ status and evidence; it does not amend the plan.
 | Product phase | **Pre-alpha; not released and not ready for production use** |
 | Plan | Version 1.0, approved for implementation by the owner on 2026-07-18 |
 | Target release | Milhouse OSS 1.0 |
-| Working branch | `codex/w02-secure-config` |
-| Git state | This snapshot is based on protected `main` commit `31f3014238696227edaa3435f542284e846f94c3`; every job in post-merge Required CI run `29848332682` passed |
+| Working branch | `codex/w02-pseudonym-key-lifecycle` |
+| Git state | This snapshot is based on protected `main` commit `0d049268f850b75fc071e991f8a3ae7bbe0d97bb`; every job in post-merge Required CI run `29858595039` passed |
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
 | Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
 | External mutation authority | Owner authorized build-branch pushes, pull requests, and merges to `main` after required checks on 2026-07-19. Tags, package publication, announcements, live-provider calls, and unrelated external mutation remain separately controlled |
 | Highest passed gate | G01 |
-| Active package | W02 implementation: secure runtime paths and explicit secret loading after the merged domain, config, identity, record, and privacy foundations |
+| Active package | W02 implementation: secure pseudonym-key material lifecycle after the merged domain, config, identity, record, privacy, runtime-path, and secret-loading foundations |
 
 The audited public baseline is the source scaffold. The private baseline is a
 read-only behavior and algorithm donor. Its history, configuration, telemetry,
@@ -74,7 +74,7 @@ evidence. A later regression returns the affected gate to **In progress**.
 |---|---|---|---|---|
 | W00 — authority, governance, ADRs | Owner plan approval | **Passed** | PR #1 merged as signed squash commit `79b9fdca3c567b1de48a3136fbe4ba0dd981926a`; reviewed head tree matched protected `main`; post-merge `test` and `gitleaks` passed | E01 and E02 complete for G00; third-party PVR delivery remains E01/E05 at G17 |
 | W01 — package and quality toolchain | G00 | **Passed** | [G01 evidence](gate-evidence/G01.md): exact candidate and remediation trees passed local gates, 18-check hosted PR runs, three independent reviews, signed protected merges, exact-tree equality, post-merge required CI, and corrected default-branch updater execution at commit `333c051ea1018a624715b98bf5dad7c885bdeca5` | G01 accepted by engineering on 2026-07-19 under the owner-authorized solo-maintainer path; aggregate `required-ci` and protection controls remain active |
-| W02 — domain, config, identity, privacy | G01 | **In progress** | Merged PRs #8-#13 provide deterministic bytes/IDs, strict config/schema/CLI foundations, canonical record envelopes, keyed pseudonyms, safe URL/path/evidence handling, layered redaction, and nested allowlists. This candidate adds secure runtime-path and explicit secret-source loading; key lifecycle, durations/logging, and complete G02 adversarial evidence remain required before `Passed` | None beyond review |
+| W02 — domain, config, identity, privacy | G01 | **In progress** | Merged PRs #8-#14 provide deterministic bytes/IDs, strict config/schema/CLI foundations, canonical record envelopes, keyed pseudonyms, safe URL/path/evidence handling, layered redaction, nested allowlists, secure runtime paths, and explicit secret loading. This candidate adds runtime-generation binding, staged and fsynced atomic no-overwrite key publication, ACL-aware owner-only validation, exact published-byte verification, and explicit commit-uncertain recovery. W06 still owns initialization and stale staging-artifact orchestration; W16 owns backup, restore, identity continuity, and rotation. Durations, structured logging/errors, common egress enforcement, plugin validation, cross-platform identity evidence, and the final G02 adversarial corpus remain required before `Passed` | None beyond review |
 | W03 — SQLite, spool, replay, retention | G02 | Pending | Every durable-write kill point; concurrency; corruption recovery; replay of 10,000 records twice; permissions; privacy-expiry behavior | Access to a supported local filesystem/host if not available to engineering |
 | W04 — ClickHouse and recovery | G02; G04b also requires G03 | Pending | G04a auth/migrations/checksums; G04b idempotent delivery, 24-hour simulated outage drain, and verified native restore | Docker-capable supported host if not available to engineering |
 | W05 — runtime/canary vertical slice | G03 and G04 | Pending | Full canary-to-query slice; ClickHouse outage behavior; exact-once logical drain; alert transition cases | None beyond review |

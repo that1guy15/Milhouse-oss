@@ -53,6 +53,14 @@ def _validate_kind(kind: str) -> bytes:
     return encoded
 
 
+def validate_pseudonym_epoch(epoch: int) -> int:
+    """Return one valid persisted pseudonym epoch without coercing booleans or strings."""
+
+    if type(epoch) is not int or not 1 <= epoch <= 2_147_483_647:
+        raise PrivacyError("MH_PRIVACY_EPOCH", "pseudonym epoch is invalid")
+    return epoch
+
+
 class Pseudonymizer:
     """Derive deterministic, domain-separated tokens without exposing the key or value."""
 
@@ -64,10 +72,8 @@ class Pseudonymizer:
                 "MH_PRIVACY_KEY_LENGTH",
                 f"pseudonym key must contain exactly {PSEUDONYM_KEY_BYTES} bytes",
             )
-        if type(epoch) is not int or not 1 <= epoch <= 2_147_483_647:
-            raise PrivacyError("MH_PRIVACY_EPOCH", "pseudonym epoch is invalid")
         self.__key = bytes(key)
-        self.__epoch = epoch
+        self.__epoch = validate_pseudonym_epoch(epoch)
 
     def __repr__(self) -> str:
         return f"Pseudonymizer(epoch={self.epoch})"
@@ -99,3 +105,13 @@ class Pseudonymizer:
 
         digest = self._digest(_FINGERPRINT_DOMAIN, kind, value)
         return f"mh_fp1_e{self.epoch}_{kind}_{_base32(digest)}"
+
+
+__all__ = [
+    "MAX_PSEUDONYM_INPUT_BYTES",
+    "MAX_PSEUDONYM_KIND_BYTES",
+    "PSEUDONYM_KEY_BYTES",
+    "PrivacyError",
+    "Pseudonymizer",
+    "validate_pseudonym_epoch",
+]

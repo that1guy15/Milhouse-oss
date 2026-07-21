@@ -71,6 +71,7 @@ test-coverage:
 		--critical 'src/milhouse/core/canonical.py' \
 		--critical 'src/milhouse/domain/identity.py' \
 		--critical 'src/milhouse/domain/records.py' \
+		--critical 'src/milhouse/privacy/keys.py' \
 		--critical 'src/milhouse/privacy/allowlist.py' \
 		--critical 'src/milhouse/privacy/pseudonym.py' \
 		--critical 'src/milhouse/privacy/redact.py' \
