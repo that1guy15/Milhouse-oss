@@ -150,6 +150,18 @@ def test_exclusive_rename_platform_selection_fails_closed(
     class LinuxLibrary:
         renameat2 = FakeFunction()
 
+    class MacLibrary:
+        renameatx_np = FakeFunction()
+
+    monkeypatch.setattr(config_filesystem.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        config_filesystem.ctypes,
+        "CDLL",
+        lambda *args, **kwargs: MacLibrary(),
+    )
+    _primitive, flag = config_filesystem._exclusive_rename_primitive()
+    assert flag == 4
+
     monkeypatch.setattr(config_filesystem.sys, "platform", "linux")
     monkeypatch.setattr(
         config_filesystem.ctypes,
@@ -292,6 +304,24 @@ def test_linux_acl_probe_detects_access_and_default_acl_xattrs(
 
     assert config_filesystem._linux_descriptor_has_extended_acl(3) is expected
     assert not pending
+
+
+def test_linux_acl_probe_accepts_the_platform_enoattr_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enoattr = 9876
+    monkeypatch.setattr(config_filesystem.errno, "ENOATTR", enoattr, raising=False)
+
+    def no_acl(*args: object) -> int:
+        config_filesystem.ctypes.set_errno(enoattr)
+        return -1
+
+    class LinuxLibrary:
+        fgetxattr = _FakeCFunction(no_acl)
+
+    monkeypatch.setattr(config_filesystem.ctypes, "CDLL", lambda *args, **kwargs: LinuxLibrary())
+
+    assert config_filesystem._linux_descriptor_has_extended_acl(3) is False
 
 
 def test_linux_acl_probe_fails_closed_on_an_unexpected_query_error(
