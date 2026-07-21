@@ -48,12 +48,24 @@ Every record receives an immutable expiry on first commit. Delivered redacted sp
 
 ## Egress
 
+The public `milhouse.privacy.require_egress` primitive enforces the classification ceiling before a
+surface may persist or render data. It returns the maximum permitted content disposition rather
+than a Boolean: a caller authorized only for a policy-filtered summary or metadata must not treat
+that result as permission to emit a complete redacted record. External surfaces are denied unless
+both independently enabled and classification-allowlisted, and caller policy can only narrow the
+fixed matrix below.
+
 - Local spool/SQLite/ClickHouse: redacted public, internal, and sensitive data; never restricted.
 - CLI/local stdio MCP: bounded public/internal results and policy-filtered sensitive summaries.
 - Repository briefs: public/internal only.
 - Telegram/GitHub Issues: public or explicitly enabled internal summaries only.
 - Hosted ClickHouse: separate opt-in with a classification allowlist.
 - Diagnostics: local preview, metadata/redacted content only, never automatic upload.
+
+This primitive is implemented in the current candidate and exhaustively matrix-tested. Operational
+acceptance remains gated on G02 and on each later storage, CLI, report, MCP, diagnostics, and
+notification work package invoking it and producing only the returned content shape; their sinks
+are not yet implemented.
 
 Milhouse has no call-home telemetry, crash upload, usage analytics, or update beacon.
 

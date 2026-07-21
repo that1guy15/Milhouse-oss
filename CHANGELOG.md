@@ -44,3 +44,8 @@
   Raw Pydantic models are now private implementation details; the pre-alpha
   `milhouse.config.MilhouseConfig` and `milhouse.config.models` construction paths are removed in
   favor of the safe loader and schema APIs, and invalid-config wording is intentionally normalized.
+- Add a fail-closed common egress matrix that requires explicit external-surface enablement and
+  classification allowlisting, permanently denies restricted data, hard-caps sensitive output,
+  and returns the mandatory record, summary, or metadata disposition for every planned surface.
+- Prevent malformed URL parser failures from retaining rejected port values in chained exception
+  graphs or formatted tracebacks.

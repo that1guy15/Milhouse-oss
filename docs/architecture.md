@@ -43,6 +43,9 @@ ClickHouse failure never prevents unrelated durable collection. Deterministic re
 - Internal structured events accept catalog-owned machine event identities, allowlisted stable error
   codes, bounded code-owned numeric metadata, and keyed fingerprints derived inside the logger from
   a catalog-owned kind; they have no arbitrary-text or exception-detail field.
+- One fail-closed egress matrix authorizes each surface/classification pair and returns its mandatory
+  maximum content shape. External caller policy may narrow that matrix but cannot elevate it;
+  restricted input is denied before surface-specific policy is considered.
 - Raw prompts, responses, transcripts, and tool output are never persisted in 1.0.
 - Agent summaries/traces are structured, bounded, and disabled by default.
 - Hosted storage, receiver remote bind, notifications, GitHub writes, and MCP writes are independent opt-ins.

@@ -109,6 +109,10 @@ The W02 stable-error, config-diagnostic, and structured-event implementation is 
 rewrite based only on the public plan and current OSS contracts. No private logging or error path is
 approved for reuse, and no private donor expression, fixture, history, or behavior is incorporated.
 
+The W02 common-egress policy is likewise a clean-room implementation of the public plan's binding
+surface/classification matrix. It uses no private egress, exporter, report, notification, or storage
+donor material, and no private expression, fixture, destination, or behavior is incorporated.
+
 ## Mandatory clean-room rewrites
 
 The following areas may use documented product behavior as requirements but may
