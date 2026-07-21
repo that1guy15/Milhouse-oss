@@ -23,6 +23,7 @@ from milhouse.core.canonical import (
     CanonicalizationError,
     canonical_json_bytes,
 )
+from milhouse.core.immutable import freeze_dict
 
 MachineIdV1 = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
 MachineNameV1 = Annotated[
@@ -63,6 +64,13 @@ _CONTENT_DOMAIN = b"milhouse-content-v1\0"
 _DEDUPE_DOMAIN = b"milhouse-dedupe-v1\0"
 
 
+def _contains_unsafe_identifier_characters(value: str) -> bool:
+    return any(
+        ord(character) < 0x20 or ord(character) == 0x7F or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    )
+
+
 class IdentityError(ValueError):
     """Safe identity derivation or validation failure."""
 
@@ -72,7 +80,13 @@ class IdentityError(ValueError):
 
 
 class _StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
 
 
 class SourceIdentityV1(_StrictModel):
@@ -111,11 +125,15 @@ class ObservationCoordinateV1(_StrictModel):
                     raise ValueError(
                         "MH_IDENTITY_OBSERVATION_FLOAT: integral float is outside signed 64-bit"
                     )
+            if type(part) is str and _contains_unsafe_identifier_characters(part):
+                raise ValueError(
+                    "MH_IDENTITY_OBSERVATION_STRING: string part contains unsafe characters"
+                )
             if type(part) is str and not 1 <= len(part.encode("utf-8")) <= 256:
                 raise ValueError(
                     "MH_IDENTITY_OBSERVATION_STRING: string part exceeds its byte bound"
                 )
-        return value
+        return freeze_dict(value)
 
 
 class RecordIdentityV1(_StrictModel):
@@ -135,6 +153,8 @@ class RecordIdentityV1(_StrictModel):
     @field_validator("source_event_id", "source_entity_id")
     @classmethod
     def validate_optional_opaque_id(cls, value: str | None) -> str | None:
+        if value is not None and _contains_unsafe_identifier_characters(value):
+            raise ValueError("MH_IDENTITY_OPAQUE_ID: identifier contains unsafe characters")
         if value is not None and len(value.encode("utf-8")) > 256:
             raise ValueError("MH_IDENTITY_OPAQUE_ID: identifier exceeds its UTF-8 byte bound")
         return value

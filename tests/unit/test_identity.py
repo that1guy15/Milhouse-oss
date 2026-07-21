@@ -3,6 +3,7 @@ import re
 import pytest
 from pydantic import ValidationError
 
+import milhouse.domain.identity as identity_module
 from milhouse.domain.identity import (
     DedupeSourceV1,
     IdentityError,
@@ -149,3 +150,77 @@ def test_identity_models_reject_unknown_fields_coercion_and_scope_mismatch() -> 
         observation_namespace_id="mh_ns1_00000000000040008000000000000000",
     )
     assert dedupe.target_id is None
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        {},
+        {f"part_{index}": index for index in range(17)},
+        {"value": 2**63},
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {"value": float(2**63)},
+        {"value": ""},
+        {"value": "x" * 257},
+        {"value": "unsafe\ncoordinate"},
+        {"value": "unsafe\ud800coordinate"},
+    ],
+)
+def test_observation_coordinates_reject_unbounded_or_unsafe_parts(
+    parts: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        ObservationCoordinateV1.model_validate({"kind": "source.revision", "parts": parts})
+
+
+def test_observation_coordinate_accepts_a_bounded_safe_string_part() -> None:
+    coordinate = ObservationCoordinateV1(
+        kind="source.revision",
+        parts={"revision": "provider-revision-1", "ratio": 1.5},
+    )
+
+    assert coordinate.parts == {"revision": "provider-revision-1", "ratio": 1.5}
+
+
+def test_identity_opaque_ids_are_byte_bounded_single_line_and_value_safe() -> None:
+    secret = "secret_token_0123456789abcdef"
+    for value in ("é" * 129, f"{secret}\nspoofed", "unsafe\ud800identifier"):
+        with pytest.raises(ValidationError) as error:
+            _identity(source_event_id=value)
+        assert secret not in str(error.value)
+
+
+def test_identity_and_dedupe_scope_requirements_fail_both_directions() -> None:
+    with pytest.raises(ValidationError, match="MH_IDENTITY_TARGET_REQUIRED"):
+        _identity(target_id=None)
+
+    dedupe = RecordDedupeV1.from_identity(_identity())
+    values = dedupe.model_dump(mode="python")
+    with pytest.raises(ValidationError, match="MH_DEDUPE_TARGET_REQUIRED"):
+        RecordDedupeV1.model_validate({**values, "target_id": None})
+    with pytest.raises(ValidationError, match="MH_DEDUPE_TARGET_FORBIDDEN"):
+        RecordDedupeV1.model_validate({**values, "scope": "installation"})
+
+
+def test_identity_digest_helpers_fail_closed_on_invalid_domains_and_projections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="NUL-terminated ASCII"):
+        identity_module._domain_digest(b"invalid", {})
+    with pytest.raises(ValueError, match="NUL-terminated ASCII"):
+        identity_module._domain_digest(b"invalid-\xff\0", {})
+    with pytest.raises(IdentityError, match="MH_IDENTITY_PROJECTION"):
+        derive_content_hash({"invalid": object()})
+    with pytest.raises(IdentityError, match="MH_CONTENT_PROJECTION"):
+        derive_content_hash([])  # type: ignore[arg-type]
+
+    permissive = re.compile(r".*")
+    with pytest.raises(IdentityError, match="not canonical base32"):
+        identity_module._validate_digest_token("mh_!", prefix="mh_", pattern=permissive)
+    with pytest.raises(IdentityError, match="noncanonical pad bits"):
+        identity_module._validate_digest_token("mh_aaaa", prefix="mh_", pattern=permissive)
+
+    monkeypatch.setattr(identity_module, "_CONTENT_DOMAIN", b"invalid")
+    with pytest.raises(ValueError, match="NUL-terminated ASCII"):
+        derive_content_hash({})

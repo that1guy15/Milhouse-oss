@@ -9,6 +9,9 @@ from pathlib import Path
 
 CRITICAL_COVERAGE_FILES = {
     "src/milhouse/resources/__init__.py",
+    "src/milhouse/core/canonical.py",
+    "src/milhouse/domain/identity.py",
+    "src/milhouse/domain/records.py",
     "scripts/check_artifacts.py",
     "scripts/check_coverage.py",
     "scripts/check_dco.py",
@@ -26,7 +29,7 @@ CRITICAL_COVERAGE_FILES = {
 }
 
 
-def test_makefile_enumerates_every_w01_critical_coverage_module() -> None:
+def test_makefile_enumerates_every_critical_coverage_module() -> None:
     repository = Path(__file__).resolve().parents[2]
     makefile = (repository / "Makefile").read_text(encoding="utf-8")
     target = makefile.split("test-coverage:\n", 1)[1].split("\nrepo-check:", 1)[0]

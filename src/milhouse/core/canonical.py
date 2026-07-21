@@ -31,12 +31,7 @@ def _normalize_string(value: str) -> str:
             "MH_CANONICAL_UNICODE", "surrogate code points are not supported"
         )
     normalized_lines = value.replace("\r\n", "\n").replace("\r", "\n")
-    try:
-        return unicodedata.normalize("NFC", normalized_lines)
-    except ValueError as error:
-        raise CanonicalizationError(
-            "MH_CANONICAL_UNICODE", "the string cannot be normalized"
-        ) from error
+    return unicodedata.normalize("NFC", normalized_lines)
 
 
 def _quote_string(value: str) -> str:
@@ -73,9 +68,7 @@ def _serialize_float(value: float) -> str:
 
     digit_count = len(digits)
     decimal_position = digit_count + exponent
-    if digit_count <= decimal_position <= 21:
-        body = digits + ("0" * (decimal_position - digit_count))
-    elif 0 < decimal_position <= 21:
+    if 0 < decimal_position <= 21:
         body = f"{digits[:decimal_position]}.{digits[decimal_position:]}"
     elif -6 < decimal_position <= 0:
         body = f"0.{('0' * -decimal_position)}{digits}"
