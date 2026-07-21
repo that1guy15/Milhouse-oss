@@ -64,6 +64,9 @@ test-coverage:
 	$(UV_RUN) python scripts/check_coverage.py build/coverage.json \
 		--line 90 --branch 85 \
 		--critical 'src/milhouse/resources/__init__.py' \
+		--critical 'src/milhouse/core/canonical.py' \
+		--critical 'src/milhouse/domain/identity.py' \
+		--critical 'src/milhouse/domain/records.py' \
 		--critical 'scripts/check_artifacts.py' \
 		--critical 'scripts/check_coverage.py' \
 		--critical 'scripts/check_dco.py' \

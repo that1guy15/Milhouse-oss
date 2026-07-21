@@ -3,7 +3,11 @@ from decimal import Decimal
 
 import pytest
 
-from milhouse.core.canonical import CanonicalizationError, canonical_json_bytes
+from milhouse.core.canonical import (
+    CanonicalizationError,
+    canonical_json_bytes,
+    canonical_json_text,
+)
 
 
 def test_canonical_json_normalizes_strings_keys_and_line_endings() -> None:
@@ -113,3 +117,28 @@ def test_canonical_json_enforces_depth_node_and_byte_bounds() -> None:
     with pytest.raises(CanonicalizationError) as byte_error:
         canonical_json_bytes("abcd", max_bytes=5)
     assert byte_error.value.code == "MH_CANONICAL_SIZE"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("max_depth", 0),
+        ("max_nodes", -1),
+        ("max_bytes", True),
+        ("max_bytes", 1.5),
+    ],
+)
+def test_canonical_json_rejects_invalid_resource_limits(name: str, value: object) -> None:
+    limits: dict[str, object] = {
+        "max_depth": 32,
+        "max_nodes": 10_000,
+        "max_bytes": 262_144,
+    }
+    limits[name] = value
+
+    with pytest.raises(ValueError, match=f"{name} must be a positive integer"):
+        canonical_json_bytes({"valid": True}, **limits)  # type: ignore[arg-type]
+
+
+def test_canonical_json_text_returns_the_same_canonical_wire_without_newline() -> None:
+    assert canonical_json_text({"status": "ok"}) == '{"status":"ok"}'
