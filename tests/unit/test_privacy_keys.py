@@ -11,6 +11,7 @@ import pytest
 import milhouse.config.filesystem as secure_filesystem
 import milhouse.privacy.keys as privacy_keys
 from milhouse.config import ConfigError, load_config, resolve_runtime_paths
+from milhouse.config._models import MilhouseConfig
 from milhouse.config.filesystem import (
     OpenedRegularFile,
     SecureFileError,
@@ -18,7 +19,6 @@ from milhouse.config.filesystem import (
     inspect_regular_file_no_follow,
 )
 from milhouse.config.loader import ConfigFileSelection, validated_config_digest
-from milhouse.config.models import MilhouseConfig
 from milhouse.config.paths import RuntimePaths
 from milhouse.privacy import (
     PSEUDONYM_KEY_BYTES,

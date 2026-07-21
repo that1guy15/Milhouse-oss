@@ -39,6 +39,11 @@ class ConfigCommandError(click.ClickException):
 
     exit_code = 2
 
+    def __init__(self, error: ConfigError) -> None:
+        self.code = error.code
+        self.error_message = error.message
+        super().__init__(str(error))
+
 
 def _platform_config_file() -> Path:
     return user_config_path("milhouse", appauthor=False) / "config.toml"
@@ -92,7 +97,7 @@ def validate_config_command(state: CliState) -> None:
             platform_data_root=_platform_data_root(),
         )
     except ConfigError as error:
-        raise ConfigCommandError(str(error)) from None
+        raise ConfigCommandError(error) from None
     click.echo("configuration is valid")
 
 

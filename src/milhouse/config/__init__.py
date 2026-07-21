@@ -1,7 +1,12 @@
-"""Milhouse configuration v1: strict Pydantic models, loader, and JSON Schema."""
+"""Public Milhouse configuration loading, paths, secrets, and JSON Schema APIs.
+
+Use the loader functions to construct validated configuration. The concrete Pydantic models are
+private implementation details so their raw validation exceptions cannot become a supported API.
+"""
 
 from __future__ import annotations
 
+from milhouse.config._models import CONFIG_VERSION
 from milhouse.config.errors import ConfigError
 from milhouse.config.loader import (
     CONFIG_PATH_ENV_VAR,
@@ -11,7 +16,6 @@ from milhouse.config.loader import (
     load_config_file,
     resolve_config_path,
 )
-from milhouse.config.models import CONFIG_VERSION, MilhouseConfig
 from milhouse.config.paths import (
     MILHOUSE_HOME_ENV_VAR,
     RuntimePaths,
@@ -47,7 +51,6 @@ __all__ = [
     "MILHOUSE_HOME_ENV_VAR",
     "ConfigError",
     "ConfigFileSelection",
-    "MilhouseConfig",
     "RuntimePaths",
     "SecretEnvironment",
     "SecretSource",

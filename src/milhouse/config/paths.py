@@ -13,12 +13,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from milhouse.config._models import MilhouseConfig
 from milhouse.config.errors import ConfigError
 from milhouse.config.loader import (
     ConfigFileSelection,
     verify_config_generation,
 )
-from milhouse.config.models import MilhouseConfig
 
 MILHOUSE_HOME_ENV_VAR = "MILHOUSE_HOME"
 

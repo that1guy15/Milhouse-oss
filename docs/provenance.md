@@ -90,7 +90,7 @@ does not mean copying a private module unchanged.
 
 | Private donor path at the fixed revision | Approved disposition | New OSS owner area | Mandatory guardrail | W00/current import state |
 |---|---|---|---|---|
-| `src/milhouse/timeutils.py` | Adapt small pure helper ideas | `src/milhouse/core/clock.py` | Inject the clock; strict UTC/DST behavior and fuzz tests | W02 candidate adapts only the single-unit elapsed-duration idea from the fixed revision into a fresh caller-bounded ASCII parser and injected wall/monotonic clock; no donor expression, fixtures, history, defaulting, permissive parsing, or direct wall-clock behavior was imported; synthetic unit/property/security tests and independent diff review are required before merge |
+| `src/milhouse/timeutils.py` | Adapt small pure helper ideas | `src/milhouse/core/clock.py` | Inject the clock; strict UTC/DST behavior and fuzz tests | PR #16 merged a fresh caller-bounded ASCII parser and injected wall/monotonic clock that adapt only the single-unit elapsed-duration idea from the fixed revision; no donor expression, fixtures, history, defaulting, permissive parsing, or direct wall-clock behavior was imported |
 | `src/milhouse/exporters/base.py` | Adapt result/protocol ideas | `src/milhouse/delivery/base.py` | v1 idempotency and checkpoint contracts replace donor state behavior | Not imported |
 | `src/milhouse/exporters/clickhouse.py` | Reference serialization/type mapping only | `src/milhouse/storage/clickhouse/` | New migrations, authentication, dedupe, spool checkpoints, and failure model | Not imported |
 | `src/milhouse/collectors/site_canary.py` | Adapt HTTP observation behavior | `src/milhouse/collectors/site_canary.py` | New config/domain/privacy/runtime boundaries; collector cannot persist directly | Not imported |
@@ -105,6 +105,10 @@ No other private donor path is approved. A request to add one requires a plan
 amendment or an ADR permitted by the plan, an ownership review, a new row here,
 and approval before source expression is introduced.
 
+The W02 stable-error, config-diagnostic, and structured-event implementation is a clean-room
+rewrite based only on the public plan and current OSS contracts. No private logging or error path is
+approved for reuse, and no private donor expression, fixture, history, or behavior is incorporated.
+
 ## Mandatory clean-room rewrites
 
 The following areas may use documented product behavior as requirements but may
@@ -112,6 +116,7 @@ not reuse donor implementation expression:
 
 - configuration, secret loading, canonical records, and deterministic IDs;
 - redaction, trust classification, HMAC pseudonyms, and safe rendering;
+- stable errors, config diagnostics, structured logging, and future CLI/log-destination wiring;
 - SQLite state, durable spool, runtime, replay, retention, and checkpoints;
 - ClickHouse schema, migrations, export, and query repository;
 - alerts, incidents, feedback history, curation, and verification;

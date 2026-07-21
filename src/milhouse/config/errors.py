@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
+from milhouse.core.errors import MilhouseError
 
-class ConfigError(Exception):
+
+class ConfigError(MilhouseError):
     """A stable configuration failure that never requires rendering an input value."""
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.message = message
 
 
 __all__ = ["ConfigError"]

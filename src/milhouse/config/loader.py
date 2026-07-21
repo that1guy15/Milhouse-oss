@@ -14,6 +14,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from milhouse.config._models import CONFIG_VERSION, MilhouseConfig, StrictModel
 from milhouse.config.errors import ConfigError
 from milhouse.config.filesystem import (
     FileIdentity,
@@ -24,12 +25,67 @@ from milhouse.config.filesystem import (
     inspect_regular_file_no_follow,
     open_regular_file_no_follow,
 )
-from milhouse.config.models import CONFIG_VERSION, MilhouseConfig
 
 CONFIG_PATH_ENV_VAR = "MILHOUSE_CONFIG"
 MAX_CONFIG_BYTES = 1_048_576
+MAX_CONFIG_DIAGNOSTIC_BYTES = 1_024
+MAX_CONFIG_DIAGNOSTICS = 8
 
 _TOML_LOCATION_PATTERN = re.compile(r"at line (\d+), column (\d+)")
+_SAFE_VALUE_ERROR_MESSAGES = frozenset(
+    {
+        "alert rule collector is not a declared collector id",
+        "alert rule must reference a site_canary collector",
+        "collector contains an undeclared mapped target id",
+        "collector job is not bound to a declared collector id",
+        "collector provider has an incompatible provider type",
+        "collector provider is not a declared provider id",
+        "collector target is not a declared target id",
+        "configuration contains an invalid discriminator",
+        "configuration contains an unknown field",
+        f"config_version must equal {CONFIG_VERSION}",
+        "expected_statuses entries must be valid HTTP status codes",
+        "feedback rule target is not a declared target id",
+        "github issues notification requires a github provider",
+        "header_name is required when auth_mode is 'header'",
+        "incident rule references an alert rule bound to another target",
+        "incident rule references an undeclared alert rule id",
+        "incident rule target is not a declared target id",
+        "interval_seconds and weekday are invalid when schedule is 'daily'",
+        "interval_seconds is invalid when schedule is 'weekly'",
+        "interval_seconds is required when schedule is 'interval'",
+        "local_time is required when schedule is 'daily'",
+        "mcp.default_limit must not exceed mcp.maximum_limit",
+        "notification provider is not a declared provider id",
+        "notification repository is not allowlisted by its github provider",
+        "path must be an absolute canonical path",
+        "path must be relative, not absolute",
+        "path must not contain empty, '.', or '..' segments",
+        "plugins.allowed requires allow_third_party=true",
+        "previous_secret_env and previous_secret_expires_at must both be set or both absent",
+        "previous_secret_env must differ from secret_env",
+        "project.default_target is not a declared target id",
+        "receiver source target is not a declared target id",
+        "timestamp must be in the future",
+        "timestamp must be RFC3339 with a zero UTC offset",
+        "timezone must be a known IANA zone name",
+        "weekday and local_time are invalid when schedule is 'interval'",
+        "weekday and local_time are required when schedule is 'weekly'",
+    }
+)
+
+
+def _known_config_location_parts() -> frozenset[str]:
+    names: set[str] = set()
+    pending = [StrictModel]
+    while pending:
+        model = pending.pop()
+        names.update(model.model_fields)
+        pending.extend(model.__subclasses__())
+    return frozenset(names)
+
+
+_KNOWN_CONFIG_LOCATION_PARTS = _known_config_location_parts()
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -234,17 +290,112 @@ def _check_config_version(data: Mapping[str, object]) -> None:
     raise ConfigError("config.version.unsupported", f"config_version must equal {CONFIG_VERSION}")
 
 
+def _safe_config_location(location: object, *, error_type: str) -> str:
+    if type(location) is not tuple:
+        return "configuration"
+    parts = location[:-1] if error_type == "extra_forbidden" and location else location
+    safe_parts = [
+        part if type(part) is str and part in _KNOWN_CONFIG_LOCATION_PARTS else "<item>"
+        for part in parts
+    ]
+    if error_type == "extra_forbidden":
+        safe_parts.append("<unknown>")
+    return ".".join(safe_parts) or "configuration"
+
+
+def _safe_value_error_message(message: object) -> str:
+    if type(message) is not str:
+        return "value failed configuration validation"
+    detail = message.removeprefix("Value error, ")
+    if detail.endswith(" contains a duplicate entry"):
+        return "configuration contains a duplicate entry"
+    if detail in _SAFE_VALUE_ERROR_MESSAGES:
+        return detail
+    return "value failed configuration validation"
+
+
+def _safe_schema_error_message(error_type: str, message: object) -> str:
+    if error_type == "extra_forbidden":
+        return "unknown field is not permitted"
+    if error_type == "value_error":
+        return _safe_value_error_message(message)
+    if error_type == "missing":
+        return "required field is missing"
+    if error_type in {"union_tag_invalid", "union_tag_not_found"}:
+        return "discriminator value is invalid"
+    if error_type.startswith("url_"):
+        return "URL value is invalid"
+    if error_type.startswith(("datetime_", "date_", "timezone_")):
+        return "timestamp value is invalid"
+    if error_type.startswith("ip_"):
+        return "IP address value is invalid"
+    if error_type in {
+        "bool_type",
+        "bytes_type",
+        "dict_type",
+        "float_type",
+        "int_type",
+        "list_type",
+        "string_type",
+        "tuple_type",
+    }:
+        return "value has the wrong type"
+    if error_type in {
+        "bytes_too_long",
+        "bytes_too_short",
+        "decimal_max_digits",
+        "decimal_max_places",
+        "decimal_whole_digits",
+        "greater_than",
+        "greater_than_equal",
+        "less_than",
+        "less_than_equal",
+        "list_too_long",
+        "list_too_short",
+        "string_too_long",
+        "string_too_short",
+        "too_long",
+        "too_short",
+    }:
+        return "value is outside the allowed bounds"
+    if error_type in {"literal_error", "string_pattern_mismatch"}:
+        return "value does not match the required format"
+    return "value failed configuration validation"
+
+
+def _bounded_schema_diagnostics(error: ValidationError) -> str:
+    failures = error.errors(include_url=False, include_context=False, include_input=False)
+    details: list[str] = []
+    for failure in failures[:MAX_CONFIG_DIAGNOSTICS]:
+        error_type_value = failure.get("type")
+        error_type = error_type_value if type(error_type_value) is str else "unknown"
+        location = _safe_config_location(failure.get("loc"), error_type=error_type)
+        message = _safe_schema_error_message(error_type, failure.get("msg"))
+        candidate = f"{location}: {message}"
+        joined = "; ".join((*details, candidate))
+        if len(joined.encode("utf-8")) > MAX_CONFIG_DIAGNOSTIC_BYTES:
+            break
+        details.append(candidate)
+
+    omitted = len(failures) - len(details)
+    if omitted:
+        while True:
+            suffix = f"{omitted} additional configuration errors omitted"
+            joined = "; ".join((*details, suffix))
+            if len(joined.encode("utf-8")) <= MAX_CONFIG_DIAGNOSTIC_BYTES or not details:
+                details.append(suffix)
+                break
+            details.pop()
+            omitted = len(failures) - len(details)
+    return "; ".join(details) or "config failed schema validation"
+
+
 def _validate_model(data: Mapping[str, object]) -> MilhouseConfig:
     try:
         return MilhouseConfig.model_validate(data)
     except ValidationError as exc:
-        details = "; ".join(
-            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
-            for error in exc.errors()
-        )
-        raise ConfigError(
-            "config.schema.invalid", details or "config failed schema validation"
-        ) from None
+        failure = ConfigError("config.schema.invalid", _bounded_schema_diagnostics(exc))
+    raise failure
 
 
 def load_config_file(path: str | Path) -> MilhouseConfig:

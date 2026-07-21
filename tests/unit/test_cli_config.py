@@ -4,8 +4,8 @@ import pytest
 from click.testing import CliRunner
 
 from milhouse.cli import main
-from milhouse.cli.root import CliState
-from milhouse.config import generate_json_schema_bytes
+from milhouse.cli.root import CliState, ConfigCommandError
+from milhouse.config import ConfigError, generate_json_schema_bytes
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG = REPOSITORY_ROOT / "config/example.toml"
@@ -20,6 +20,14 @@ def test_cli_state_representation_never_contains_local_paths() -> None:
     assert str(state) == repr(state)
     assert private_config not in repr(state)
     assert private_env not in repr(state)
+
+
+def test_config_command_error_retains_stable_fields_for_future_structured_rendering() -> None:
+    error = ConfigCommandError(ConfigError("config.test.failure", "configuration failed"))
+
+    assert error.code == "config.test.failure"
+    assert error.error_message == "configuration failed"
+    assert error.format_message() == "config.test.failure: configuration failed"
 
 
 def test_root_help_exposes_config_commands_and_global_path_options() -> None:

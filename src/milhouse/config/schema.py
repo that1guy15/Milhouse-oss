@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from milhouse.config.models import MilhouseConfig
+from milhouse.config._models import MilhouseConfig
 
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 JSON_SCHEMA_ID = "urn:milhouse:config-schema:v1"

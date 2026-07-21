@@ -38,3 +38,9 @@
   uncertain publication commits.
 - Add injectable UTC wall and process-local monotonic clocks plus a strict internal ASCII elapsed-
   duration parser whose lower and upper bounds are supplied by each owning caller.
+- Add a shared stable-error foundation, code-only unknown-error normalization, and injected
+  allowlist-only structured operational events with no arbitrary-text or exception-detail fields;
+  harden config-model rendering and bound schema diagnostics without echoing unknown keys or values.
+  Raw Pydantic models are now private implementation details; the pre-alpha
+  `milhouse.config.MilhouseConfig` and `milhouse.config.models` construction paths are removed in
+  favor of the safe loader and schema APIs, and invalid-config wording is intentionally normalized.

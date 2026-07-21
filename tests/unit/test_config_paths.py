@@ -7,9 +7,9 @@ import pytest
 
 import milhouse.config.paths as config_paths
 from milhouse.config import ConfigError, load_config_file
+from milhouse.config._models import MilhouseConfig
 from milhouse.config.filesystem import inspect_regular_file_no_follow
 from milhouse.config.loader import ConfigFileSelection, validated_config_digest
-from milhouse.config.models import MilhouseConfig
 from milhouse.config.paths import (
     MILHOUSE_HOME_ENV_VAR,
     RuntimePaths,

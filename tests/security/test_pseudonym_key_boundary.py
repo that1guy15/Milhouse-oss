@@ -16,7 +16,7 @@ import pytest
 import milhouse.config.filesystem as secure_filesystem
 import milhouse.privacy.keys as privacy_keys
 from milhouse.config import load_config, resolve_runtime_paths
-from milhouse.config.models import MilhouseConfig
+from milhouse.config._models import MilhouseConfig
 from milhouse.config.paths import RuntimePaths
 from milhouse.privacy import (
     PrivacyError,

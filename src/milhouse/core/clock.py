@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar
 
+from milhouse.core.errors import MilhouseValueError
+
 _DATETIME_TYPE = datetime
 _DURATION_PATTERN = re.compile(r"(0|[1-9][0-9]{0,17})([smhd])", flags=re.ASCII)
 _MAX_DURATION_TEXT_LENGTH = 19
@@ -21,16 +23,8 @@ _SECONDS_PER_UNIT = {
 _T = TypeVar("_T")
 
 
-class TimeError(ValueError):
+class TimeError(MilhouseValueError):
     """A stable time-boundary failure that never renders the rejected value."""
-
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
-        self.message = message
-        super().__init__(f"{code}: {message}")
-
-    def __repr__(self) -> str:
-        return f"TimeError(code={self.code!r}, message={self.message!r})"
 
 
 class WallClock(Protocol):
