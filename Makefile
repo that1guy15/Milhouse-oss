@@ -63,6 +63,10 @@ test-coverage:
 		--cov-report=term-missing --cov-report=json:build/coverage.json
 	$(UV_RUN) python scripts/check_coverage.py build/coverage.json \
 		--line 90 --branch 85 \
+		--critical 'src/milhouse/config/filesystem.py' \
+		--critical 'src/milhouse/config/loader.py' \
+		--critical 'src/milhouse/config/paths.py' \
+		--critical 'src/milhouse/config/secrets.py' \
 		--critical 'src/milhouse/resources/__init__.py' \
 		--critical 'src/milhouse/core/canonical.py' \
 		--critical 'src/milhouse/domain/identity.py' \

@@ -1,9 +1,12 @@
 import os
+import stat
 import traceback
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import milhouse.config.filesystem as config_filesystem
 import milhouse.config.loader as config_loader
 from milhouse.config.loader import (
     CONFIG_PATH_ENV_VAR,
@@ -203,12 +206,41 @@ def test_resolve_config_path_uses_process_environment_by_default(
 def test_load_config_end_to_end_returns_config_and_resolved_path(tmp_path: Path) -> None:
     config_path = _write(tmp_path / "milhouse.toml")
 
-    config, resolved_path = load_config(
+    config, selection = load_config(
         str(config_path), platform_default=tmp_path / "default.toml", env={}
     )
 
-    assert resolved_path == config_path
+    assert selection.path == config_path
+    assert repr(selection) == "ConfigFileSelection(selected=True)"
+    assert os.fspath(selection) == os.fspath(config_path)
+    assert os.fspath(config_path) not in repr(selection)
     assert config.project.name == "team"
+
+
+def test_config_open_unreadable_category_maps_to_a_stable_error() -> None:
+    error = config_loader._config_open_error(
+        config_filesystem.SecureFileError(config_filesystem.SecureFileErrorKind.UNREADABLE)
+    )
+
+    assert error.code == "config.file.unreadable"
+
+
+def test_validated_config_digest_serialization_failure_is_value_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_fragment = "private-serialization-fragment-0123456789"
+    config = load_config_file(_write(tmp_path / "config.toml"))
+
+    def fail_dump(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise TypeError(private_fragment)
+
+    monkeypatch.setattr(type(config), "model_dump", fail_dump)
+
+    with pytest.raises(ConfigError) as excinfo:
+        config_loader.validated_config_digest(config)
+
+    assert excinfo.value.code == "config.selection.mismatch"
+    assert private_fragment not in str(excinfo.value)
 
 
 def test_load_config_file_missing_is_a_stable_error(tmp_path: Path) -> None:
@@ -235,32 +267,118 @@ def test_load_config_file_rejects_symlinks_without_o_nofollow(
     target = _write(tmp_path / "real.toml")
     link = tmp_path / "link.toml"
     link.symlink_to(target)
-    monkeypatch.setattr(config_loader.os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(config_filesystem.os, "O_NOFOLLOW", 0, raising=False)
 
     with pytest.raises(ConfigError) as excinfo:
         load_config_file(link)
 
-    assert excinfo.value.code == "config.file.not_regular"
+    assert excinfo.value.code == "config.file.security_unsupported"
 
 
-def test_load_config_file_detects_a_fallback_open_swap(
+def test_load_config_file_fails_closed_without_nofollow_before_opening(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _write(tmp_path / "milhouse.toml")
-    replacement = _write(tmp_path / "replacement.toml")
-    real_open = os.open
-    monkeypatch.setattr(config_loader.os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(config_filesystem.os, "O_NOFOLLOW", 0, raising=False)
 
-    def swapped_open(candidate: str | bytes | os.PathLike[str], flags: int) -> int:
-        os.replace(replacement, path)
-        return real_open(candidate, flags)
+    def fail_open(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("config path must not be opened")
 
-    monkeypatch.setattr(config_loader.os, "open", swapped_open)
+    monkeypatch.setattr(config_filesystem.os, "open", fail_open)
 
     with pytest.raises(ConfigError) as excinfo:
         load_config_file(path)
 
+    assert excinfo.value.code == "config.file.security_unsupported"
+
+
+def test_load_config_file_rejects_a_preexisting_parent_symlink_before_parsing(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = _write(outside / "milhouse.toml", "malformed target content !\n")
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config_file(linked_parent / "milhouse.toml")
+
+    assert excinfo.value.code == "config.file.not_regular"
+    assert os.fspath(target) not in str(excinfo.value)
+    assert "malformed" not in str(excinfo.value)
+
+
+def test_load_config_file_rejects_a_parent_swapped_during_selection_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_parent = tmp_path / "selected"
+    selected_parent.mkdir()
+    original = _write(selected_parent / "milhouse.toml")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = _write(outside / "milhouse.toml", "malformed target content !\n")
+    real_open = os.open
+    swapped = False
+
+    def swap_parent(
+        candidate: str | bytes | os.PathLike[str],
+        flags: int,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and candidate == selected_parent.name:
+            selected_parent.rename(tmp_path / "original-parent")
+            selected_parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return real_open(candidate, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(config_filesystem.os, "open", swap_parent)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config_file(original)
+
+    assert swapped
+    assert excinfo.value.code == "config.file.not_regular"
+    assert os.fspath(target) not in str(excinfo.value)
+    assert "malformed" not in str(excinfo.value)
+
+
+def test_load_config_file_rejects_a_parent_swapped_after_directory_open_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_parent = tmp_path / "selected"
+    selected_parent.mkdir()
+    original = _write(selected_parent / "milhouse.toml")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = _write(outside / "milhouse.toml", "malformed target content !\n")
+    real_open = os.open
+    swapped = False
+
+    def swap_after_parent_open(
+        candidate: str | bytes | os.PathLike[str],
+        flags: int,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and candidate == original.name and kwargs.get("dir_fd") is not None:
+            selected_parent.rename(tmp_path / "original-parent")
+            selected_parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return real_open(candidate, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(config_filesystem.os, "open", swap_after_parent_open)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config_file(original)
+
+    assert swapped
     assert excinfo.value.code == "config.file.changed"
+    assert os.fspath(target) not in str(excinfo.value)
+    assert "malformed" not in str(excinfo.value)
 
 
 def test_load_config_file_rejects_directories(tmp_path: Path) -> None:
@@ -331,18 +449,89 @@ def test_load_config_file_enforces_the_read_bound_after_fstat(
     assert excinfo.value.code == "config.file.too_large"
 
 
+def test_load_config_file_translates_fdopen_failure_and_closes_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(tmp_path / "milhouse.toml")
+    private_fragment = "private-fdopen-fragment-0123456789"
+    real_close = os.close
+    closed: list[int] = []
+
+    def fail_fdopen(*_args: object, **_kwargs: object) -> object:
+        raise OSError(private_fragment)
+
+    def record_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(config_loader.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(config_loader.os, "close", record_close)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config_file(path)
+
+    assert excinfo.value.code == "config.file.unreadable"
+    assert private_fragment not in str(excinfo.value)
+    assert closed
+
+
+def test_load_config_file_translates_read_metadata_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(tmp_path / "milhouse.toml")
+    real_fstat = os.fstat
+    regular_file_calls = 0
+
+    def fail_after_read(descriptor: int) -> os.stat_result:
+        nonlocal regular_file_calls
+        metadata = real_fstat(descriptor)
+        if stat.S_ISREG(metadata.st_mode):
+            regular_file_calls += 1
+        if regular_file_calls == 2:
+            raise OSError("private-read-fragment-0123456789")
+        return metadata
+
+    monkeypatch.setattr(config_loader.os, "fstat", fail_after_read)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config_file(path)
+
+    assert excinfo.value.code == "config.file.unreadable"
+    assert "private-read-fragment" not in str(excinfo.value)
+
+
+def test_load_config_file_rejects_reinspection_snapshot_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write(tmp_path / "milhouse.toml")
+    real_inspect = config_loader.inspect_regular_file_no_follow
+
+    def changed_snapshot(selected_path: str | Path):
+        current = real_inspect(selected_path)
+        return replace(current, snapshot=replace(current.snapshot, size=current.snapshot.size + 1))
+
+    monkeypatch.setattr(config_loader, "inspect_regular_file_no_follow", changed_snapshot)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config_file(path)
+
+    assert excinfo.value.code == "config.file.changed"
+
+
 def test_load_config_file_detects_an_in_place_read_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _write(tmp_path / "milhouse.toml")
     real_fstat = os.fstat
     initial = path.stat()
-    calls = 0
+    regular_file_calls = 0
 
     def changed_after_read(descriptor: int) -> os.stat_result:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
+        nonlocal regular_file_calls
+        metadata = real_fstat(descriptor)
+        if stat.S_ISREG(metadata.st_mode):
+            regular_file_calls += 1
+        if regular_file_calls == 2:
             os.utime(
                 path,
                 ns=(initial.st_atime_ns, initial.st_mtime_ns + 1_000_000_000),
@@ -375,6 +564,19 @@ def test_load_config_file_rejects_malformed_toml(tmp_path: Path) -> None:
 
     assert excinfo.value.code == "config.toml.syntax"
     assert "line" in excinfo.value.message
+
+
+def test_toml_location_extraction_and_location_free_syntax_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert config_loader._extract_toml_location("no source coordinate") is None
+    monkeypatch.setattr(config_loader, "_extract_toml_location", lambda _message: None)
+
+    with pytest.raises(ConfigError) as excinfo:
+        config_loader._parse_toml("not valid = = toml")
+
+    assert excinfo.value.code == "config.toml.syntax"
+    assert "line" not in excinfo.value.message
 
 
 @pytest.mark.parametrize(
