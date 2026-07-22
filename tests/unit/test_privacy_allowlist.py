@@ -92,6 +92,23 @@ def test_safe_url_field_requires_no_redaction_counts() -> None:
     assert result.redactions == {}
 
 
+@pytest.mark.parametrize("secret", ["mh_ps1_e", "local-pa"])
+def test_typed_path_allowlist_cannot_emit_registered_pseudonym_fragments(secret: str) -> None:
+    redactor = LayeredRedactor(Pseudonymizer(KEY), known_secrets=(secret,))
+    policy = FieldAllowlist((FieldRule(("workspace",), "path"),))
+
+    result = apply_field_allowlist(
+        {"workspace": "/home/operator/private/app.py"},
+        allowlist=policy,
+        redactor=redactor,
+    )
+
+    assert result.value == {"workspace": "[mh:p]"}
+    assert secret not in repr(result)
+    assert result.redactions == {"path": 1, "secret": 1}
+    assert redactor.pseudonymize_path("/home/operator/private/app.py") == "[mh:p]"
+
+
 @pytest.mark.parametrize("value", [True, 0, 42, 1.5, "safe text"])
 def test_scalar_fields_preserve_canonical_types(value: object) -> None:
     policy = FieldAllowlist((FieldRule(("value",), "scalar"),))

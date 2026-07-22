@@ -113,6 +113,10 @@ The W02 common-egress policy is likewise a clean-room implementation of the publ
 surface/classification matrix. It uses no private egress, exporter, report, notification, or storage
 donor material, and no private expression, fixture, destination, or behavior is incorporated.
 
+The W02 domain-validation guard and marked-path/file-URI redaction remediation are clean-room
+implementations derived from the public privacy contract and wholly synthetic adversarial canaries.
+No private exception, record, path, fixture, parser, or redaction expression was inspected or reused.
+
 ## Mandatory clean-room rewrites
 
 The following areas may use documented product behavior as requirements but may

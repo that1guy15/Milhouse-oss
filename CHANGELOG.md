@@ -49,3 +49,25 @@
   and returns the mandatory record, summary, or metadata disposition for every planned surface.
 - Prevent malformed URL parser failures from retaining rejected port values in chained exception
   graphs or formatted tracebacks.
+- Normalize every public identity and record-model validation failure to one fixed, value-free
+  Pydantic error before it can retain rejected values, hostile exception text, or nested contexts;
+  prevent caller overrides, foreign-model coercion, repeated initialization,
+  declared/unknown/underscore mutation, pickle state APIs, and unchecked copy/construct APIs from
+  weakening the strict contract; preserve strict JSON validation, public JSON schemas, exact nested
+  domain-model composition, and deterministic record wires.
+- Pseudonymize marked POSIX, network, tilde, relative, Windows, UNC, and `file:` paths in free text
+  without a fixed mount-root allowlist, including repeated raw-space and shell-quoted continuations;
+  ambiguous whitespace/path and nested delimiter boundaries fail with value-free diagnostics. Within
+  HTTP URLs, classify one bounded decoded view and pseudonymize complete filesystem-root, PII, and
+  double-encoding-ambiguous components while preserving `/api`, `/app`, and `/data` controls.
+- Advance layered redaction to policy `r2`: compact collision-safe category markers, a final
+  registered-secret invariant over generated pseudonyms and URLs, canonical-equivalent and nested
+  percent/JSON/HTML/base64/hex decoding through two layers, base64 pad-bit/MIME aliases, standalone
+  encoded local paths, unbracketed IPv6, and reviewed Linux/macOS filesystem-root segments at any
+  URL path position. Malformed UTF-8 suffixes, non-UTF-8 neighboring bytes, odd/misaligned hex
+  nibbles, and MIME whitespace after an outer codec cannot suppress a valid registered-secret span.
+  Typed path allowlists now use the same collision-safe invariant.
+- Detach accepted timestamps into exact built-in UTC datetimes and normalize secret-bearing
+  `BaseException` failures from validation, clock, canonicalization, and content-hash boundaries to
+  fixed value-free errors. Replace repeated outer-wrapper suffix scans with a bounded near-linear
+  index for input-ceiling behavior.

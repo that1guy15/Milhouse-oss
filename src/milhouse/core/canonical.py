@@ -110,10 +110,10 @@ class _CanonicalEncoder:
         if type(value) is datetime:
             try:
                 return _quote_string(format_timestamp(value))
-            except (OverflowError, ValueError) as error:
+            except BaseException:
                 raise CanonicalizationError(
                     "MH_CANONICAL_TIMESTAMP", "a timestamp must be aware and valid"
-                ) from error
+                ) from None
         if type(value) is list:
             return self._encode_array(value, container_depth=container_depth + 1)
         if type(value) is dict:

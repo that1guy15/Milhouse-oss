@@ -55,7 +55,7 @@ def _read_time_source(
 
     try:
         return operation()
-    except Exception:
+    except BaseException:
         pass
     raise TimeError(code, message)
 

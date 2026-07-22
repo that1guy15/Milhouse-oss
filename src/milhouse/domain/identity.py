@@ -9,7 +9,6 @@ import re
 from typing import Annotated, Literal, Self
 
 from pydantic import (
-    BaseModel,
     ConfigDict,
     Field,
     StringConstraints,
@@ -25,6 +24,7 @@ from milhouse.core.canonical import (
 )
 from milhouse.core.errors import MilhouseValueError
 from milhouse.core.immutable import freeze_dict
+from milhouse.domain._validation import ValueSafeIdentityModel
 
 MachineIdV1 = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
 MachineNameV1 = Annotated[
@@ -76,12 +76,13 @@ class IdentityError(MilhouseValueError):
     """Safe identity derivation or validation failure."""
 
 
-class _StrictModel(BaseModel):
+class _StrictModel(ValueSafeIdentityModel):
     model_config = ConfigDict(
         extra="forbid",
         strict=True,
         frozen=True,
         hide_input_in_errors=True,
+        revalidate_instances="always",
         validate_default=True,
     )
 
@@ -185,6 +186,7 @@ class RecordDedupeV1(_StrictModel):
 
     @classmethod
     def from_identity(cls, identity: RecordIdentityV1) -> Self:
+        identity = RecordIdentityV1.model_validate(identity)
         return cls(
             installation_id=identity.installation_id,
             source=DedupeSourceV1(
@@ -215,6 +217,7 @@ def _base32_digest(digest: bytes) -> str:
 
 
 def derive_record_id(identity: RecordIdentityV1) -> str:
+    identity = RecordIdentityV1.model_validate(identity)
     projection = identity.model_dump(mode="python", exclude_none=True)
     return f"mh_{_base32_digest(_domain_digest(_RECORD_ID_DOMAIN, projection))}"
 
@@ -226,6 +229,7 @@ def derive_content_hash(content_projection: dict[str, object]) -> str:
 
 
 def derive_dedupe_key(dedupe: RecordDedupeV1) -> str:
+    dedupe = RecordDedupeV1.model_validate(dedupe)
     projection = dedupe.model_dump(mode="python", exclude_none=True)
     return f"mh_d1_{_base32_digest(_domain_digest(_DEDUPE_DOMAIN, projection))}"
 

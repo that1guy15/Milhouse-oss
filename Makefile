@@ -73,6 +73,7 @@ test-coverage:
 		--critical 'src/milhouse/core/clock.py' \
 		--critical 'src/milhouse/core/errors.py' \
 		--critical 'src/milhouse/core/logging.py' \
+		--critical 'src/milhouse/domain/_validation.py' \
 		--critical 'src/milhouse/domain/identity.py' \
 		--critical 'src/milhouse/domain/records.py' \
 		--critical 'src/milhouse/privacy/egress.py' \

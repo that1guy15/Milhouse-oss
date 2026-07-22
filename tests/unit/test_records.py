@@ -1,8 +1,9 @@
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 import pytest
 from pydantic import ValidationError
 
+from milhouse.domain._validation import RECORD_VALIDATION_ERROR_MESSAGE
 from milhouse.domain.records import (
     ActorReferenceV1,
     AlertDataV1,
@@ -30,6 +31,7 @@ from milhouse.domain.records import (
 INSTALLATION_ID = "mh_in1_00000000000040008000000000000000"
 EVIDENCE_ID = "mh_g3hdcz3y6hf7wf5puc2h77nm554bfl3e45vrdfyyartayjdogdga"
 NOW = datetime(2026, 7, 21, 15, 0, tzinfo=UTC)
+RECORD_VALIDATION_MESSAGE = RECORD_VALIDATION_ERROR_MESSAGE
 
 
 def _source(
@@ -146,6 +148,45 @@ def test_finalize_record_assigns_deterministic_verified_identity_and_content() -
     assert first.model_copy(deep=True) == first
 
 
+class _MutableUtc(tzinfo):
+    def __init__(self) -> None:
+        self.offset = timedelta(0)
+
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        return self.offset
+
+    def dst(self, value: datetime | None) -> timedelta:
+        return timedelta(0)
+
+
+def test_timestamps_are_detached_into_exact_immutable_utc_values() -> None:
+    caller_tz = _MutableUtc()
+    caller_value = datetime(2026, 7, 21, 15, 0, tzinfo=caller_tz)
+    draft = _draft(
+        occurred_at=caller_value,
+        observed_at=caller_value,
+        ingested_at=caller_value,
+        expires_at=datetime(2026, 8, 20, 15, 0, tzinfo=caller_tz),
+    )
+    record = finalize_record(draft, installation_id=INSTALLATION_ID)
+    wire_before = record.model_dump_json()
+    record_id_before = record.record_id
+
+    caller_tz.offset = timedelta(hours=12)
+
+    for value in (
+        draft.occurred_at,
+        draft.observed_at,
+        draft.ingested_at,
+        draft.expires_at,
+    ):
+        assert type(value) is datetime
+        assert value.tzinfo is UTC
+    assert record.model_dump_json() == wire_before
+    assert record.record_id == record_id_before
+    assert record.model_copy(deep=True) == record
+
+
 def test_delivery_and_observation_metadata_do_not_change_logical_hashes() -> None:
     first = finalize_record(_draft(), installation_id=INSTALLATION_ID)
     moved = _draft(
@@ -161,6 +202,47 @@ def test_delivery_and_observation_metadata_do_not_change_logical_hashes() -> Non
     assert second.record_id == first.record_id
     assert second.dedupe_key == first.dedupe_key
     assert second.content_hash == first.content_hash
+
+
+def test_redaction_policy_revision_separates_changed_normalization_identity() -> None:
+    legacy = finalize_record(
+        _draft(
+            EventDataV1(
+                category="privacy",
+                status="redacted",
+                message="token [redacted:secret]",
+            ),
+            redaction_version="r1-e4",
+        ),
+        installation_id=INSTALLATION_ID,
+    )
+    current = finalize_record(
+        _draft(
+            EventDataV1(
+                category="privacy",
+                status="redacted",
+                message="token [mh:s]",
+            ),
+            redaction_version="r2-e4",
+        ),
+        installation_id=INSTALLATION_ID,
+    )
+    repeated = finalize_record(
+        _draft(
+            EventDataV1(
+                category="privacy",
+                status="redacted",
+                message="token [mh:s]",
+            ),
+            redaction_version="r2-e4",
+        ),
+        installation_id=INSTALLATION_ID,
+    )
+
+    assert current.record_id != legacy.record_id
+    assert current.dedupe_key == legacy.dedupe_key
+    assert current.content_hash != legacy.content_hash
+    assert repeated == current
 
 
 def test_meaningful_content_change_preserves_identity_but_creates_conflict_hash() -> None:
@@ -185,7 +267,7 @@ def test_record_parser_rejects_tampered_content() -> None:
     values = record.model_dump(mode="python")
     values["dimensions"] = {"route": "other"}
 
-    with pytest.raises(ValidationError, match="content_hash does not match"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         RecordEnvelopeV1.model_validate(values)
 
     other = finalize_record(
@@ -207,7 +289,7 @@ def test_record_parser_rejects_tampered_content() -> None:
 
 
 @pytest.mark.parametrize(
-    ("overrides", "message"),
+    ("overrides", "_message"),
     [
         ({"target": None}, "target scope requires"),
         ({"scope": "installation"}, "installation scope forbids"),
@@ -219,9 +301,9 @@ def test_record_parser_rejects_tampered_content() -> None:
     ],
 )
 def test_record_draft_fails_closed_on_cross_field_contracts(
-    overrides: dict[str, object], message: str
+    overrides: dict[str, object], _message: str
 ) -> None:
-    with pytest.raises(ValidationError, match=message):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(**overrides)
 
 
@@ -233,7 +315,7 @@ def test_non_collector_records_require_no_collector_provenance() -> None:
     )
     assert finalize_record(draft, installation_id=INSTALLATION_ID).source.producer == "system"
 
-    with pytest.raises(ValidationError, match="non-collector records forbid"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(source=_source(producer="system"))
 
     installation = _draft(
@@ -247,12 +329,12 @@ def test_non_collector_records_require_no_collector_provenance() -> None:
 
 
 def test_record_type_must_match_discriminated_payload() -> None:
-    with pytest.raises(ValidationError, match="record_type must match"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(record_type="metric")
 
     values = _draft().model_dump(mode="python")
     values["data"] = {"type": "unknown"}
-    with pytest.raises(ValidationError, match="union_tag_invalid"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         RecordDraftV1.model_validate(values)
 
 
@@ -272,16 +354,16 @@ def test_metric_window_and_numeric_contracts_are_strict() -> None:
         == "metric"
     )
 
-    with pytest.raises(ValidationError, match="window_total requires"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         MetricDataV1(value=1, unit="requests", metric_semantics="window_total")
-    with pytest.raises(ValidationError, match="only window_total"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         MetricDataV1(
             value=1,
             unit="requests",
             metric_semantics="gauge",
             window_start=NOW,
         )
-    with pytest.raises(ValidationError, match="window_end must be after"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         MetricDataV1(
             value=1,
             unit="requests",
@@ -292,7 +374,7 @@ def test_metric_window_and_numeric_contracts_are_strict() -> None:
     for invalid in (True, float("nan"), float("inf"), 2**63):
         with pytest.raises(ValidationError):
             MetricDataV1(value=invalid, unit="ms", metric_semantics="gauge")
-    with pytest.raises(ValidationError, match="signed 64-bit"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         MetricDataV1(value=float(2**63), unit="ms", metric_semantics="gauge")
     assert MetricDataV1(value=1, unit="count", metric_semantics="gauge").value == 1
 
@@ -335,7 +417,7 @@ def test_span_run_and_audit_payloads_finalize() -> None:
         )
         assert record.data.type == payload.type
 
-    with pytest.raises(ValidationError, match="ended_at must not precede"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         RunDataV1(
             run_id="run-1",
             run_type="collector.run",
@@ -385,15 +467,15 @@ def test_alert_and_incident_transitions_are_append_only_and_consistent() -> None
         )
         assert record.severity == record.data.severity  # type: ignore[union-attr]
 
-    with pytest.raises(ValidationError, match="alert state transition is not allowed"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         AlertDataV1.model_validate(
             {**alert.model_dump(), "state": "firing", "previous_state": "firing"}
         )
-    with pytest.raises(ValidationError, match="incident state transition is not allowed"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         IncidentDataV1.model_validate(
             {**incident.model_dump(), "transition": "resolved", "state": "resolved"}
         )
-    with pytest.raises(ValidationError, match="severity must match"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(alert, record_type="alert", severity="warning")
 
 
@@ -456,7 +538,7 @@ def test_feedback_item_and_transition_contracts_enforce_authority_and_evidence()
     )
     assert accepted_record.data.type == "feedback_transition"
 
-    with pytest.raises(ValidationError, match="requires an owner"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         FeedbackTransitionDataV1.model_validate({**accepted.model_dump(), "owner": None})
     returned_open = FeedbackTransitionDataV1.model_validate(
         {
@@ -470,7 +552,7 @@ def test_feedback_item_and_transition_contracts_enforce_authority_and_evidence()
         }
     )
     assert returned_open.clear_owner is True
-    with pytest.raises(ValidationError, match="only when returning accepted feedback to open"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         FeedbackTransitionDataV1.model_validate(
             {
                 **accepted.model_dump(),
@@ -480,7 +562,7 @@ def test_feedback_item_and_transition_contracts_enforce_authority_and_evidence()
                 "clear_owner": True,
             }
         )
-    with pytest.raises(ValidationError, match="only an acceptance transition"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         FeedbackTransitionDataV1.model_validate(
             {
                 **accepted.model_dump(),
@@ -488,7 +570,7 @@ def test_feedback_item_and_transition_contracts_enforce_authority_and_evidence()
                 "to_state": "rejected",
             }
         )
-    with pytest.raises(ValidationError, match="requires a change and validation evidence"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         FeedbackTransitionDataV1.model_validate(
             {
                 **accepted.model_dump(),
@@ -499,7 +581,7 @@ def test_feedback_item_and_transition_contracts_enforce_authority_and_evidence()
                 "owner": None,
             }
         )
-    with pytest.raises(ValidationError, match="only a verifier"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         FeedbackTransitionDataV1.model_validate(
             {
                 **accepted.model_dump(),
@@ -510,7 +592,7 @@ def test_feedback_item_and_transition_contracts_enforce_authority_and_evidence()
                 "owner": None,
             }
         )
-    with pytest.raises(ValidationError, match="require verification evidence"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         FeedbackTransitionDataV1.model_validate(
             {
                 **accepted.model_dump(),
@@ -522,11 +604,11 @@ def test_feedback_item_and_transition_contracts_enforce_authority_and_evidence()
                 "owner": None,
             }
         )
-    with pytest.raises(ValidationError, match="not allowed"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         FeedbackTransitionDataV1.model_validate(
             {**accepted.model_dump(), "from_state": "open", "to_state": "verified"}
         )
-    with pytest.raises(ValidationError, match="expected_revision plus one"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         FeedbackTransitionDataV1.model_validate({**accepted.model_dump(), "revision": 3})
 
 
@@ -534,13 +616,13 @@ def test_verification_spec_is_typed_bounded_and_non_executable() -> None:
     spec = _verification_spec()
     assert spec.predicate.type == "validation_passed"
 
-    with pytest.raises(ValidationError, match="record_names must not contain duplicates"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         VerificationSpecV1.model_validate(
             {**spec.model_dump(), "record_names": ["validation.result", "validation.result"]}
         )
-    with pytest.raises(ValidationError, match="extra_forbidden"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         VerificationSpecV1.model_validate({**spec.model_dump(), "sql": "SELECT 1"})
-    with pytest.raises(ValidationError, match="union_tag_invalid"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         VerificationSpecV1.model_validate(
             {**spec.model_dump(), "predicate": {"type": "run_command", "command": "false"}}
         )
@@ -574,14 +656,14 @@ def test_feedback_envelope_rejects_mismatched_embedded_contract_fields() -> None
         "occurred_at": NOW,
         "severity": "warning",
     }
-    for replacement, message in (
+    for replacement, _message in (
         ({"target_id": "another-target"}, "feedback target must match"),
         ({"trust_level": "system"}, "feedback trust level must match"),
         ({"privacy_class": "public"}, "feedback privacy class must match"),
         ({"created_at": NOW + timedelta(seconds=1)}, "created_at must match"),
     ):
         changed = FeedbackItemDataV1.model_validate({**item.model_dump(), **replacement})
-        with pytest.raises(ValidationError, match=message):
+        with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
             _draft(changed, **base)
 
     transition = FeedbackTransitionDataV1(
@@ -596,7 +678,7 @@ def test_feedback_envelope_rejects_mismatched_embedded_contract_fields() -> None
         rationale="Synthetic rejection",
         request_id="request-1",
     )
-    with pytest.raises(ValidationError, match="timestamp must match"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(
             transition,
             record_type="feedback_transition",
@@ -615,19 +697,19 @@ def test_record_bounds_timestamps_and_value_safe_errors() -> None:
         )
     assert secret not in str(error.value)
 
-    with pytest.raises(ValidationError, match="dimension value"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(dimensions={"value": "x" * 2_049})
-    with pytest.raises(ValidationError, match="finite"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(dimensions={"value": float("nan")})
-    with pytest.raises(ValidationError, match="unsafe control"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(EventDataV1(category="availability", status="failed", message="bad\x1bvalue"))
-    with pytest.raises(ValidationError, match="single line"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         ActorReferenceV1(type="operator", id="operator\nspoofed")
-    with pytest.raises(ValidationError, match="surrogate"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         EventDataV1(category="availability", status="failed", message="bad\ud800value")
-    with pytest.raises(ValidationError, match="lowercase machine name"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(dimensions={"Bad Key": "value"})
-    with pytest.raises(ValidationError, match="duplicates"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         AlertDataV1(
             alert_key="alert-1",
             rule_id="availability-rule",
@@ -641,7 +723,7 @@ def test_record_bounds_timestamps_and_value_safe_errors() -> None:
             summary="Synthetic alert",
             evidence_ids=[EVIDENCE_ID, EVIDENCE_ID],
         )
-    with pytest.raises(ValidationError, match="resource_ids must not contain duplicates"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         AuditDataV1(
             action="config.validate",
             actor=ActorReferenceV1(type="operator", id="operator-1"),
@@ -658,7 +740,7 @@ def test_record_bounds_timestamps_and_value_safe_errors() -> None:
             _draft(occurred_at=invalid_time)
 
     large = {f"key_{index}": "x" * 2_048 for index in range(100)}
-    with pytest.raises(ValidationError, match="canonical record bounds"):
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(
             EventDataV1(
                 category="availability",
