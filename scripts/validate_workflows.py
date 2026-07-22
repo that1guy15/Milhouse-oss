@@ -27,6 +27,18 @@ ACTION_REFERENCE = re.compile(
 DOCKER_REFERENCE = re.compile(r"^docker://[^\s@]+@sha256:[0-9a-f]{64}$")
 DEPENDENCY_REVIEW_ACTION = "actions/dependency-review-action@"
 MAKE_LAUNCHER = "./scripts/run_make.py"
+IDENTITY_PORTABILITY_JOB = "identity-portability"
+IDENTITY_PORTABILITY_RUNNER = "macos-14"
+IDENTITY_PORTABILITY_PYTHON_VERSIONS = ("3.11", "3.14")
+IDENTITY_PORTABILITY_COMMAND = f"{MAKE_LAUNCHER} identity-portability"
+IDENTITY_PORTABILITY_PYTHON_EXPRESSION = "${{ matrix.python }}"
+IDENTITY_PORTABILITY_UV_SETTINGS = {
+    "version": "${{ env.UV_VERSION }}",
+    "enable-cache": True,
+    "cache-dependency-glob": "uv.lock",
+}
+SETUP_PYTHON_ACTION = "actions/setup-python@"
+SETUP_UV_ACTION = "astral-sh/setup-uv@"
 DCO_PULL_REQUEST_CONDITION = "github.event_name == 'pull_request'"
 DCO_PUSH_CONDITION = "github.event_name == 'push'"
 DCO_OTHER_CONDITION = "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"
@@ -72,6 +84,10 @@ AGGREGATE_RESULT_ENVIRONMENT = {
         "${{ needs.dependency-review.result }}",
     ),
     "gitleaks": ("GITLEAKS_RESULT", "${{ needs.gitleaks.result }}"),
+    "identity-portability": (
+        "IDENTITY_PORTABILITY_RESULT",
+        "${{ needs.identity-portability.result }}",
+    ),
     "package": ("PACKAGE_RESULT", "${{ needs.package.result }}"),
     "quality": ("QUALITY_RESULT", "${{ needs.quality.result }}"),
     "test": ("TEST_RESULT", "${{ needs.test.result }}"),
@@ -482,6 +498,84 @@ def _validate_dependency_review_job(path: Path, jobs: dict[str, object]) -> None
     )
 
 
+def _validate_identity_portability_job(path: Path, jobs: dict[str, object]) -> None:
+    """Require the exact cross-version macOS identity portability gate."""
+
+    raw_job = jobs.get(IDENTITY_PORTABILITY_JOB)
+    if raw_job is None:
+        raise WorkflowError(
+            f"{path}: aggregate workflow requires the mandatory {IDENTITY_PORTABILITY_JOB} job"
+        )
+    job = require_mapping(raw_job, f"{path}:{IDENTITY_PORTABILITY_JOB}")
+    if "if" in job or "needs" in job:
+        raise WorkflowError(f"{path}:{IDENTITY_PORTABILITY_JOB} must be unconditional")
+    if job.get("runs-on") != IDENTITY_PORTABILITY_RUNNER:
+        raise WorkflowError(
+            f"{path}:{IDENTITY_PORTABILITY_JOB} must use fixed runner {IDENTITY_PORTABILITY_RUNNER}"
+        )
+
+    strategy = require_mapping(
+        job.get("strategy"),
+        f"{path}:{IDENTITY_PORTABILITY_JOB}.strategy",
+    )
+    if set(strategy) != {"fail-fast", "matrix"}:
+        raise WorkflowError(
+            f"{path}:{IDENTITY_PORTABILITY_JOB} strategy must contain only fail-fast and matrix"
+        )
+    if strategy["fail-fast"] is not False:
+        raise WorkflowError(f"{path}:{IDENTITY_PORTABILITY_JOB} fail-fast must be literal false")
+    matrix = require_mapping(
+        strategy["matrix"],
+        f"{path}:{IDENTITY_PORTABILITY_JOB}.strategy.matrix",
+    )
+    if set(matrix) != {"python"} or matrix.get("python") != list(
+        IDENTITY_PORTABILITY_PYTHON_VERSIONS
+    ):
+        versions = " and ".join(IDENTITY_PORTABILITY_PYTHON_VERSIONS)
+        raise WorkflowError(
+            f"{path}:{IDENTITY_PORTABILITY_JOB} Python matrix must be exactly {versions}"
+        )
+
+    raw_steps = job.get("steps")
+    if not isinstance(raw_steps, list):
+        raise WorkflowError(f"{path}:{IDENTITY_PORTABILITY_JOB} steps must be a list")
+    steps = [require_mapping(step, f"{path}:{IDENTITY_PORTABILITY_JOB} step") for step in raw_steps]
+    python_steps = [
+        step for step in steps if str(step.get("uses", "")).startswith(SETUP_PYTHON_ACTION)
+    ]
+    if len(python_steps) != 1:
+        raise WorkflowError(
+            f"{path}:{IDENTITY_PORTABILITY_JOB} requires exactly one setup-python step"
+        )
+    python_settings = require_mapping(
+        python_steps[0].get("with"),
+        f"{path}:{IDENTITY_PORTABILITY_JOB} setup-python settings",
+    )
+    if python_settings != {"python-version": IDENTITY_PORTABILITY_PYTHON_EXPRESSION}:
+        raise WorkflowError(
+            f"{path}:{IDENTITY_PORTABILITY_JOB} setup-python must use the matrix Python version"
+        )
+
+    uv_steps = [step for step in steps if str(step.get("uses", "")).startswith(SETUP_UV_ACTION)]
+    if len(uv_steps) != 1:
+        raise WorkflowError(f"{path}:{IDENTITY_PORTABILITY_JOB} requires exactly one setup-uv step")
+    uv_settings = require_mapping(
+        uv_steps[0].get("with"),
+        f"{path}:{IDENTITY_PORTABILITY_JOB} setup-uv settings",
+    )
+    if uv_settings != IDENTITY_PORTABILITY_UV_SETTINGS:
+        raise WorkflowError(
+            f"{path}:{IDENTITY_PORTABILITY_JOB} setup-uv settings differ from the locked toolchain"
+        )
+
+    command_steps = [step for step in steps if step.get("run") == IDENTITY_PORTABILITY_COMMAND]
+    if len(command_steps) != 1:
+        raise WorkflowError(
+            f"{path}:{IDENTITY_PORTABILITY_JOB} requires exactly one exact "
+            f"{IDENTITY_PORTABILITY_COMMAND} step"
+        )
+
+
 def _validate_dco_job(path: Path, jobs: dict[str, object]) -> None:
     """Require exact PR, complete-push, and non-push DCO ranges."""
 
@@ -691,8 +785,14 @@ def validate_workflow(
     if "dependency-review" in jobs:
         _validate_dependency_review_job(path, jobs)
 
-    graph = _validate_graph(jobs, path)
     has_aggregate = "required-ci" in jobs
+    if has_aggregate:
+        if IDENTITY_PORTABILITY_JOB in optional_jobs:
+            raise WorkflowError(
+                f"{path}: {IDENTITY_PORTABILITY_JOB} cannot be an optional aggregate job"
+            )
+        _validate_identity_portability_job(path, jobs)
+    graph = _validate_graph(jobs, path)
     if has_aggregate:
         if "pull_request" not in trigger_names:
             raise WorkflowError(f"{path}: aggregate workflow must run on pull_request")

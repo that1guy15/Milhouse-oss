@@ -23,6 +23,12 @@ Metric payloads declare `gauge`, `counter_delta`, `window_total`, or `cumulative
 
 All collectors document their entity identity, observation coordinate, correction semantics, and update fixtures. Query, report, replay, and verification code share canonical serialization and cannot invent alternate identity or aggregation rules.
 
+An immutable synthetic conformance corpus fixes the canonical identity bytes, record ID, dedupe key,
+content hash, and finalized-record identity. Required CI recomputes those values in independent
+interpreters across every supported Python version on Ubuntu and the oldest/newest supported Python
+on fixed macOS 14 runners. Hash seed, mapping insertion order, timezone, and available locale changes
+cannot alter a wire value; a mismatch is a compatibility defect rather than a fixture-refresh event.
+
 ## Plan references
 
 - [Section 4.2: Canonical record envelope](../implementation-plan.md#42-canonical-record-envelope)

@@ -125,6 +125,10 @@ distribution, under pre-parse byte caps, and never imports plugin code. The PEP 
 is used only to validate raw version syntax; acceptance still requires an exact raw installed-version
 match.
 
+The W02 identity-portability corpus and process harness are derived only from the public canonical
+identity contract and wholly synthetic values. No private identity, identifier, record, fixture,
+platform output, source expression, configuration, or runtime data was inspected or reused.
+
 ## Mandatory clean-room rewrites
 
 The following areas may use documented product behavior as requirements but may

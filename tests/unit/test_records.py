@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 import pytest
@@ -9,6 +10,7 @@ from milhouse.domain.records import (
     AlertDataV1,
     AuditDataV1,
     CollectorDescriptorV1,
+    CorrelationV1,
     EventDataV1,
     FeedbackItemDataV1,
     FeedbackTransitionDataV1,
@@ -146,6 +148,15 @@ def test_finalize_record_assigns_deterministic_verified_identity_and_content() -
     with pytest.raises(TypeError, match="immutable"):
         first.data.attributes["status_code"] = 500
     assert first.model_copy(deep=True) == first
+
+
+def test_raw_json_omitted_correlation_uses_the_validated_empty_default() -> None:
+    document = _draft().model_dump(mode="json")
+    document.pop("correlation")
+
+    parsed = RecordDraftV1.model_validate_json(json.dumps(document))
+
+    assert parsed.correlation == CorrelationV1()
 
 
 class _MutableUtc(tzinfo):

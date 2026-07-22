@@ -1,0 +1,456 @@
+{
+  "fixture_schema": "milhouse.identity-portability.v1",
+  "vectors": [
+    {
+      "id": "target-mixed-scalars",
+      "installation_id": "mh_in1_0123456789ab4cde8f0123456789abcd",
+      "identity_variants": [
+        {
+          "installation_id": "mh_in1_0123456789ab4cde8f0123456789abcd",
+          "redaction_version": "r2-e3",
+          "source": {
+            "id": "synthetic-source",
+            "type": "fixture.event",
+            "observation_namespace_id": "mh_ns1_00000000000040008000000000000000",
+            "source_generation_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          },
+          "scope": "target",
+          "target_id": "synthetic-target",
+          "record_type": "event",
+          "name": "fixture.portability",
+          "source_event_id": "synthetic-event-1",
+          "source_entity_id": "synthetic-entity-1",
+          "observation": {
+            "kind": "fixture.coordinate",
+            "parts": {
+              "bool_value": true,
+              "fraction": 1.5,
+              "max_int": 9223372036854775807,
+              "min_int": -9223372036854775808,
+              "negative_zero": -0.0,
+              "revision": 7,
+              "scientific": 1e-7,
+              "text": "Caf\u00e9"
+            }
+          }
+        },
+        {
+          "observation": {
+            "parts": {
+              "text": "Cafe\u0301",
+              "scientific": 0.0000001,
+              "revision": 7,
+              "negative_zero": 0.0,
+              "min_int": -9223372036854775808,
+              "max_int": 9223372036854775807,
+              "fraction": 1.5,
+              "bool_value": true
+            },
+            "kind": "fixture.coordinate"
+          },
+          "source_entity_id": "synthetic-entity-1",
+          "source_event_id": "synthetic-event-1",
+          "name": "fixture.portability",
+          "record_type": "event",
+          "target_id": "synthetic-target",
+          "scope": "target",
+          "source": {
+            "source_generation_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "observation_namespace_id": "mh_ns1_00000000000040008000000000000000",
+            "type": "fixture.event",
+            "id": "synthetic-source"
+          },
+          "redaction_version": "r2-e3",
+          "installation_id": "mh_in1_0123456789ab4cde8f0123456789abcd"
+        }
+      ],
+      "content_variants": [
+        {
+          "content_version": 1,
+          "occurred_at": {
+            "$datetime": "2026-07-21T15:00:00.123Z"
+          },
+          "name": "fixture.portability",
+          "data": {
+            "active": true,
+            "fraction": 1.5,
+            "max_int": 9223372036854775807,
+            "min_int": -9223372036854775808,
+            "negative_zero": -0.0,
+            "scientific": 1e-7,
+            "text": "Caf\u00e9"
+          }
+        },
+        {
+          "data": {
+            "text": "Cafe\u0301",
+            "scientific": 0.0000001,
+            "negative_zero": 0.0,
+            "min_int": -9223372036854775808,
+            "max_int": 9223372036854775807,
+            "fraction": 1.5,
+            "active": true
+          },
+          "name": "fixture.portability",
+          "occurred_at": {
+            "$datetime": "2026-07-21T10:00:00.123-05:00"
+          },
+          "content_version": 1
+        }
+      ],
+      "draft_variants": [
+        {
+          "record_type": "event",
+          "name": "fixture.portability",
+          "occurred_at": "2026-07-21T15:00:00.123Z",
+          "observed_at": "2026-07-21T15:00:01.000Z",
+          "ingested_at": "2026-07-21T15:00:02.000Z",
+          "expires_at": "2026-08-20T15:00:02.000Z",
+          "source_event_id": "synthetic-event-1",
+          "source_entity_id": "synthetic-entity-1",
+          "operation_id": "synthetic-operation-1",
+          "collector_run_id": "synthetic-run-1",
+          "scope": "target",
+          "source": {
+            "id": "synthetic-source",
+            "type": "fixture.event",
+            "producer": "collector",
+            "observation_namespace_id": "mh_ns1_00000000000040008000000000000000",
+            "source_generation_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "observation": {
+              "kind": "fixture.coordinate",
+              "parts": {
+                "bool_value": true,
+                "fraction": 1.5,
+                "max_int": 9223372036854775807,
+                "min_int": -9223372036854775808,
+                "negative_zero": -0.0,
+                "revision": 7,
+                "scientific": 1e-7,
+                "text": "Caf\u00e9"
+              }
+            }
+          },
+          "collector": {
+            "id": "synthetic-collector",
+            "type": "fixture.collector",
+            "plugin_api_version": "1.0",
+            "implementation_version": "1.2.3"
+          },
+          "target": {
+            "id": "synthetic-target",
+            "name": "Synthetic Caf\u00e9 target",
+            "kind": "fixture.service",
+            "environment": "test"
+          },
+          "severity": "info",
+          "trust_level": "authenticated",
+          "privacy_class": "internal",
+          "redaction_version": "r2-e3",
+          "correlation": {
+            "trace_id": "synthetic-trace-1",
+            "run_id": "synthetic-correlation-run-1"
+          },
+          "dimensions": {
+            "active": true,
+            "fraction": 1.5,
+            "max_int": 9223372036854775807,
+            "min_int": -9223372036854775808,
+            "negative_zero": -0.0,
+            "scientific": 1e-7,
+            "text": "Caf\u00e9"
+          },
+          "data": {
+            "type": "event",
+            "category": "portability",
+            "status": "complete",
+            "message": "Synthetic Caf\u00e9 result",
+            "attributes": {
+              "active": true,
+              "fraction": 1.5,
+              "max_int": 9223372036854775807,
+              "min_int": -9223372036854775808,
+              "negative_zero": -0.0,
+              "scientific": 1e-7,
+              "text": "Caf\u00e9"
+            }
+          }
+        },
+        {
+          "data": {
+            "attributes": {
+              "text": "Cafe\u0301",
+              "scientific": 0.0000001,
+              "negative_zero": 0.0,
+              "min_int": -9223372036854775808,
+              "max_int": 9223372036854775807,
+              "fraction": 1.5,
+              "active": true
+            },
+            "message": "Synthetic Cafe\u0301 result",
+            "status": "complete",
+            "category": "portability",
+            "type": "event"
+          },
+          "dimensions": {
+            "text": "Cafe\u0301",
+            "scientific": 0.0000001,
+            "negative_zero": 0.0,
+            "min_int": -9223372036854775808,
+            "max_int": 9223372036854775807,
+            "fraction": 1.5,
+            "active": true
+          },
+          "correlation": {
+            "run_id": "synthetic-correlation-run-1",
+            "trace_id": "synthetic-trace-1"
+          },
+          "redaction_version": "r2-e3",
+          "privacy_class": "internal",
+          "trust_level": "authenticated",
+          "severity": "info",
+          "target": {
+            "environment": "test",
+            "kind": "fixture.service",
+            "name": "Synthetic Cafe\u0301 target",
+            "id": "synthetic-target"
+          },
+          "collector": {
+            "implementation_version": "1.2.3",
+            "plugin_api_version": "1.0",
+            "type": "fixture.collector",
+            "id": "synthetic-collector"
+          },
+          "source": {
+            "observation": {
+              "parts": {
+                "text": "Cafe\u0301",
+                "scientific": 0.0000001,
+                "revision": 7,
+                "negative_zero": 0.0,
+                "min_int": -9223372036854775808,
+                "max_int": 9223372036854775807,
+                "fraction": 1.5,
+                "bool_value": true
+              },
+              "kind": "fixture.coordinate"
+            },
+            "source_generation_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "observation_namespace_id": "mh_ns1_00000000000040008000000000000000",
+            "producer": "collector",
+            "type": "fixture.event",
+            "id": "synthetic-source"
+          },
+          "scope": "target",
+          "collector_run_id": "synthetic-run-1",
+          "operation_id": "synthetic-operation-1",
+          "source_entity_id": "synthetic-entity-1",
+          "source_event_id": "synthetic-event-1",
+          "expires_at": "2026-08-20T15:00:02.000Z",
+          "ingested_at": "2026-07-21T15:00:02.000Z",
+          "observed_at": "2026-07-21T15:00:01.000Z",
+          "occurred_at": "2026-07-21T15:00:00.123Z",
+          "name": "fixture.portability",
+          "record_type": "event"
+        }
+      ],
+      "expected": {
+        "identity_canonical_hex": "7b226964656e746974795f76657273696f6e223a312c22696e7374616c6c6174696f6e5f6964223a226d685f696e315f3031323334353637383961623463646538663031323334353637383961626364222c226e616d65223a22666978747572652e706f72746162696c697479222c226f62736572766174696f6e223a7b226b696e64223a22666978747572652e636f6f7264696e617465222c227061727473223a7b22626f6f6c5f76616c7565223a747275652c226672616374696f6e223a312e352c226d61785f696e74223a393232333337323033363835343737353830372c226d696e5f696e74223a2d393232333337323033363835343737353830382c226e656761746976655f7a65726f223a302c227265766973696f6e223a372c22736369656e7469666963223a31652d372c2274657874223a22436166c3a9227d7d2c227265636f72645f74797065223a226576656e74222c22726564616374696f6e5f76657273696f6e223a2272322d6533222c22736368656d615f76657273696f6e223a22312e30222c2273636f7065223a22746172676574222c22736f75726365223a7b226964223a2273796e7468657469632d736f75726365222c226f62736572766174696f6e5f6e616d6573706163655f6964223a226d685f6e73315f3030303030303030303030303430303038303030303030303030303030303030222c22736f757263655f67656e65726174696f6e5f646967657374223a2230313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566222c2274797065223a22666978747572652e6576656e74227d2c22736f757263655f656e746974795f6964223a2273796e7468657469632d656e746974792d31222c22736f757263655f6576656e745f6964223a2273796e7468657469632d6576656e742d31222c227461726765745f6964223a2273796e7468657469632d746172676574227d",
+        "record_id": "mh_jh4jeoegbbzvbm46r27mxhbeyc3ybmfvuex7uaqw4rgkbmltqmwa",
+        "dedupe_wire": "mh_d1_o26ext5kmyzabz6woiv7drkf5dwje2uuue4bupuiuddwy6kow7va",
+        "content_hash": "881f3cad105023ea4051d5a2363b40dfefb15437586f51ec4eed5a1a60b6949a",
+        "finalized_envelope": {
+          "record_id": "mh_jh4jeoegbbzvbm46r27mxhbeyc3ybmfvuex7uaqw4rgkbmltqmwa",
+          "dedupe_wire": "mh_d1_o26ext5kmyzabz6woiv7drkf5dwje2uuue4bupuiuddwy6kow7va",
+          "content_hash": "41bed1e63b78282f6f671890d378ce5a94cf476c1c6d10988df7b7315c7756c8",
+          "canonical_sha256": "e1fa780a5a4d4b7ef7b736de525611a0262ced5be79690504620dba7b0ac2b0d"
+        }
+      }
+    },
+    {
+      "id": "installation-optional-identifiers-absent",
+      "installation_id": "mh_in1_11111111111141118111111111111111",
+      "identity_variants": [
+        {
+          "installation_id": "mh_in1_11111111111141118111111111111111",
+          "redaction_version": "r1-e1",
+          "source": {
+            "id": "milhouse-system",
+            "type": "system.identity",
+            "observation_namespace_id": "mh_ns1_11111111111141118111111111111111",
+            "source_generation_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+          },
+          "scope": "installation",
+          "record_type": "audit",
+          "name": "identity.initialized",
+          "observation": {
+            "kind": "identity.generation",
+            "parts": {
+              "active": false,
+              "generation": 1,
+              "label": "synthetic-initialization"
+            }
+          }
+        },
+        {
+          "observation": {
+            "parts": {
+              "label": "synthetic-initialization",
+              "generation": 1,
+              "active": false
+            },
+            "kind": "identity.generation"
+          },
+          "name": "identity.initialized",
+          "record_type": "audit",
+          "scope": "installation",
+          "source": {
+            "source_generation_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "observation_namespace_id": "mh_ns1_11111111111141118111111111111111",
+            "type": "system.identity",
+            "id": "milhouse-system"
+          },
+          "redaction_version": "r1-e1",
+          "installation_id": "mh_in1_11111111111141118111111111111111"
+        }
+      ],
+      "content_variants": [
+        {
+          "content_version": 1,
+          "occurred_at": {
+            "$datetime": "2026-07-22T00:00:00.000Z"
+          },
+          "kind": "identity.initialized",
+          "counts": {
+            "created": 1,
+            "existing": 0
+          }
+        },
+        {
+          "counts": {
+            "existing": 0,
+            "created": 1
+          },
+          "kind": "identity.initialized",
+          "occurred_at": {
+            "$datetime": "2026-07-22T05:30:00.000+05:30"
+          },
+          "content_version": 1
+        }
+      ],
+      "draft_variants": [
+        {
+          "record_type": "audit",
+          "name": "identity.initialized",
+          "occurred_at": "2026-07-22T00:00:00.000Z",
+          "observed_at": "2026-07-22T00:00:00.000Z",
+          "ingested_at": "2026-07-22T00:00:00.001Z",
+          "expires_at": "2027-07-22T00:00:00.001Z",
+          "operation_id": "synthetic-identity-operation-1",
+          "scope": "installation",
+          "source": {
+            "id": "milhouse-system",
+            "type": "system.identity",
+            "producer": "system",
+            "observation_namespace_id": "mh_ns1_11111111111141118111111111111111",
+            "source_generation_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "observation": {
+              "kind": "identity.generation",
+              "parts": {
+                "active": false,
+                "generation": 1,
+                "label": "synthetic-initialization"
+              }
+            }
+          },
+          "severity": "info",
+          "trust_level": "system",
+          "privacy_class": "internal",
+          "redaction_version": "r1-e1",
+          "dimensions": {
+            "created": 1,
+            "existing": 0
+          },
+          "data": {
+            "type": "audit",
+            "action": "identity.initialize",
+            "actor": {
+              "type": "system",
+              "id": "milhouse-system"
+            },
+            "resource_ids": [
+              "synthetic-installation"
+            ],
+            "outcome": "success",
+            "counts": {
+              "created": 1,
+              "existing": 0
+            }
+          }
+        },
+        {
+          "data": {
+            "counts": {
+              "existing": 0,
+              "created": 1
+            },
+            "outcome": "success",
+            "resource_ids": [
+              "synthetic-installation"
+            ],
+            "actor": {
+              "id": "milhouse-system",
+              "type": "system"
+            },
+            "action": "identity.initialize",
+            "type": "audit"
+          },
+          "dimensions": {
+            "existing": 0,
+            "created": 1
+          },
+          "correlation": {},
+          "redaction_version": "r1-e1",
+          "privacy_class": "internal",
+          "trust_level": "system",
+          "severity": "info",
+          "source": {
+            "observation": {
+              "parts": {
+                "label": "synthetic-initialization",
+                "generation": 1,
+                "active": false
+              },
+              "kind": "identity.generation"
+            },
+            "source_generation_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "observation_namespace_id": "mh_ns1_11111111111141118111111111111111",
+            "producer": "system",
+            "type": "system.identity",
+            "id": "milhouse-system"
+          },
+          "scope": "installation",
+          "operation_id": "synthetic-identity-operation-1",
+          "expires_at": "2027-07-22T00:00:00.001Z",
+          "ingested_at": "2026-07-22T00:00:00.001Z",
+          "observed_at": "2026-07-22T00:00:00.000Z",
+          "occurred_at": "2026-07-22T00:00:00.000Z",
+          "name": "identity.initialized",
+          "record_type": "audit"
+        }
+      ],
+      "expected": {
+        "identity_canonical_hex": "7b226964656e746974795f76657273696f6e223a312c22696e7374616c6c6174696f6e5f6964223a226d685f696e315f3131313131313131313131313431313138313131313131313131313131313131222c226e616d65223a226964656e746974792e696e697469616c697a6564222c226f62736572766174696f6e223a7b226b696e64223a226964656e746974792e67656e65726174696f6e222c227061727473223a7b22616374697665223a66616c73652c2267656e65726174696f6e223a312c226c6162656c223a2273796e7468657469632d696e697469616c697a6174696f6e227d7d2c227265636f72645f74797065223a226175646974222c22726564616374696f6e5f76657273696f6e223a2272312d6531222c22736368656d615f76657273696f6e223a22312e30222c2273636f7065223a22696e7374616c6c6174696f6e222c22736f75726365223a7b226964223a226d696c686f7573652d73797374656d222c226f62736572766174696f6e5f6e616d6573706163655f6964223a226d685f6e73315f3131313131313131313131313431313138313131313131313131313131313131222c22736f757263655f67656e65726174696f6e5f646967657374223a2261626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839222c2274797065223a2273797374656d2e6964656e74697479227d7d",
+        "record_id": "mh_gjkyxdv5o3nzy7a2layq475jmcpi5v3hkray2y4az24j3d3zgnqa",
+        "dedupe_wire": "mh_d1_p5lnzvtk3wy2irqxtvpjyb6jvygqkyqjsnaas65dtw6xm6gemfca",
+        "content_hash": "cf6f32b41401a027baf45ec557e4cb7c1fcdca7f00130246a9b31ac0c6c803f6",
+        "finalized_envelope": {
+          "record_id": "mh_gjkyxdv5o3nzy7a2layq475jmcpi5v3hkray2y4az24j3d3zgnqa",
+          "dedupe_wire": "mh_d1_p5lnzvtk3wy2irqxtvpjyb6jvygqkyqjsnaas65dtw6xm6gemfca",
+          "content_hash": "16196631082460fd5c779dec42c662c7b51b44ba5349ceb9277065616d52167a",
+          "canonical_sha256": "599691b2a6a77e024013bc047d62c13bc5860aa8301143d774a4162704858810"
+        }
+      }
+    }
+  ]
+}
