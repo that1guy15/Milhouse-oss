@@ -2,9 +2,10 @@
 
 ## Status
 
-Recovery is in progress. This record does not amend the authoritative plan, classify the affected
-commit as DCO compliant, or weaken the DCO checker. It preserves the exact incident evidence and
-the bounded recovery path while protected `main` remains immutable.
+Immediate recovery is complete at protected-main commit
+`c0f9f2a8a1300eef18e651a20b6e2111d9cbd6a5`. This record does not amend the authoritative plan,
+classify the affected commit as DCO compliant, or weaken the DCO checker. Permanent historical
+disposition remains owner-pending.
 
 ## Exact affected contribution
 
@@ -46,20 +47,31 @@ failure. Every other job passed: quality, test coverage, Python 3.11-3.14 compat
 identity portability on Python 3.11 and 3.14, package build, four artifact-smoke jobs, audit,
 dependency review, gitleaks, and CodeQL.
 
-## Bounded recovery
+## Bounded recovery evidence
 
-The same author is submitting this record in a DCO-signed remediation commit whose message applies
-the sign-off retroactively to the exact affected contribution and binds it to the signed,
-identical-tree source commit. Recovery must proceed through a protected pull request. Its squash
-body must contain real line breaks and an author-matching trailer. After merge, validation must:
+Recovery [PR #22](https://github.com/that1guy15/Milhouse-oss/pull/22) retained final signed source
+head `3ac1a330fad9cf9216fd78a2f0220404c3be8b5a` and tree
+`6c8e6d11c36ed88989a4adafefa59d91a33aa837`. Required CI run
+[`29903357994`](https://github.com/that1guy15/Milhouse-oss/actions/runs/29903357994) and the
+separate GitHub Advanced Security CodeQL check passed at that exact head. Independent report-only
+review found no actionable P0-P3 issue after D01 was added to the defects ledger.
 
-1. inspect the protected commit message rather than trusting the merge command;
-2. pass `scripts/check_dco.py` for the exact old-main-to-new-main range;
-3. continue to reject the original affected-commit range; and
-4. pass the recovery PR and post-merge aggregate Required CI runs.
+Protected squash merge produced `c0f9f2a8a1300eef18e651a20b6e2111d9cbd6a5` with the exact
+reviewed tree. Direct inspection found real line breaks and one parsed, author-matching trailer.
+The strict checker passes the exact
+`76511d5c63e4509765b3ad3ceabefba251e559c7..c0f9f2a8a1300eef18e651a20b6e2111d9cbd6a5`
+recovery range and continues to reject the original affected range.
+
+Post-merge Required CI run
+[`29903480661`](https://github.com/that1guy15/Milhouse-oss/actions/runs/29903480661) first failed
+because the pinned uv setup action in the `gitleaks` job timed out after five seconds while fetching
+its public version manifest; neither secret scanner started. Every other constituent job passed,
+and `required-ci` correctly propagated the setup failure. The failed-jobs-only second attempt ran
+both secret scans successfully and then passed `required-ci`; the completed run conclusion is
+success.
 
 No history rewrite, force push, protection bypass, checker weakening, generic squash exception, or
-rerun of the correctly failed workflow is permitted.
+rerun of the correctly failed PR #21 workflow occurred.
 
 ## Durable disposition boundary
 
