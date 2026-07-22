@@ -9,4 +9,5 @@ A record may describe an in-progress candidate. Only an explicit conclusion tied
 commit and every required result marks a gate passed.
 
 - [G01 package and quality-toolchain foundation](G01.md) — passed 2026-07-19
-- [PR #21 squash DCO incident and remediation](PR21-DCO.md) — recovery in progress 2026-07-22
+- [PR #21 squash DCO incident and remediation](PR21-DCO.md) — immediate recovery complete;
+  historical disposition pending 2026-07-22
