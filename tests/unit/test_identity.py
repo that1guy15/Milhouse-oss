@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 import milhouse.domain.identity as identity_module
+from milhouse.domain._validation import IDENTITY_VALIDATION_ERROR_MESSAGE
 from milhouse.domain.identity import (
     DedupeSourceV1,
     IdentityError,
@@ -17,6 +18,8 @@ from milhouse.domain.identity import (
     validate_dedupe_key,
     validate_record_id,
 )
+
+IDENTITY_VALIDATION_MESSAGE = IDENTITY_VALIDATION_ERROR_MESSAGE
 
 
 def _source(*, generation: str = "0" * 64) -> SourceIdentityV1:
@@ -192,14 +195,14 @@ def test_identity_opaque_ids_are_byte_bounded_single_line_and_value_safe() -> No
 
 
 def test_identity_and_dedupe_scope_requirements_fail_both_directions() -> None:
-    with pytest.raises(ValidationError, match="MH_IDENTITY_TARGET_REQUIRED"):
+    with pytest.raises(ValidationError, match=IDENTITY_VALIDATION_MESSAGE):
         _identity(target_id=None)
 
     dedupe = RecordDedupeV1.from_identity(_identity())
     values = dedupe.model_dump(mode="python")
-    with pytest.raises(ValidationError, match="MH_DEDUPE_TARGET_REQUIRED"):
+    with pytest.raises(ValidationError, match=IDENTITY_VALIDATION_MESSAGE):
         RecordDedupeV1.model_validate({**values, "target_id": None})
-    with pytest.raises(ValidationError, match="MH_DEDUPE_TARGET_FORBIDDEN"):
+    with pytest.raises(ValidationError, match=IDENTITY_VALIDATION_MESSAGE):
         RecordDedupeV1.model_validate({**values, "scope": "installation"})
 
 

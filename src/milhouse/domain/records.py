@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, Self, TypeAlias
 
 from pydantic import (
     AfterValidator,
-    BaseModel,
     ConfigDict,
     Field,
     field_validator,
@@ -24,6 +23,7 @@ from milhouse.core.canonical import (
 )
 from milhouse.core.errors import MilhouseValueError
 from milhouse.core.immutable import freeze_dict, freeze_list
+from milhouse.domain._validation import ValueSafeRecordModel
 from milhouse.domain.identity import (
     InstallationIdV1,
     MachineIdV1,
@@ -63,12 +63,13 @@ class RecordError(MilhouseValueError):
     """A stable record construction or identity-verification failure."""
 
 
-class _StrictRecordModel(BaseModel):
+class _StrictRecordModel(ValueSafeRecordModel):
     model_config = ConfigDict(
         extra="forbid",
         strict=True,
         frozen=True,
         hide_input_in_errors=True,
+        revalidate_instances="always",
         validate_default=True,
     )
 
@@ -78,7 +79,19 @@ def _validate_utc(value: datetime) -> datetime:
         raise ValueError("timestamp must use an explicit zero UTC offset")
     if value.microsecond % 1000:
         raise ValueError("timestamp must have millisecond precision")
-    return value
+    # Never retain a caller-owned datetime subclass or mutable tzinfo object.
+    # A zero-offset value has the same wall-clock fields in canonical UTC.
+    return datetime(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+        tzinfo=UTC,
+        fold=value.fold,
+    )
 
 
 UtcTimestampV1 = Annotated[datetime, AfterValidator(_validate_utc)]
@@ -677,8 +690,9 @@ def finalize_record(
     *,
     installation_id: InstallationIdV1,
 ) -> RecordEnvelopeV1:
-    """Assign deterministic identity and content digests to one validated record draft."""
+    """Assign deterministic digests to a draft already normalized and redacted by its caller."""
 
+    draft = RecordDraftV1.model_validate(draft)
     identity = draft.identity(installation_id)
     values = draft.model_dump(mode="python", exclude_none=True)
     values.update(
@@ -698,6 +712,7 @@ def verify_record_identity(
 ) -> None:
     """Fail safely when a parsed record's deterministic identity does not match its body."""
 
+    record = RecordEnvelopeV1.model_validate(record)
     identity = record.identity(installation_id)
     if record.record_id != derive_record_id(identity):
         raise RecordError("MH_RECORD_ID_MISMATCH", "record_id does not match record identity")

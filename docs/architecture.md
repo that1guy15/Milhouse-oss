@@ -40,6 +40,37 @@ ClickHouse failure never prevents unrelated durable collection. Deterministic re
 - Restricted input is discarded; only separately normalized safe audit metadata may survive.
 - Configuration construction crosses the bounded loader API; raw Pydantic models and their
   value-bearing validation internals are private implementation details.
+- Public identity and record Pydantic models replace every ordinary validation failure with one
+  fixed value-free error before the rejected object, nested location, or exception context can
+  escape. Their concrete-model validators enforce strict types, forbidden extras, instance
+  revalidation without structural coercion of foreign models, value-safe immutable
+  copy/assignment/deletion (including unknown underscore state), refusal of initialized
+  `self_instance` and repeated `__init__`, disabled pickle state export/restoration, JSON-only legacy
+  raw parsing, and no legacy file/ORM parsing. Caller-created composite raw-JSON adapters are outside
+  the ingestion boundary because their parser can fail before a model validator. Record drafts are
+  explicitly
+  post-allowlist/post-redaction inputs to finalization.
+- Free-text redaction recognizes marked local/file-URI path grammars without a fixed filesystem-root
+  allowlist, including repeated separator-bearing raw-space and shell-quoted continuations. The
+  same-line raw scanner uses punctuation, markup, and field labels as terminators and fails with a
+  value-free error when a separator first appears only after multiple ambiguous prose-shaped tokens
+  or separator-free text would remain after the last confirmed continuation separator. HTTP URL
+  paths stay under a separate bounded single-decode policy, which pseudonymizes complete components
+  for filesystem-root signatures, PII, or double-encoding ambiguity and preserves safe paths outside
+  those signatures. Same-length backtick runs adjacent to a new quote or opening markup tag also
+  fail value-free when wrapper ownership is ambiguous; matching outer quotes and closing HTML tags
+  are retained as valid boundaries.
+- Redaction policy `r2` applies a bounded two-layer decoder graph for canonical-equivalent
+  percent/JSON/HTML/base64/hex registered-secret forms, preserves valid decoded subruns beside
+  malformed UTF-8 or misaligned hex input, recognizes MIME whitespace after every outer codec,
+  validates generated pseudonyms again, and
+  uses compact whole-value markers for typed path or URL collisions. Standalone percent-encoded
+  local paths, exact filesystem-root segments at any URL path position, and unbracketed IPv6 share
+  the same policy. A precomputed outer-wrapper suffix index keeps adversarial marked-path parsing
+  near-linear at the 65 KiB input ceiling.
+- Timestamp validators detach accepted caller values into exact UTC datetimes. Untrusted timezone
+  callbacks cannot escape secret-bearing `BaseException` text through domain validation, clock
+  formatting, canonical JSON, or content-hash derivation.
 - Internal structured events accept catalog-owned machine event identities, allowlisted stable error
   codes, bounded code-owned numeric metadata, and keyed fingerprints derived inside the logger from
   a catalog-owned kind; they have no arbitrary-text or exception-detail field.

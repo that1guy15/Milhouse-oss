@@ -208,8 +208,9 @@ def _transform_leaf(
         _merge_counts(counts, result)
         return result.value
     if rule.kind == "path":
-        counts["path"] = counts.get("path", 0) + 1
-        return redactor.pseudonymize_path(value)
+        result = redactor.redact_path(value)
+        _merge_counts(counts, result)
+        return result.value
     result = redactor.redact_url(value, allowed_query_keys=rule.allowed_query_keys)
     _merge_counts(counts, result)
     return result.value

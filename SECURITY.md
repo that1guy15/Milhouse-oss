@@ -33,6 +33,16 @@ P0/P1 reports block release. Maintainers will acknowledge a valid private report
 
 - Redaction and trust classification precede every persistence and egress surface.
 - Restricted data is rejected; only safe metadata may survive.
+- Public domain validation and mutation failures retain only fixed error metadata, never rejected
+  input or nested exception details; frozen models reject declared, unknown, and underscore state,
+  repeated initialization, initialized validator targets, and pickle state APIs.
+- Marked local paths, complete file URIs, and decoded-sensitive URL path components are
+  keyed-pseudonymized before retained text crosses a persistence or output boundary.
+- Redaction policy revisions are identity-bearing. Policy `r2` enforces the registered-secret
+  invariant after generated pseudonyms, handles two-layer encoded forms without letting malformed
+  percent/hex neighbors or MIME whitespace hide a valid registered span, covers unbracketed IPv6, and
+  returns collision-safe whole-path/whole-URL markers when canonical output would otherwise leak or
+  become malformed.
 - Raw prompts, responses, transcripts, and tool output are never persisted in 1.0.
 - Acknowledged records are durably spooled before export.
 - ClickHouse and the ingestion receiver are loopback-only by default.

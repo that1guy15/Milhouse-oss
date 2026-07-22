@@ -445,6 +445,27 @@ def test_exclusive_rename_translates_unexpected_primitive_failure() -> None:
     assert "private-rename-detail" not in str(excinfo.value)
 
 
+def test_create_preserves_certain_publish_failure_and_sanitizes_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "runtime.bin"
+    token = "d" * 32
+    staged = tmp_path / f"{config_filesystem._STAGED_FILE_PREFIX}{token}"
+
+    def refuse_publish(*args: object, **kwargs: object) -> None:
+        raise SecureFileError(SecureFileErrorKind.ALREADY_EXISTS)
+
+    monkeypatch.setattr(config_filesystem.secrets, "token_hex", lambda _size: token)
+    monkeypatch.setattr(config_filesystem, "_rename_no_replace", refuse_publish)
+    with pytest.raises(SecureFileError) as excinfo:
+        create_regular_file_no_follow(path, b"sensitive-stage", mode=0o600)
+
+    assert excinfo.value.kind is SecureFileErrorKind.ALREADY_EXISTS
+    assert not path.exists()
+    assert staged.read_bytes() == b""
+
+
 def test_created_metadata_validation_fails_without_owner_checks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

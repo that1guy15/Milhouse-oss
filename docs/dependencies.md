@@ -35,7 +35,7 @@ more than a routine dependency update.
 | `httpx>=0.27,<1` | W05 bounded asynchronous HTTP and later provider clients. | Maintained async/sync client with BSD-3-Clause upstream license; Milhouse wraps it with its own timeout, TLS, redirect, retry, size, and SSRF policy. |
 | `mcp>=1.27,<2` | W10 local stdio MCP implementation and conformance. | Official Python SDK and MIT upstream license; `<2` is a locked compatibility contract because stable SDK v2 was not available when plan 1.0 was fixed. |
 | `platformdirs>=4,<5` | W02/W06 deterministic platform config and state roots. | Small cross-platform abstraction with MIT upstream license; avoids CWD- or private-path-dependent defaults. |
-| `pydantic>=2.8,<3` | W02 strict config/domain models and JSON Schema. | Maintained typed validation ecosystem with MIT upstream license; bounded to the v2 contract used by the plan. |
+| `pydantic>=2.12,<3` | W02 strict config/domain models and JSON Schema. | Maintained typed validation ecosystem with MIT upstream license; bounded to the reviewed v2 validator API used by the value-safe domain boundary. |
 | `python-dotenv>=1,<2` | W02 loading only explicitly selected environment files. | Small BSD-3-Clause upstream package; Milhouse disables implicit `.env` discovery and never serializes secret values. |
 
 Runtime ranges are deliberately compatible ranges, not exact pins. CI and contributor environments

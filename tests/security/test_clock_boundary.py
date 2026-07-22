@@ -28,15 +28,22 @@ class _HostileValue:
 
 
 class _HostileTimezone(tzinfo):
-    def __init__(self, private_value: str, *, successful_reads: int) -> None:
+    def __init__(
+        self,
+        private_value: str,
+        *,
+        successful_reads: int,
+        failure_type: type[BaseException] = RuntimeError,
+    ) -> None:
         self.private_value = private_value
         self.successful_reads = successful_reads
+        self.failure_type = failure_type
 
     def utcoffset(self, value: datetime | None) -> timedelta:
         if self.successful_reads:
             self.successful_reads -= 1
             return timedelta(0)
-        raise RuntimeError(self.private_value)
+        raise self.failure_type(self.private_value)
 
     def dst(self, value: datetime | None) -> timedelta:
         return timedelta(0)
@@ -187,6 +194,31 @@ def test_timestamp_normalization_never_leaks_timezone_failures(successful_reads:
     )
     hostile_timezone.private_value = ""
     private_value = ""
+
+    assert result == (True, "MH_TIME_TIMESTAMP", True, True, True)
+
+
+class _PrivateBaseFailure(BaseException):
+    pass
+
+
+@pytest.mark.security
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit, _PrivateBaseFailure])
+def test_timestamp_normalization_contains_secret_bearing_base_exceptions(
+    failure_type: type[BaseException],
+) -> None:
+    private_value = secrets.token_urlsafe(32)
+    hostile_timezone = _HostileTimezone(
+        private_value,
+        successful_reads=0,
+        failure_type=failure_type,
+    )
+    candidate = datetime(2026, 7, 21, tzinfo=hostile_timezone)
+
+    result = _time_rejection_is_value_free(
+        lambda: format_timestamp(candidate),
+        private_value=private_value,
+    )
 
     assert result == (True, "MH_TIME_TIMESTAMP", True, True, True)
 
