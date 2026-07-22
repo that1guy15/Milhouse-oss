@@ -4,8 +4,12 @@
 
 Immediate recovery is complete at protected-main commit
 `c0f9f2a8a1300eef18e651a20b6e2111d9cbd6a5`. This record does not amend the authoritative plan,
-classify the affected commit as DCO compliant, or weaken the DCO checker. Permanent historical
-disposition remains owner-pending.
+classify the affected commit as DCO compliant, or weaken the DCO checker. The permanent historical
+disposition is now recorded by owner-approved amendment A03 (2026-07-22, ratified by ADR 0017): the
+original squash remains permanently noncompliant, and the matching author's signed follow-up commit
+`c0f9f2a8a1300eef18e651a20b6e2111d9cbd6a5` supplies the narrow retroactive attestation for the
+identical contribution. This immediate-recovery evidence was closed at protected-main commit
+`ce0aaecbf05f14b566d45446f756aeda24bfe1f3` (#23).
 
 ## Exact affected contribution
 
@@ -76,8 +80,11 @@ rerun of the correctly failed PR #21 workflow occurred.
 ## Durable disposition boundary
 
 This remediation restores enforcement for subsequent protected-main ranges but cannot alter the
-historical commit. A permanent exact historical exception requires explicit owner approval through
-the plan's numbered change-control process. Such an amendment must bind only the affected squash
-SHA, parent, tree, signed source SHA, matching author identity, and protected recovery commit while
-leaving all future DCO enforcement unchanged. If the owner declines that exception, the retained
-PR #21 change must be reverted and re-landed through protected, correctly signed squash commits.
+historical commit. The owner approved that permanent exact historical exception on 2026-07-22 as
+amendment A03, ratified by ADR 0017, through the plan's numbered change-control process. The
+disposition binds only the affected squash `76511d5c63e4509765b3ad3ceabefba251e559c7`, parent
+`15eb96dc23fb25b7787f1f6d3c7563a9ccd525cf`, tree `9629b5116e6351cee94c5385a9a5a20ed93abf69`, signed
+source `74ca504c9483e6af983e829e2e831af6b00d9061`, matching author identity, and protected recovery
+commit `c0f9f2a8a1300eef18e651a20b6e2111d9cbd6a5`, and leaves all future DCO enforcement unchanged.
+The declined alternative would have reverted and re-landed the retained PR #21 change through
+protected, correctly signed squash commits.

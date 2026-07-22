@@ -2,6 +2,7 @@
 
 - Status: Accepted (ratification)
 - Date: 2026-07-18
+- Amended by: ADR 0016 (adds the `local_log` egress surface and the persisted structured-log contract, 2026-07-22)
 
 ## Context
 
@@ -28,5 +29,6 @@ No sink may weaken classification or redaction. Privacy and security tests plant
 ## Plan references
 
 - [Section 4.7: trust, privacy, identity, egress, retention, and purge](../implementation-plan.md#47-trust-privacy-and-prompt-injection-boundary)
+- [Section 4.15: structured log persistence (added by ADR 0016)](../implementation-plan.md#415-structured-log-persistence)
 - [Section 10.1: threat-model boundaries](../implementation-plan.md#101-threat-model-assets-and-boundaries)
 - [W02 and W03: privacy and retention implementation](../implementation-plan.md#w02--domain-configuration-identity-trust-and-privacy)

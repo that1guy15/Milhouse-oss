@@ -6,7 +6,10 @@ The implementation plan remains the normative build contract. If an ADR and the 
 
 ADRs 0001-0014 are plan-version 1.0 ratifications dated 2026-07-18. ADR 0015 is
 an owner-approved process adaptation dated 2026-07-19; it changes no public API,
-stored schema, privacy promise, or product scope.
+stored schema, privacy promise, or product scope. ADRs 0016 and 0017 record
+owner-approved amendments A02 and A03 dated 2026-07-22: ADR 0016 ratifies the
+persisted local structured-log contract and amends ADR 0007, and ADR 0017 records
+the bounded D01 historical DCO disposition.
 
 | ADR | Ratified decision |
 |---|---|
@@ -25,6 +28,8 @@ stored schema, privacy promise, or product scope.
 | [0013](0013-packaging-versioning-and-release.md) | Packaging, versioning, artifacts, and release train |
 | [0014](0014-support-governance-security-and-provenance.md) | Support, governance, security response, and provenance |
 | [0015](0015-agent-engineering-workflow.md) | Agent engineering loop, five focused skills, read-only review, sanitized learning, discovery, and authority boundaries |
+| [0016](0016-local-structured-log-persistence.md) | Persisted local structured-log wire, namespace, durability, rotation, recovery, concurrency, and `local_log` egress (amendment A02; amends ADR 0007) |
+| [0017](0017-d01-dco-historical-disposition.md) | Exact bounded D01 PR #21 historical DCO disposition (amendment A03) |
 
 ## Status vocabulary
 
