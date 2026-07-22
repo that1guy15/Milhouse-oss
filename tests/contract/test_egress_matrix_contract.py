@@ -57,6 +57,10 @@ _EXPECTED = {
         "public": EgressDisposition.METADATA,
         "internal": EgressDisposition.REDACTED_METADATA,
     },
+    EgressSurface.LOCAL_LOG: {
+        "public": EgressDisposition.METADATA,
+        "internal": EgressDisposition.REDACTED_METADATA,
+    },
 }
 
 
@@ -96,6 +100,7 @@ def test_public_api_uses_stable_string_values() -> None:
         "github_issues",
         "hosted_clickhouse",
         "diagnostics",
+        "local_log",
     }
     assert {disposition.value for disposition in EgressDisposition} == {
         "redacted_record",

@@ -65,3 +65,22 @@ def test_machine_shaped_strings_cannot_create_an_egress_capability() -> None:
             allowed_classifications=frozenset({"public", "sensitive"}),  # type: ignore[arg-type]
         )
     assert policy.value.code == "MH_EGRESS_POLICY"
+
+
+@pytest.mark.security
+def test_local_log_surface_cannot_be_externally_enabled() -> None:
+    with pytest.raises(PrivacyError) as enabled:
+        require_egress(
+            surface=EgressSurface.LOCAL_LOG,
+            privacy_class="public",
+            explicitly_enabled=True,
+        )
+    assert enabled.value.code == "MH_EGRESS_POLICY"
+
+    with pytest.raises(PrivacyError) as allowlisted:
+        require_egress(
+            surface=EgressSurface.LOCAL_LOG,
+            privacy_class="internal",
+            allowed_classifications=frozenset({"internal"}),
+        )
+    assert allowlisted.value.code == "MH_EGRESS_POLICY"
