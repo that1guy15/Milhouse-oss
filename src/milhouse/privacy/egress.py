@@ -24,6 +24,7 @@ class EgressSurface(StrEnum):
     GITHUB_ISSUES = "github_issues"
     HOSTED_CLICKHOUSE = "hosted_clickhouse"
     DIAGNOSTICS = "diagnostics"
+    LOCAL_LOG = "local_log"
 
 
 class EgressDisposition(StrEnum):
@@ -116,6 +117,12 @@ _MATRIX: Mapping[
             }
         ),
         EgressSurface.DIAGNOSTICS: MappingProxyType(
+            {
+                "public": EgressDisposition.METADATA,
+                "internal": EgressDisposition.REDACTED_METADATA,
+            }
+        ),
+        EgressSurface.LOCAL_LOG: MappingProxyType(
             {
                 "public": EgressDisposition.METADATA,
                 "internal": EgressDisposition.REDACTED_METADATA,
