@@ -67,6 +67,7 @@ test-coverage:
 		--critical 'src/milhouse/config/loader.py' \
 		--critical 'src/milhouse/config/_models.py' \
 		--critical 'src/milhouse/config/paths.py' \
+		--critical 'src/milhouse/config/plugins.py' \
 		--critical 'src/milhouse/config/secrets.py' \
 		--critical 'src/milhouse/resources/__init__.py' \
 		--critical 'src/milhouse/core/canonical.py' \

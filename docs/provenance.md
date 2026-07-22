@@ -117,6 +117,14 @@ The W02 domain-validation guard and marked-path/file-URI redaction remediation a
 implementations derived from the public privacy contract and wholly synthetic adversarial canaries.
 No private exception, record, path, fixture, parser, or redaction expression was inspected or reused.
 
+The W02 installed-plugin metadata validator is a clean-room implementation of the public plan and
+Python standard-library entry-point contract. It uses no private registry, plugin loader, package
+inventory, configuration, fixture, diagnostic, or donor expression. Validation reads only synthetic
+test metadata or the fixed metadata files of an explicitly configured path-backed local
+distribution, under pre-parse byte caps, and never imports plugin code. The PEP 440 parser dependency
+is used only to validate raw version syntax; acceptance still requires an exact raw installed-version
+match.
+
 ## Mandatory clean-room rewrites
 
 The following areas may use documented product behavior as requirements but may

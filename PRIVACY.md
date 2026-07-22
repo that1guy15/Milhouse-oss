@@ -121,6 +121,6 @@ Milhouse has no call-home telemetry, crash upload, usage analytics, or update be
 
 ## Operator responsibilities
 
-Operators control source credentials, file permissions, host/disk encryption, backup encryption/location, retention choices, provider permissions, external destinations, plugin installation, repository access, and legal/compliance requirements. Third-party plugins run as trusted local code with the Milhouse user's authority and are not sandboxed.
+Operators control source credentials, file permissions, host/disk encryption, backup encryption/location, retention choices, provider permissions, external destinations, plugin installation, repository access, and legal/compliance requirements. Third-party plugins run as trusted local code with the Milhouse user's authority and are not sandboxed. Milhouse validates only explicitly allowlisted, path-backed installed plugin metadata without importing code. It applies byte caps before parsing the fixed metadata files, fails closed for unsupported metadata backends, neither inventories unlisted plugin distributions nor treats a metadata match as a privacy or safety guarantee.
 
 See [the threat model](docs/threat-model.md), [Security](SECURITY.md), and plan section 4.7 for the exact egress/identity/purge contracts.

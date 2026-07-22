@@ -34,6 +34,7 @@ more than a routine dependency update.
 | `filelock>=3.15,<4` | W03 supported cross-process file locks where SQLite leases are insufficient. | Focused, widely used API with a permissive upstream license; the implementation still owns durability and reconciliation semantics. |
 | `httpx>=0.27,<1` | W05 bounded asynchronous HTTP and later provider clients. | Maintained async/sync client with BSD-3-Clause upstream license; Milhouse wraps it with its own timeout, TLS, redirect, retry, size, and SSRF policy. |
 | `mcp>=1.27,<2` | W10 local stdio MCP implementation and conformance. | Official Python SDK and MIT upstream license; `<2` is a locked compatibility contract because stable SDK v2 was not available when plan 1.0 was fixed. |
+| `packaging>=24,<27` | W02 installed-plugin PEP 440 version-syntax validation. | PyPA's focused Apache-2.0/BSD-2-Clause library avoids a home-grown version grammar; Milhouse preserves each raw version string and still requires exact configured-to-installed equality. |
 | `platformdirs>=4,<5` | W02/W06 deterministic platform config and state roots. | Small cross-platform abstraction with MIT upstream license; avoids CWD- or private-path-dependent defaults. |
 | `pydantic>=2.12,<3` | W02 strict config/domain models and JSON Schema. | Maintained typed validation ecosystem with MIT upstream license; bounded to the reviewed v2 validator API used by the value-safe domain boundary. |
 | `python-dotenv>=1,<2` | W02 loading only explicitly selected environment files. | Small BSD-3-Clause upstream package; Milhouse disables implicit `.env` discovery and never serializes secret values. |
@@ -71,7 +72,7 @@ Development tools never become required imports for a base Milhouse runtime.
 
 | Area | Direct tools | Reason retained |
 |---|---|---|
-| Build and artifact checks | `build`, `setuptools`, `wheel`, `check-wheel-contents`, `twine`, `packaging` | Standards-based wheel/sdist builds from the same locked backend used by `pyproject.toml`, strict metadata validation, explicit source/wheel/sdist inventories, byte-parity checks, and installed-artifact checks. |
+| Build and artifact checks | `build`, `setuptools`, `wheel`, `check-wheel-contents`, `twine` | Standards-based wheel/sdist builds from the same locked backend used by `pyproject.toml`, strict metadata validation, explicit source/wheel/sdist inventories, byte-parity checks, and installed-artifact checks. The runtime `packaging` dependency is also reused by artifact checks. |
 | Tests and coverage | `pytest`, `pytest-asyncio`, `pytest-cov`, `coverage`, `hypothesis`, `respx` | Offline test topology, async behavior, separate line/branch evidence, property invariants, and bounded HTTP simulation. |
 | Static quality | `ruff`, `mypy`, `types-pyyaml` | One formatter/linter, strict typing, and checked YAML-tool annotations with a small tool surface. |
 | Repository and docs validation | `pyyaml`, `validate-pyproject`, `mkdocs-material` | Strict structured-file/project metadata parsing and the later canonical W17 documentation build. |

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, Protocol, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from packaging.version import InvalidVersion, Version
 from pydantic import (
     AfterValidator,
     BaseModel,
@@ -21,6 +23,7 @@ from pydantic import (
 from pydantic_core import Url
 
 CONFIG_VERSION = 1
+MAX_PLUGIN_ALLOWLIST_ENTRIES = 128
 
 _ID_PATTERN = r"^[a-z][a-z0-9_-]{0,63}$"
 _ENV_VAR_PATTERN = r"^[A-Z][A-Z0-9_]{0,127}$"
@@ -29,8 +32,11 @@ _MACHINE_NAME_PATTERN = r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
 _LOCAL_TIME_PATTERN = r"^([01][0-9]|2[0-3]):[0-5][0-9]$"
 _REPOSITORY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
 _DISTRIBUTION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
-_PLUGIN_VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}$"
-_ENTRY_POINT_PATTERN = r"^[A-Za-z_][A-Za-z0-9_.]{0,127}:[A-Za-z_][A-Za-z0-9_.]{0,127}$"
+_PLUGIN_VERSION_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9.!+_-]{0,63}$"
+_ENTRY_POINT_PATTERN = (
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
+)
 _CLICKHOUSE_IDENTIFIER_PATTERN = _ID_PATTERN
 _ADMIN_API_PATH_PATTERN = r"^/[A-Za-z0-9/_-]{0,255}$"
 _TIMEZONE_PATTERN = r"^[A-Za-z0-9_+\-/]{1,64}$"
@@ -88,6 +94,44 @@ def _validate_future_utc_datetime(value: datetime) -> datetime:
     return value
 
 
+def _validate_plugin_distribution(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) > 128
+        or re.fullmatch(_DISTRIBUTION_PATTERN, value, flags=re.ASCII) is None
+    ):
+        raise ValueError("plugin distribution must be a bounded distribution name")
+    return value
+
+
+def _validate_plugin_version(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) > 64
+        or re.fullmatch(_PLUGIN_VERSION_PATTERN, value, flags=re.ASCII) is None
+    ):
+        raise ValueError("plugin version must be a bounded PEP 440 version")
+    try:
+        Version(value)
+    except InvalidVersion:
+        raise ValueError("plugin version must be a bounded PEP 440 version") from None
+    return value
+
+
+def _validate_plugin_entry_point(value: object) -> str:
+    if type(value) is not str or len(value) > 257:
+        raise ValueError("plugin entry point must be a bounded module:attribute reference")
+    module, separator, attribute = value.partition(":")
+    if (
+        separator != ":"
+        or len(module) > 128
+        or len(attribute) > 128
+        or re.fullmatch(_ENTRY_POINT_PATTERN, value, flags=re.ASCII) is None
+    ):
+        raise ValueError("plugin entry point must be a bounded module:attribute reference")
+    return value
+
+
 def _require_unique(values: Sequence[str], *, label: str) -> list[str]:
     seen: set[str] = set()
     for value in values:
@@ -103,9 +147,21 @@ DimensionKey = Annotated[str, StringConstraints(pattern=_DIMENSION_KEY_PATTERN)]
 MachineName = Annotated[str, StringConstraints(pattern=_MACHINE_NAME_PATTERN, max_length=128)]
 LocalTime = Annotated[str, StringConstraints(pattern=_LOCAL_TIME_PATTERN)]
 RepositorySlug = Annotated[str, StringConstraints(pattern=_REPOSITORY_PATTERN)]
-PluginDistribution = Annotated[str, StringConstraints(pattern=_DISTRIBUTION_PATTERN)]
-PluginVersion = Annotated[str, StringConstraints(pattern=_PLUGIN_VERSION_PATTERN)]
-PluginEntryPoint = Annotated[str, StringConstraints(pattern=_ENTRY_POINT_PATTERN)]
+PluginDistribution = Annotated[
+    str,
+    StringConstraints(pattern=_DISTRIBUTION_PATTERN, max_length=128),
+    AfterValidator(_validate_plugin_distribution),
+]
+PluginVersion = Annotated[
+    str,
+    StringConstraints(pattern=_PLUGIN_VERSION_PATTERN, max_length=64),
+    AfterValidator(_validate_plugin_version),
+]
+PluginEntryPoint = Annotated[
+    str,
+    StringConstraints(pattern=_ENTRY_POINT_PATTERN, max_length=257),
+    AfterValidator(_validate_plugin_entry_point),
+]
 ClickHouseIdentifier = Annotated[str, StringConstraints(pattern=_CLICKHOUSE_IDENTIFIER_PATTERN)]
 AdminApiPath = Annotated[str, StringConstraints(pattern=_ADMIN_API_PATH_PATTERN)]
 GithubApiVersion = Annotated[str, StringConstraints(pattern=_GITHUB_API_VERSION_PATTERN)]
@@ -234,7 +290,10 @@ class PluginAllowlistEntry(StrictModel):
 
 class PluginsConfig(StrictModel):
     allow_third_party: bool = False
-    allowed: list[PluginAllowlistEntry] = Field(default_factory=list)
+    allowed: list[PluginAllowlistEntry] = Field(
+        default_factory=list,
+        max_length=MAX_PLUGIN_ALLOWLIST_ENTRIES,
+    )
 
     @model_validator(mode="after")
     def _check_unique_allowlist(self) -> PluginsConfig:
@@ -953,6 +1012,7 @@ class MilhouseConfig(StrictModel):
 
 __all__ = [
     "CONFIG_VERSION",
+    "MAX_PLUGIN_ALLOWLIST_ENTRIES",
     "AbsolutePathStr",
     "AgentSummaryCollector",
     "AlertRuleConfig",

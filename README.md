@@ -7,7 +7,8 @@ teams and AI-assisted development workflows.
 > foundation has passed G01; W02 domain, configuration, identity, trust, and privacy implementation
 > is in progress. The repository now contains strict configuration/schema validation, deterministic
 > record identity and envelopes, privacy/redaction primitives, secure runtime path and explicit
-> secret-loading foundations, and secure pseudonym-key material primitives. Durable storage,
+> secret-loading foundations, secure pseudonym-key material primitives, and metadata-only exact
+> third-party plugin allowlist validation. Durable storage,
 > collection, querying, initialization, and the operational runtime are not implemented yet. Do not
 > use this build for production data.
 
@@ -52,7 +53,11 @@ collectors, storage, feedback, reports, MCP, and services become available in th
 packages. In particular, product initialization is W06 work; contributor setup does not create
 Milhouse configuration or runtime state. The current key-material module is a lower-level primitive:
 W06 still owns private-directory initialization and stale staging-artifact handling, while W16 owns
-backup, restore, identity-continuity, and rotation workflows.
+backup, restore, identity-continuity, and rotation workflows. When third-party plugins are enabled,
+`config validate` checks only explicitly allowlisted, path-backed installed-package metadata and
+does not import or execute the plugin. Its direct metadata-file reads are byte-bounded before
+parsing, and unsupported metadata backends fail closed. The runtime registry and plugin contract kit
+remain W05 work; that registry must revalidate and bind the exact object it will load.
 
 ## Contributor quickstart
 
