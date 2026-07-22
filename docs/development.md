@@ -70,6 +70,7 @@ for bounded direct dependency ranges or a maintenance/license/security assessmen
 | `./scripts/run_make.py type-check` | Run strict mypy over `src/milhouse` and repository Python tooling. |
 | `./scripts/run_make.py test` | Run the complete ordinary offline pytest topology. |
 | `./scripts/run_make.py test-coverage` | Run tests with branch data and enforce overall line and branch thresholds. |
+| `./scripts/run_make.py identity-portability` | Recompute immutable identity vectors in isolated processes for the required Ubuntu/macOS portability gate. |
 | `./scripts/run_make.py repo-check` | Validate setup syntax, project metadata, and checked-in TOML, JSON, YAML, and package-resource policy. |
 | `./scripts/run_make.py docs-check` | Validate local Markdown links/anchors and bounded external-link availability. |
 | `./scripts/run_make.py workflow-check` | Validate workflow structure and required-CI aggregation invariants. |

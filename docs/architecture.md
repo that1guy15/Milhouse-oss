@@ -50,6 +50,9 @@ ClickHouse failure never prevents unrelated durable collection. Deterministic re
   the ingestion boundary because their parser can fail before a model validator. Record drafts are
   explicitly
   post-allowlist/post-redaction inputs to finalization.
+- Immutable synthetic portability vectors bind canonical identity bytes, record IDs, dedupe keys,
+  content hashes, and finalized-record identity across independent interpreters. Required Ubuntu
+  Python 3.11-3.14 and fixed macOS 14 Python 3.11/3.14 jobs fail on any wire drift.
 - Free-text redaction recognizes marked local/file-URI path grammars without a fixed filesystem-root
   allowlist, including repeated separator-bearing raw-space and shell-quoted continuations. The
   same-line raw scanner uses punctuation, markup, and field labels as terminators and fails with a

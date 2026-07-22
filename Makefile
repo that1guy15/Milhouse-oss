@@ -21,6 +21,7 @@ $(error Milhouse gates refuse make dry-run, ignore-error, question, or touch mod
 endif
 
 _MILHOUSE_TARGETS := setup lock lock-check format format-check lint type-check test test-coverage \
+	identity-portability \
 	repo-check docs-check workflow-check skill-check quality build package-check \
 	artifact-smoke audit license-check private-identifier-check secret-scan \
 	secret-scan-self-test
@@ -56,6 +57,11 @@ type-check:
 
 test:
 	$(UV_RUN) python -m pytest
+
+identity-portability:
+	$(UV_RUN) python -m pytest \
+		tests/contract/test_identity_portability_contract.py \
+		tests/integration/test_identity_subprocess_integration.py
 
 test-coverage:
 	mkdir -p build

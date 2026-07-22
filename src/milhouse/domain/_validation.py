@@ -168,6 +168,20 @@ def _value_safe_schema(
     ) -> Any:
         def validate() -> Any:
             if info.mode == "json":
+                # A nested model default is created after JSON decoding, so its own wrapper still
+                # observes JSON mode even though the value is now an exact trusted model instance.
+                # Revalidate that detached instance through the strict Python path; attempting to
+                # JSON-encode it would reject a valid omitted field before the parent model exists.
+                if type(value) is source_type:
+                    candidate = _normalize_model_instance(value, source_type=source_type)
+                    return strict_validator.validate_python(
+                        candidate,
+                        strict=True,
+                        extra="forbid",
+                        from_attributes=False,
+                        context=info.context,
+                        allow_partial=False,
+                    )
                 encoded = json.dumps(
                     value,
                     allow_nan=False,

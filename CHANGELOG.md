@@ -80,3 +80,8 @@
   are then matched exactly. Validation never imports plugin code, never scans unlisted
   distributions, and returns fixed value-free configuration failures for missing, ambiguous,
   malformed, oversized, unsupported, or drifted metadata.
+- Add immutable synthetic identity portability vectors and independent-process recomputation across
+  mapping orders, hash seeds, timezones, and locales. Make the same contract aggregate-required on
+  fixed macOS 14 with Python 3.11 and 3.14 while the existing Ubuntu matrix covers Python 3.11-3.14.
+- Accept a raw JSON record draft that omits optional correlation data by strictly revalidating the
+  exact model default instead of attempting to JSON-encode that already-constructed nested model.

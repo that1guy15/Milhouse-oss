@@ -9,6 +9,8 @@ import yaml
 from scripts import validate_workflows as workflow_validation
 from scripts.validate_workflows import (
     DEPENDENCY_REVIEW_SETTINGS,
+    IDENTITY_PORTABILITY_PYTHON_EXPRESSION,
+    IDENTITY_PORTABILITY_UV_SETTINGS,
     MAKE_LAUNCHER,
     WorkflowError,
     main,
@@ -17,9 +19,12 @@ from scripts.validate_workflows import (
 
 PINNED_ACTION = "actions/checkout@" + "a" * 40
 PINNED_DEPENDENCY_REVIEW = "actions/dependency-review-action@" + "b" * 40
+PINNED_SETUP_PYTHON = "actions/setup-python@" + "c" * 40
+PINNED_SETUP_UV = "astral-sh/setup-uv@" + "d" * 40
 AGGREGATE_JOBS = (
     "quality",
     "test",
+    "identity-portability",
     "audit",
     "dependency-review",
     "dco",
@@ -28,6 +33,7 @@ RESULT_ENVIRONMENT = {
     "AUDIT_RESULT": "${{ needs.audit.result }}",
     "DCO_RESULT": "${{ needs.dco.result }}",
     "DEPENDENCY_REVIEW_RESULT": "${{ needs.dependency-review.result }}",
+    "IDENTITY_PORTABILITY_RESULT": "${{ needs.identity-portability.result }}",
     "QUALITY_RESULT": "${{ needs.quality.result }}",
     "TEST_RESULT": "${{ needs.test.result }}",
 }
@@ -37,6 +43,7 @@ def _aggregate_command() -> str:
     variables = {
         "quality": "QUALITY_RESULT",
         "test": "TEST_RESULT",
+        "identity-portability": "IDENTITY_PORTABILITY_RESULT",
         "audit": "AUDIT_RESULT",
         "dependency-review": "DEPENDENCY_REVIEW_RESULT",
         "dco": "DCO_RESULT",
@@ -66,6 +73,24 @@ def _baseline() -> dict[str, object]:
             "test": {
                 "runs-on": "ubuntu-24.04",
                 "steps": [{"run": "python -m pytest tests/security"}],
+            },
+            "identity-portability": {
+                "runs-on": "macos-14",
+                "strategy": {
+                    "fail-fast": False,
+                    "matrix": {"python": ["3.11", "3.14"]},
+                },
+                "steps": [
+                    {
+                        "uses": PINNED_SETUP_PYTHON,
+                        "with": {"python-version": IDENTITY_PORTABILITY_PYTHON_EXPRESSION},
+                    },
+                    {
+                        "uses": PINNED_SETUP_UV,
+                        "with": dict(IDENTITY_PORTABILITY_UV_SETTINGS),
+                    },
+                    {"run": f"{MAKE_LAUNCHER} identity-portability"},
+                ],
             },
             "audit": {
                 "runs-on": "ubuntu-24.04",
@@ -120,7 +145,7 @@ def _baseline() -> dict[str, object]:
                 ],
             },
             "required-ci": {
-                "needs": ["quality", "test", "audit", "dependency-review", "dco"],
+                "needs": list(AGGREGATE_JOBS),
                 "if": "${{ always() }}",
                 "permissions": {"contents": "read"},
                 "runs-on": "ubuntu-24.04",
@@ -147,16 +172,73 @@ def _mutate(case: str) -> dict[str, object]:
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
     quality = jobs["quality"]
+    identity_portability = jobs["identity-portability"]
     aggregate = jobs["required-ci"]
     assert isinstance(quality, dict)
+    assert isinstance(identity_portability, dict)
     assert isinstance(aggregate, dict)
     quality_steps = quality["steps"]
+    identity_portability_steps = identity_portability["steps"]
     aggregate_steps = aggregate["steps"]
     assert isinstance(quality_steps, list)
+    assert isinstance(identity_portability_steps, list)
     assert isinstance(aggregate_steps, list)
 
     if case == "missing aggregate dependency":
         aggregate["needs"] = ["quality"]
+    elif case == "missing identity portability job":
+        jobs.pop("identity-portability")
+        needs = aggregate["needs"]
+        assert isinstance(needs, list)
+        needs.remove("identity-portability")
+        evaluator = aggregate_steps[0]
+        assert isinstance(evaluator, dict)
+        environment = evaluator["env"]
+        run = evaluator["run"]
+        assert isinstance(environment, dict)
+        assert isinstance(run, str)
+        environment.pop("IDENTITY_PORTABILITY_RESULT")
+        evaluator["run"] = run.replace(
+            " --expected-job identity-portability "
+            '--result "identity-portability=${IDENTITY_PORTABILITY_RESULT}"',
+            "",
+        )
+    elif case == "identity portability runner weakened":
+        identity_portability["runs-on"] = "ubuntu-24.04"
+    elif case == "identity portability made dependent":
+        identity_portability["needs"] = "quality"
+    elif case == "identity portability matrix weakened":
+        strategy = identity_portability["strategy"]
+        assert isinstance(strategy, dict)
+        matrix = strategy["matrix"]
+        assert isinstance(matrix, dict)
+        matrix["python"] = ["3.14"]
+    elif case == "identity portability fail fast weakened":
+        strategy = identity_portability["strategy"]
+        assert isinstance(strategy, dict)
+        strategy["fail-fast"] = True
+    elif case == "identity portability Python setup weakened":
+        setup_python = identity_portability_steps[0]
+        assert isinstance(setup_python, dict)
+        setup_python["with"] = {"python-version": "3.11"}
+    elif case == "identity portability uv setup weakened":
+        setup_uv = identity_portability_steps[1]
+        assert isinstance(setup_uv, dict)
+        setup_uv["with"] = {"version": "latest"}
+    elif case == "identity portability command weakened":
+        command = identity_portability_steps[2]
+        assert isinstance(command, dict)
+        command["run"] = f"{MAKE_LAUNCHER} test"
+    elif case == "identity portability result binding removed":
+        evaluator = aggregate_steps[0]
+        assert isinstance(evaluator, dict)
+        run = evaluator["run"]
+        assert isinstance(run, str)
+        evaluator["run"] = run.replace(
+            " --expected-job identity-portability "
+            '--result "identity-portability=${IDENTITY_PORTABILITY_RESULT}"',
+            "",
+        )
     elif case == "skippable aggregate":
         aggregate["if"] = "${{ success() }}"
     elif case == "conditional evaluator":
@@ -524,6 +606,27 @@ def test_dependency_review_requires_hosted_and_exact_local_license_proof(
     ("case", "message"),
     [
         ("missing aggregate dependency", "dependency graph is incomplete"),
+        ("missing identity portability job", "requires the mandatory identity-portability job"),
+        ("identity portability runner weakened", "must use fixed runner macos-14"),
+        ("identity portability made dependent", "identity-portability must be unconditional"),
+        ("identity portability matrix weakened", "Python matrix must be exactly 3.11 and 3.14"),
+        ("identity portability fail fast weakened", "fail-fast must be literal false"),
+        (
+            "identity portability Python setup weakened",
+            "setup-python must use the matrix Python version",
+        ),
+        (
+            "identity portability uv setup weakened",
+            "setup-uv settings differ from the locked toolchain",
+        ),
+        (
+            "identity portability command weakened",
+            "requires exactly one exact.*run_make.py identity-portability step",
+        ),
+        (
+            "identity portability result binding removed",
+            "aggregate evaluator job list is incomplete",
+        ),
         ("skippable aggregate", "must use if: always"),
         ("conditional evaluator", "evaluator must be unconditional"),
         ("conditional mandatory step", "mandatory steps must be unconditional"),
