@@ -133,7 +133,7 @@ def test_json_schema_bytes_are_deterministic_across_calls() -> None:
     assert first == second
     assert first.endswith(b"\n")
     assert hashlib.sha256(first).hexdigest() == (
-        "6c48eb696a701229e3d0338ebf58f65e29f36b558bd298a050c8c3d6c103d304"
+        "e13c614fde8aac7b97c1b0e4dd29bcd86a78e1ae2b84b12c304cb7aa8307b933"
     )
 
 
@@ -142,6 +142,13 @@ def test_json_schema_declares_draft_2020_12() -> None:
 
     assert schema["$schema"] == JSON_SCHEMA_DIALECT
     assert JSON_SCHEMA_DIALECT == "https://json-schema.org/draft/2020-12/schema"
+
+
+def test_json_schema_bounds_plugin_allowlist_metadata_work() -> None:
+    schema = json.loads(generate_json_schema_bytes())
+
+    allowed = schema["$defs"]["PluginsConfig"]["properties"]["allowed"]
+    assert allowed["maxItems"] == 128
 
 
 def test_json_schema_is_sorted_and_parses_as_valid_json() -> None:

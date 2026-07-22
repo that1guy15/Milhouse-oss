@@ -81,6 +81,15 @@ ClickHouse failure never prevents unrelated durable collection. Deterministic re
 - Agent summaries/traces are structured, bounded, and disabled by default.
 - Hosted storage, receiver remote bind, notifications, GitHub writes, and MCP writes are independent opt-ins.
 - Third-party entry-point plugins are explicitly installed/allowlisted trusted code, not a sandbox.
+  Configuration validation performs no imports and inspects only each enabled allowlist entry's
+  path-backed installed distribution metadata. It directly reads `METADATA`/`PKG-INFO` and
+  `entry_points.txt` under respective 128 KiB and 64 KiB pre-parse caps, fails closed for unsupported
+  metadata backends, and reuses one bounded snapshot per configured distribution in a validation
+  pass. Both configured and installed raw version strings must be valid PEP 440, including epochs,
+  and must then match exactly. Installed entry-point values must contain nonempty dotted Python
+  identifier segments on both sides of `:` and must match the configured value exactly. Unlisted
+  distributions are not discovered. W05 must revalidate and bind the exact entry-point object it
+  will load so the checked metadata cannot authorize a different object.
 
 ## Processes and interfaces
 

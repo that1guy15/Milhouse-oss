@@ -25,6 +25,7 @@ from milhouse.config.filesystem import (
     inspect_regular_file_no_follow,
     open_regular_file_no_follow,
 )
+from milhouse.config.plugins import validate_configured_plugins
 
 CONFIG_PATH_ENV_VAR = "MILHOUSE_CONFIG"
 MAX_CONFIG_BYTES = 1_048_576
@@ -410,6 +411,7 @@ def _load_config_document(path: str | Path) -> tuple[MilhouseConfig, ConfigFileS
     data = _parse_toml(text)
     _check_config_version(data)
     config = _validate_model(data)
+    validate_configured_plugins(config.plugins)
     return config, _bind_selection(selection, config_digest=validated_config_digest(config))
 
 

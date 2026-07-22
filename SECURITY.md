@@ -47,7 +47,12 @@ P0/P1 reports block release. Maintainers will acknowledge a valid private report
 - Acknowledged records are durably spooled before export.
 - ClickHouse and the ingestion receiver are loopback-only by default.
 - MCP is local stdio, bounded, and read-only by default.
-- Third-party plugins are explicitly installed, allowlisted, trusted in-process code—not sandboxed.
+- Third-party plugins are explicitly installed, exactly metadata-allowlisted, trusted in-process
+  code—not sandboxed. Configuration validation directly reads only configured, path-backed
+  distribution metadata under pre-parse byte caps; it does not import plugin code or inspect
+  unlisted distributions, and unsupported metadata backends fail closed. A metadata match is not a
+  code-safety or provenance verdict. W05 must revalidate and bind the exact entry-point object it
+  will load.
 - External notifications and writes are disabled by default and require preview/confirmation policy.
 
 See [PRIVACY.md](PRIVACY.md), [the threat model](docs/threat-model.md), and [the implementation plan](docs/implementation-plan.md).

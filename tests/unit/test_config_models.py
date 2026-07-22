@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
-from milhouse.config._models import MilhouseConfig
+from milhouse.config._models import MAX_PLUGIN_ALLOWLIST_ENTRIES, MilhouseConfig
 
 
 def _base_config(**overrides: object) -> dict[str, object]:
@@ -593,6 +593,27 @@ def test_plugins_allowlist_requires_third_party_enablement() -> None:
     document = _with_section(_base_config(), "plugins", allowed=[entry])
 
     with pytest.raises(ValidationError, match="allow_third_party=true"):
+        MilhouseConfig.model_validate(document)
+
+
+def test_plugins_allowlist_has_a_bounded_metadata_work_budget() -> None:
+    entries = [
+        {
+            "distribution": f"example-plugin-{index}",
+            "version": "1.0.0",
+            "group": "milhouse.collectors",
+            "entry_point": f"example_plugin_{index}.module:Collector",
+        }
+        for index in range(MAX_PLUGIN_ALLOWLIST_ENTRIES + 1)
+    ]
+    document = _with_section(
+        _base_config(),
+        "plugins",
+        allow_third_party=True,
+        allowed=entries,
+    )
+
+    with pytest.raises(ValidationError, match="at most 128 items"):
         MilhouseConfig.model_validate(document)
 
 

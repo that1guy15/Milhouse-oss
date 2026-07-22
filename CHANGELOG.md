@@ -71,3 +71,12 @@
   `BaseException` failures from validation, clock, canonicalization, and content-hash boundaries to
   fixed value-free errors. Replace repeated outer-wrapper suffix scans with a bounded near-linear
   index for input-ceiling behavior.
+- Validate enabled third-party plugin allowlist entries against a bounded, metadata-only view of
+  installed path-backed distributions. Validation reads `METADATA`/`PKG-INFO` and
+  `entry_points.txt` directly, applies respective 128 KiB and 64 KiB pre-parse byte caps, fails
+  closed for unsupported metadata backends, and reuses one snapshot per configured distribution.
+  Acceptance requires one exact raw distribution name, valid PEP 440 version (including epochs),
+  entry-point group, and valid dotted `module:attribute` value; raw versions and entry-point values
+  are then matched exactly. Validation never imports plugin code, never scans unlisted
+  distributions, and returns fixed value-free configuration failures for missing, ambiguous,
+  malformed, oversized, unsupported, or drifted metadata.

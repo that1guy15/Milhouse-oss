@@ -12,6 +12,7 @@ CRITICAL_COVERAGE_FILES = {
     "src/milhouse/config/loader.py",
     "src/milhouse/config/_models.py",
     "src/milhouse/config/paths.py",
+    "src/milhouse/config/plugins.py",
     "src/milhouse/config/secrets.py",
     "src/milhouse/resources/__init__.py",
     "src/milhouse/core/canonical.py",
