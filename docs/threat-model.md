@@ -27,7 +27,7 @@
 | Raw prompts/responses/transcripts/tool output | Source user/provider | Restricted | Transient parser input only; never persisted or egressed | None |
 | SQLite control/index metadata | Installation operator | Internal/sensitive | Local state and encrypted backup policy | Bounded by referenced record/control lifecycle |
 | Reports and repo briefs | Target/repository owner | Public/internal | Local reports or configured `.milhouse/` | 90 days for reports; briefs atomically replaced |
-| Operational logs | Installation operator | Internal | Local rotated logs | 14 days |
+| Operational logs | Installation operator | Internal | Local rotated structured-log JSONL via the `local_log` egress surface (plan section 4.15) | 14 days |
 | Diagnostics | Installation operator | Internal/redacted metadata | Local previewed bundle only | Explicit operator deletion/policy |
 | Backups | Installation operator | Same as included telemetry | Restricted local/off-device storage; encryption required off device | Explicit manual policy disclosed in manifest |
 | Receiver nonces/idempotency | Installation operator | Internal metadata | SQLite | 10 minutes for nonces; operation policy for idempotency |

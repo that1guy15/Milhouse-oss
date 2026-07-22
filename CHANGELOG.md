@@ -87,3 +87,8 @@
   fixed macOS 14 with Python 3.11 and 3.14 while the existing Ubuntu matrix covers Python 3.11-3.14.
 - Accept a raw JSON record draft that omits optional correlation data by strictly revalidating the
   exact model default instead of attempting to JSON-encode that already-constructed nested model.
+- Ratify owner-approved amendment A02 (ADR 0016): the persisted local structured-log contract (plan
+  section 4.15), adding the `local_log` egress surface with installation-scoped operational metadata
+  only and no external egress, record, publication, or retention expansion.
+- Record owner-approved amendment A03 (ADR 0017): the exact bounded D01 PR #21 historical DCO
+  disposition, keeping the original squash permanently noncompliant and future enforcement unchanged.

@@ -30,6 +30,14 @@ scope, or release gate. Instruction authority is: this plan, accepted ADRs,
 host-specific pointers. Selecting a skill grants no source, Git, GitHub, provider, external-model,
 tag, publication, announcement, or messaging authority beyond the current status ledger.
 
+Plan amendment A02, approved by the owner on 2026-07-22 and ratified by ADR 0016, defines the
+persisted local structured-log contract in section 4.15 and adds the `local_log` egress surface to
+section 4.7. It authorizes installation-scoped local operational metadata only, adds no external
+egress, record, or publication authority, and expands no retention beyond the existing 14-day log
+class. Amendment A03, approved by the owner on 2026-07-22 and ratified by ADR 0017, records the exact
+bounded historical DCO disposition for the D01 PR #21 squash incident without weakening future
+enforcement.
+
 ## 2. Product contract
 
 ### 2.1 Product definition
@@ -745,6 +753,9 @@ Egress policy:
 | GitHub Issues | Yes | Explicit opt-in summary | No | Never |
 | Hosted ClickHouse | Yes | Explicit opt-in | Separate explicit allowlist | Never |
 | Diagnostics bundle | Metadata | Redacted metadata | No by default | Never |
+| Local operational log | Metadata | Redacted metadata | No | Never |
+
+The `Local operational log` surface persists only installation-scoped operational metadata; its wire, namespace, durability, rotation, recovery, and lifecycle are defined in section 4.15.
 
 Default retention:
 
@@ -950,6 +961,22 @@ Daily and weekly Markdown reports are generated from the common query service an
 Telegram is disabled by default, escapes Markdown safely, chunks within provider limits, retries with backoff, and records idempotent delivery without token-bearing URLs. GitHub issue creation is disabled by default, uses a least-privilege token, embeds a hidden Milhouse item marker for idempotency, and never decides verification state.
 
 `/doh` creates a neutral postmortem from explicitly approved evidence. Its input contract includes target, reason/original-intent summary when available, bounded time window, optional run/session/commit correlations, and whether configured project documents may be scanned. It may inspect configured project planning/status documents read-only and Milhouse records inside bounded windows. Raw local agent logs can be parsed transiently only when the operator explicitly supplies or enables an allowlisted source; raw content is not persisted or exported. An opt-in agent collector that detects an explicit `/doh` marker emits a durable request event; the scheduler runs the postmortem automatically when `auto_on_doh_marker` is enabled, while clearly reporting any missing original-intent evidence. The report labels quoted telemetry untrusted, assigns accountability across the complete system, creates corrective feedback items, and supplies verification criteria. It does not use personal-name or profanity heuristics.
+
+### 4.15 Structured log persistence
+
+Structured logs are installation-scoped local operational metadata. They are never a record, audit, replay, verification, acknowledgement, or feedback authority, and logging can never control or roll back record acknowledgement. The `local_log` egress surface (section 4.7) authorizes only `public → metadata` and `internal → redacted metadata`; `sensitive` and `restricted` are denied. No target IDs, paths, URLs, credentials, payloads, exception text, arbitrary messages, prompts, transcripts, responses, tool output, or provider content may enter the stored wire, stderr, or any exception or traceback. Safe counts or keyed fingerprints derived from rejected data are reclassified as internal metadata before this boundary. No external log egress or private-donor logging reuse is authorized.
+
+The stored wire is bounded `CanonicalJSONV1` UTF-8 JSONL with one LF per line and no BOM. `StructuredLogHeaderV1` carries version, line type, installation scope, a positive signed-64 sequence, canonical `opened_at`, and captured `retention_days`. `StructuredLogEventLineV1` carries version, line type, internal privacy class, canonical timestamp, a catalog-owned event name, level, sorted typed metrics, a normalized coded error, and an optional validated installation-keyed fingerprint; it has no arbitrary-text or exception-detail field. `StructuredLogTrailerV1` carries sequence, `closed_at`, `last_event_at`, `event_count`, `content_sha256`, and `expires_at`. `content_sha256` covers the exact header plus the ordered event-line bytes including their LFs and excludes the trailer. The existing in-memory `StructuredLogEventV1` remains constructor-controlled; the stored line is a separate exact projection.
+
+Files live under the securely resolved `[paths].logs` directory inside the runtime home: `structured-log.current.jsonl`, rotated `structured-log.<20-digit-sequence>.jsonl`, a `.structured-log.next.tmp` staging file, and a `structured-log.lock`. Rotated sequences use exactly twenty decimal digits; sequence reuse is forbidden until a confirmed full installation purge, and overflow fails closed. The directory is mode `0700` and files are mode `0600`; access requires the correct owner, a regular file, a single hard link, a safe ACL, no symlink, no directory replacement, and no unsafe foreign matching file, using descriptor-relative, no-follow, close-on-exec handles. Milhouse fails closed when a required platform protection is unavailable.
+
+A successful emit means one complete event line was appended, not that it is crash-durable; flush, clean shutdown, and rotation fsync the active descriptor. Log failures emit only fixed safe `MH_LOG_*` metadata and never recursively invoke the same sink. Rotation happens before an append when the resulting segment including its reserved trailer would exceed 8 MiB, the UTC day changes, the retention policy changes, or maintenance finds it due, following a fixed fsync, trailer, no-replace rename, directory-fsync, next-header, and publish order. Recovery covers every write, fsync, and rename crash boundary: a torn incomplete active tail is truncated to its last LF, while complete malformed lines, conflicting sequences, foreign inodes, unexpected trailers, and ambiguous current/rotated/temporary combinations fail closed. Closed rotations are immutable.
+
+The lock order is global barrier lease then `structured-log.lock` then descriptors; existing barrier authority is passed through rather than reacquired; recovery, retention, restore, and full purge take exclusive maintenance authority before the log lock; and the global barrier is never acquired while the log lock is held. Bounds are at most 4,096 bytes per event line including its LF, at most 1,024 bytes per header or trailer including its LF, at most 8 MiB per segment including its trailer, at most 10,000 enumerated rotations, and a five-second lock wait on injected monotonic time. There is no compression in v1.
+
+Default `[retention].logs_days` remains 14. Each segment captures its retention at rotation; a tightening may shorten an unexpired deadline, but a later relaxation never extends an already captured deadline. Retention deletes only validated closed segments after expiry with a descriptor-bound unlink and a parent fsync, and rotates an active segment before removing it. Backups exclude logs; restore never imports source-host logs and preserves destination-host logs; target purge leaves installation-scoped logs to ordinary expiry because the wire holds no target identity; and a confirmed full installation purge removes logs under exclusive maintenance authority. Pre-init commands do not create the log directory. `stderr` uses the exact event-line bytes with no file header, trailer, or sequence.
+
+Ownership follows the work packages: W02 owns the wire, encoder, `local_log` privacy authorization, golden vectors, and sink interface; W03 owns filesystem persistence, crash recovery, multiprocess and global-barrier integration, and retention preview/apply; W06 owns the CLI and stderr binding; and W16 owns backup, restore, and full-purge integration. No public stored-log format has shipped, so this contract is v1 with no migration and does not implicitly adopt preexisting matching files; a future wire change requires a new version and compatibility plan. This contract was added by plan amendment A02 and is ratified by ADR 0016.
 
 ## 5. CLI contract
 
@@ -1343,7 +1370,7 @@ Deliverables:
 - deterministic ID/content-hash implementation;
 - safe URL/path sanitization, field allowlists, layered redaction, HMAC pseudonyms, and untrusted renderer;
 - injected clock and bounded duration parser;
-- safe structured logging and stable error codes;
+- safe structured logging, including the section 4.15 persisted `local_log` wire, encoder, privacy authorization, golden vectors, and sink interface, and stable error codes;
 - validated public config examples and adversarial privacy corpus.
 
 Gate G02:
@@ -1351,6 +1378,7 @@ Gate G02:
 - every example validates and unknown keys fail clearly;
 - identical identity input yields identical IDs across processes/platforms;
 - secret values never appear in exceptions, logs, CLI, records, reports, or diagnostics;
+- the `local_log` wire (section 4.15, amendment A02) is byte-stable across supported platforms and never emits secrets, PII, paths, prompts, transcripts, or tool output to files, stderr, exceptions, or tracebacks;
 - property tests cover nested, encoded, Unicode, multiline, Markdown/HTML, URL, path, PII, and prompt-injection cases;
 - security-critical modules reach at least 95% branch coverage.
 
