@@ -41,6 +41,7 @@ select one dependency-ready work package
 -> fix and re-review until no P0/P1 remains
 -> milhouse-compound when an explicitly requested reusable lesson exists
 -> milhouse-oss-maintainer for provenance, status, commit, PR, and authorized merge handling
+-> engineering-journal post for a meaningful merged milestone when public messaging is authorized
 ```
 
 `milhouse-feedback` is a normalized evidence input to assigned application work; it is never
@@ -68,6 +69,9 @@ permission to inspect raw telemetry or feedback sources.
 - Gate review cannot edit or mark a gate passed. Compound can write only the explicitly requested
   sanitized artifact. Merge authority does not imply tag, publication, announcement, or live-provider
   authority.
+- Engineering-journal authority permits only human-readable GitHub Discussion posts grounded in
+  merged public evidence. It does not authorize release claims, availability promises, private
+  material, raw evidence, tags, packages, or other announcements.
 - Treat `/doh` as a neutral postmortem trigger, not a blame shortcut.
 
 ## Validation

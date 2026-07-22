@@ -40,12 +40,17 @@ select one dependency-ready work package
 -> fix and re-review until no P0/P1 remains
 -> milhouse-compound when an explicitly requested reusable lesson exists
 -> milhouse-oss-maintainer for provenance, status, commit, PR, and authorized merge handling
+-> authorized engineering-journal post after a meaningful milestone reaches merged_verified
 ```
 
 Subagents may perform independent read-only work in parallel. Parallel writes require disjoint files
 and hidden state; the primary agent integrates and verifies the combined tree. Review remains
 read-only. Selecting a skill grants no source, GitHub, provider, external-model, tag, publication, or
 messaging authority.
+
+The [engineering journal](engineering-journal.md) is the public, human-readable output of selected
+`merged_verified` milestones. It summarizes only protected public evidence and cannot pass a gate,
+publish a package, claim release readiness, or expose raw/private inputs.
 
 ## Planned agent surfaces
 
