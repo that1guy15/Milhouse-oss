@@ -16,7 +16,7 @@ status and evidence; it does not amend the plan.
 | Git state | Immediate [D01 recovery](gate-evidence/PR21-DCO.md) completed at protected, correctly signed `main` commit `c0f9f2a8a1300eef18e651a20b6e2111d9cbd6a5` with the exact reviewed PR #22 tree. Post-merge Required CI run `29903480661` passed on its failed-jobs-only second attempt after the first attempt's `gitleaks` job timed out during uv setup before scanning. The original PR #21 squash remains noncompliant, and its permanent exact historical disposition remains owner-pending |
 | Public source baseline | `that1guy15/Milhouse-oss@fb81a7faf2c101e8bb3f08ef9120d82c2b20600b` |
 | Private reference baseline | `that1guy15/milhouse@18ee9514ee11413812fde8fe361405b3686e025f` |
-| External mutation authority | Owner authorized build-branch pushes, pull requests, and merges to `main` after required checks on 2026-07-19. Tags, package publication, announcements, live-provider calls, and unrelated external mutation remain separately controlled |
+| External mutation authority | Owner authorized build-branch pushes, pull requests, and merges to `main` after required checks on 2026-07-19. On 2026-07-22 the owner separately authorized maintainer-authored engineering-journal posts in GitHub Discussions when they use only merged public evidence and clearly remain pre-release. Tags, package publication, release/availability announcements, live-provider calls, and unrelated external mutation remain separately controlled |
 | Highest passed gate | G01 |
 | Active package | W02 contract closure: owner decisions for the exact historical DCO disposition and persisted local structured-log contract |
 
@@ -203,6 +203,7 @@ exact request/evidence, and the named owner must authorize or perform it.
 | E07 | G18 | Project owner/elapsed monitor | Keep the approved environment available for the 7-day alpha, 14-day beta, and 7-day RC soaks; preserve continuity evidence and respond to monitor alerts | Pending |
 | E08 | G17/G18/release | Project/release owner | Build-branch push/PR/merge is authorized. Separately authorize protected release environment, signed tag/build, Trusted Publishing, GitHub Release, any visibility change, and announcement. Approval for one step does not imply the next | Branch push/PR/merge authorized 2026-07-19; release actions pending |
 | E09 | Release completion | Project owner/release monitor | Authorize public-registry installs, announcement only after verification, and at least 72 hours of post-publication monitoring | Pending |
+| E10 | Active implementation | Project owner and maintainers | Publish human-readable engineering-journal posts from meaningful `merged_verified` milestones using only public evidence, explicit implemented/planned boundaries, and the checked-in privacy template | Authorized 2026-07-22 for GitHub Discussions `Announcements`; this is not release, availability, package-publication, or live-provider authority |
 
 ## Defects, amendments, and stop conditions
 

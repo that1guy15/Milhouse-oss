@@ -86,6 +86,14 @@ Current repository validation:
 These commands validate the current source tree. W01 has passed, but that does not imply that the
 Milhouse runtime or any later work package is complete.
 
+## Watch the build
+
+The maintainer-authored
+[Milhouse engineering journal](https://github.com/that1guy15/Milhouse-oss/discussions/categories/announcements)
+explains meaningful merged architecture and feature milestones in plain language. Posts link the
+exact protected evidence and distinguish implemented behavior from planned work and release
+readiness. See the [journal workflow](docs/engineering-journal.md).
+
 ## Source and privacy boundary
 
 This is a fresh public implementation. The private operational repository is read-only donor material, not the codebase. Reuse is limited to the audited, generalized algorithms listed in [provenance](docs/provenance.md); private history, telemetry, configuration, paths, fixtures, reports, and agent content are prohibited.
@@ -99,6 +107,7 @@ Never attach credentials, real telemetry, raw agent content, private incident da
 - [Architecture](docs/architecture.md)
 - [Contributor setup](docs/setup.md)
 - [Development workflow](docs/development.md)
+- [Engineering journal](docs/engineering-journal.md)
 - [Dependency policy](docs/dependencies.md)
 - [Privacy](PRIVACY.md)
 - [Threat model](docs/threat-model.md)

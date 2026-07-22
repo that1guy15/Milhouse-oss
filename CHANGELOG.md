@@ -9,6 +9,8 @@
   sanitized compound learning, and explicit no-vendoring, privacy, egress, and mutation boundaries.
 - Add privacy, threat-model, governance, support, DCO, and implementation-status artifacts.
 - Remove stale duplicate workflow/publication instructions and harden issue/review privacy guidance.
+- Add an evidence-linked GitHub Discussions engineering journal, maintainer announcement form, and
+  inaugural pre-alpha architecture post while keeping release claims separately authorized.
 - Begin the W01 foundation with the `milhouse-observability` distribution, typed `milhouse` import
   package, modular pre-alpha Click entry point, and explicit package-resource manifest.
 - Separate bounded runtime, optional receiver, and development dependencies; add the uv 0.11.29
