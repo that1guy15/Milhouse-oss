@@ -4,7 +4,7 @@
 - Date: 2026-07-22
 - Authority: Owner-approved plan amendment A02 (2026-07-22) under plan section 1 change control
 - Amends: ADR 0007 (adds the `local_log` egress surface and the persisted structured-log contract)
-- Corrected: 2026-07-23 gate-scope alignment (defect D02), owner-approved under plan section 1 change control — the G02 revised-validation is re-scoped to W02-owned evidence, and the dependency-blocked filesystem, CLI/stderr, and backup/restore/purge evidence is mapped to G03, G06, and G16 per section 4.15
+- Corrected: 2026-07-23 gate-scope alignment (defect D02, plan amendment A04), owner-approved under plan section 1 change control — the G02 revised-validation is re-scoped to W02-owned evidence, and the dependency-blocked structured-log file, CLI/stderr/diagnostics, generated-report, and backup/restore/purge evidence is mapped to G03, G06, G09, and G16 per section 4.15
 
 ## Context
 
@@ -111,9 +111,11 @@ The dependency-blocked downstream evidence is validated at its owning gate, cons
 integration, size/day/policy rotation, every write/fsync/rename crash boundary, torn-tail recovery and
 corruption refusal, disk-full/short-write/lock-timeout/capacity/sequence-overflow failures,
 acknowledgement isolation, and retention behavior are owned by W03 and validated at G03; the real
-CLI/stderr binding is owned by W06 and validated at G06; and backup exclusion, restore preservation,
-and full-purge behavior are owned by W16 and validated at G16. Requiring that downstream evidence for
-G02 would be a gate cycle, because W03 depends on G02.
+CLI/stderr binding and diagnostics bundle are owned by W06 and validated at G06; the concrete
+generated-report surface is owned by W09 and validated at G09; and backup exclusion, restore
+preservation, target purge (which leaves installation-scoped logs to ordinary expiry), and full-purge
+behavior are owned by W16 and validated at G16. Requiring that downstream evidence for G02 would be a
+gate cycle, because W03 depends on G02.
 
 ## Plan references
 

@@ -38,6 +38,14 @@ class. Amendment A03, approved by the owner on 2026-07-22 and ratified by ADR 00
 bounded historical DCO disposition for the D01 PR #21 squash incident without weakening future
 enforcement.
 
+Plan amendment A04, approved by the owner on 2026-07-23, resolves defect D02 by re-scoping the W02 gate
+G02 assertions to certify the W02 redaction, rendering, structured-error, structured-event, and
+`local_log` wire and stream-sink primitives, and by deferring the concrete generated-report surface to
+G09, the concrete structured-log file surface to G03, and the concrete CLI, stderr, and diagnostics
+surfaces to G06, consistent with the section 4.15 ownership split. It preserves the privacy invariant
+unchanged, changes no product scope, retention rule, or later-gate content, and removes the G02/W03
+gate cycle. ADR 0016 and the G02 evidence packet are aligned to this scope.
+
 ## 2. Product contract
 
 ### 2.1 Product definition
@@ -1377,8 +1385,8 @@ Gate G02:
 
 - every example validates and unknown keys fail clearly;
 - identical identity input yields identical IDs across processes/platforms;
-- secret values never appear in exceptions, logs, CLI, records, reports, or diagnostics;
-- the `local_log` wire (section 4.15, amendment A02) is byte-stable across supported platforms and never emits secrets, PII, paths, prompts, transcripts, or tool output to files, stderr, exceptions, or tracebacks;
+- secret values never appear in the W02 redaction, rendering, structured-error, and structured-event primitives, in canonical records, in the W02 config-command output, or in exceptions and tracebacks; the concrete generated-report surface is validated at G09;
+- the `local_log` wire (section 4.15, amendment A02) is byte-stable across supported platforms and never carries secrets, PII, paths, prompts, transcripts, or tool output in the projected event bytes, the injected stream-sink output, exceptions, or tracebacks; the concrete structured-log file surface is validated at G03, and the concrete CLI/stderr binding and diagnostics bundle at G06;
 - property tests cover nested, encoded, Unicode, multiline, Markdown/HTML, URL, path, PII, and prompt-injection cases;
 - security-critical modules reach at least 95% branch coverage.
 
