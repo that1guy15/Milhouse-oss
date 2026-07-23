@@ -9,5 +9,6 @@ A record may describe an in-progress candidate. Only an explicit conclusion tied
 commit and every required result marks a gate passed.
 
 - [G01 package and quality-toolchain foundation](G01.md) — passed 2026-07-19
+- [G02 domain, configuration, identity, trust, and privacy](G02.md) — candidate; owner acceptance pending 2026-07-23
 - [PR #21 squash DCO incident and remediation](PR21-DCO.md) — immediate recovery complete;
-  historical disposition pending 2026-07-22
+  historical disposition recorded by amendment A03 (2026-07-22)
