@@ -42,9 +42,19 @@ Plan amendment A04, approved by the owner on 2026-07-23, resolves defect D02 by 
 G02 assertions to certify the W02 redaction, rendering, structured-error, structured-event, and
 `local_log` wire and stream-sink primitives, and by deferring the concrete generated-report surface to
 G09, the concrete structured-log file surface to G03, and the concrete CLI, stderr, and diagnostics
-surfaces to G06, consistent with the section 4.15 ownership split. It preserves the privacy invariant
-unchanged, changes no product scope, retention rule, or later-gate content, and removes the G02/W03
-gate cycle. ADR 0016 and the G02 evidence packet are aligned to this scope.
+surfaces to G06, consistent with the work-package ownership split. Reason: the plan and ADR previously
+required G02 to certify concrete surfaces owned by dependency-blocked later packages — an unsatisfiable
+G02/W03 gate cycle surfaced by the PR #31 and #32 owner reviews. Alternatives considered: keeping G02's
+requirement of the downstream file, CLI/stderr/diagnostics, and report surfaces (rejected because W03,
+W06, and W09 each depend on G02, so their evidence cannot exist when G02 is judged), and leaving the
+plan, ADR, and evidence packet mismatched (rejected because a locked release gate must read consistently
+across the three). Compatibility and migration: documentation-only, with no source, stored-format,
+shipped-artifact, product-scope, retention, or later-gate change, and therefore no migration. Security:
+the privacy invariant is unchanged, and the same W02-owned secret, PII, path, prompt, transcript, and
+tool-output canary absence is still required. Revised tests: the re-scoped W02-owned G02 assertion set
+plus the strengthened `tests/unit/test_gate_scope.py`, which reconstructs the package dependency graph
+and proves each deferred gate transitively depends on G02 so the re-scope cannot silently regress. It
+removes the G02/W03 gate cycle, and ADR 0016 and the G02 evidence packet are aligned to this scope.
 
 Plan amendment A05, approved by the owner on 2026-07-23 and ratified by an ADR 0016 addendum,
 promotes the section 4.15 stored-log wire from a prose field summary to an exact, machine-checked v1

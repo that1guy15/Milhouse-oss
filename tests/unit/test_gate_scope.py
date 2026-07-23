@@ -1,11 +1,11 @@
 """Gate-to-dependency consistency: G02 must not own a surface a dependency-blocked package owns.
 
-Per plan section 4.15, the concrete structured-log file, CLI/stderr/diagnostics, and
-generated-report surfaces are owned by later work packages (W03, W06, W09) whose gates
-transitively depend on G02. A G02 assertion that required one of those concrete surfaces would be a
-gate cycle. Rather than only matching a phrase, these tests reconstruct the package dependency graph
-from the status ledger and prove each deferred gate transitively depends on G02, so the
-owner-approved amendment A04 re-scope cannot silently regress even if the wording is reworded.
+Per amendment A04 and the work-package ownership split, the concrete structured-log file,
+CLI/stderr/diagnostics, and generated-report surfaces are owned by later work packages (W03, W06,
+W09) whose gates transitively depend on G02. A G02 assertion that required one of those concrete
+surfaces would be a gate cycle. Rather than only matching a phrase, these tests rebuild the
+dependency graph from the status ledger and prove each deferred gate transitively depends on G02, so
+the owner-approved amendment A04 re-scope cannot silently regress even if the wording is reworded.
 """
 
 from __future__ import annotations

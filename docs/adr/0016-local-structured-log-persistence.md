@@ -4,7 +4,7 @@
 - Date: 2026-07-22
 - Authority: Owner-approved plan amendments A02 (2026-07-22) and A05 (2026-07-23) under plan section 1 change control
 - Amends: ADR 0007 (adds the `local_log` egress surface and the persisted structured-log contract)
-- Corrected: 2026-07-23 gate-scope alignment (defect D02, plan amendment A04), owner-approved under plan section 1 change control — the G02 revised-validation is re-scoped to W02-owned evidence, and the dependency-blocked structured-log file, CLI/stderr/diagnostics, generated-report, and backup/restore/purge evidence is mapped to G03, G06, G09, and G16 per section 4.15
+- Corrected: 2026-07-23 gate-scope alignment (defect D02, plan amendment A04), owner-approved under plan section 1 change control — the G02 revised-validation is re-scoped to W02-owned evidence, and the dependency-blocked structured-log file, CLI/stderr/diagnostics, generated-report, and backup/restore/purge evidence is mapped to G03, G06, G09, and G16 per amendment A04 and the work-package ownership split
 
 ## Context
 
