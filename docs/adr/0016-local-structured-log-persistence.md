@@ -4,6 +4,7 @@
 - Date: 2026-07-22
 - Authority: Owner-approved plan amendment A02 (2026-07-22) under plan section 1 change control
 - Amends: ADR 0007 (adds the `local_log` egress surface and the persisted structured-log contract)
+- Corrected: 2026-07-23 gate-scope alignment (defect D02), owner-approved under plan section 1 change control — the G02 revised-validation is re-scoped to W02-owned evidence, and the dependency-blocked filesystem, CLI/stderr, and backup/restore/purge evidence is mapped to G03, G06, and G16 per section 4.15
 
 ## Context
 
@@ -96,15 +97,23 @@ authorized, and the stored-log wire is a clean-room rewrite from the public plan
 
 ## Revised validation
 
-Gate G02 additionally requires golden `local_log` wire bytes across Python 3.11-3.14, hash seeds,
-locales, timezones, Ubuntu, and macOS; secret, PII, path, prompt, transcript, and tool-output canary
-absence from files, stderr, exceptions, and tracebacks; owner, mode, ACL, symlink, hard-link, and
-directory-swap negatives; multiprocess non-interleaving with exact event counts; size, day, and policy
-rotation; every write, fsync, and rename crash boundary; torn-tail recovery and complete-corruption
-refusal; disk-full, short-write, lock-timeout, capacity, and sequence-overflow failures; proof that a
-logging failure cannot change record acknowledgement; retention boundary, tightening-without-extension,
-backup exclusion, restore preservation, target purge, and full-purge behavior; and at least 95% branch
-coverage for the critical logging and filesystem modules.
+Gate G02 requires only the W02-owned evidence for this contract: golden `local_log` wire bytes across
+Python 3.11-3.14, hash seeds, locales, timezones, Ubuntu, and macOS; secret, PII, path, prompt,
+transcript, and tool-output canary absence from the projected wire bytes, the stream-sink output,
+exceptions, and tracebacks; the fail-closed `local_log` egress authorization; the constructor-controlled
+event projection with no arbitrary-text or exception-detail field; stream-sink hostile-failure
+normalization and complete-write enforcement; the contained child-process disclosure oracle; and at
+least 95% branch coverage for the W02 security-critical modules, including `core/log_wire.py`.
+
+The dependency-blocked downstream evidence is validated at its owning gate, consistent with the section
+4.15 ownership split, and G02 neither requires nor certifies it: filesystem persistence and security
+(owner, mode, ACL, symlink, hard-link, and directory-swap negatives), multiprocess and global-barrier
+integration, size/day/policy rotation, every write/fsync/rename crash boundary, torn-tail recovery and
+corruption refusal, disk-full/short-write/lock-timeout/capacity/sequence-overflow failures,
+acknowledgement isolation, and retention behavior are owned by W03 and validated at G03; the real
+CLI/stderr binding is owned by W06 and validated at G06; and backup exclusion, restore preservation,
+and full-purge behavior are owned by W16 and validated at G16. Requiring that downstream evidence for
+G02 would be a gate cycle, because W03 depends on G02.
 
 ## Plan references
 
