@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Protocol
 
 from milhouse.core.canonical import MAX_CANONICAL_INT, canonical_json_bytes
+from milhouse.core.clock import truncate_to_milliseconds
 from milhouse.core.logging import LoggingError, StructuredLogEventV1
 from milhouse.domain.records import PrivacyClassV1
 from milhouse.privacy.egress import EgressDisposition, EgressSurface, require_egress
@@ -31,7 +32,8 @@ STRUCTURED_LOG_PRIVACY_CLASS: PrivacyClassV1 = "internal"
 MAX_EVENT_LINE_BYTES = 4_096
 MAX_HEADER_LINE_BYTES = 1_024
 MAX_TRAILER_LINE_BYTES = 1_024
-MAX_LOG_RETENTION_DAYS = 36_500
+# Must equal the config `[retention].logs_days` upper bound (see tests/unit/test_log_framing.py).
+MAX_LOG_RETENTION_DAYS = 3_650
 
 _LINE_FEED = b"\n"
 _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
@@ -93,9 +95,23 @@ def _validate_sequence(value: object) -> None:
         raise LoggingError("MH_LOG_SEQUENCE", "a positive signed-64 sequence is required")
 
 
-def _validate_aware(value: object, code: str) -> None:
-    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+def _normalized_utc(value: object, code: str) -> datetime:
+    """Normalize an aware timestamp to a safe UTC value, failing closed on hostile ``tzinfo``.
+
+    A hostile ``tzinfo`` whose ``utcoffset`` raises never reaches an exception or traceback: it is
+    caught here and a fixed ``LoggingError`` is raised outside the handler with no cause or context.
+    """
+
+    normalized: datetime | None = None
+    if type(value) is datetime:
+        try:
+            if value.tzinfo is not None and value.utcoffset() is not None:
+                normalized = truncate_to_milliseconds(value)
+        except Exception:
+            normalized = None
+    if type(normalized) is not datetime:
         raise LoggingError(code, "an aware UTC timestamp is required")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +124,7 @@ class StructuredLogHeaderV1:
 
     def __post_init__(self) -> None:
         _validate_sequence(self.sequence)
-        _validate_aware(self.opened_at, "MH_LOG_HEADER_TIME")
+        object.__setattr__(self, "opened_at", _normalized_utc(self.opened_at, "MH_LOG_HEADER_TIME"))
         if (
             type(self.retention_days) is not int
             or not 1 <= self.retention_days <= MAX_LOG_RETENTION_DAYS
@@ -131,8 +147,12 @@ class StructuredLogTrailerV1:
 
     def __post_init__(self) -> None:
         _validate_sequence(self.sequence)
-        _validate_aware(self.closed_at, "MH_LOG_TRAILER_TIME")
-        _validate_aware(self.expires_at, "MH_LOG_TRAILER_TIME")
+        object.__setattr__(
+            self, "closed_at", _normalized_utc(self.closed_at, "MH_LOG_TRAILER_TIME")
+        )
+        object.__setattr__(
+            self, "expires_at", _normalized_utc(self.expires_at, "MH_LOG_TRAILER_TIME")
+        )
         if type(self.event_count) is not int or not 0 <= self.event_count <= MAX_CANONICAL_INT:
             raise LoggingError("MH_LOG_TRAILER_COUNT", "a bounded event count is required")
         if (
@@ -148,7 +168,11 @@ class StructuredLogTrailerV1:
                     "MH_LOG_TRAILER_EVENT_TIME", "an empty segment has no last-event time"
                 )
         else:
-            _validate_aware(self.last_event_at, "MH_LOG_TRAILER_EVENT_TIME")
+            object.__setattr__(
+                self,
+                "last_event_at",
+                _normalized_utc(self.last_event_at, "MH_LOG_TRAILER_EVENT_TIME"),
+            )
 
 
 def structured_log_header_line(header: StructuredLogHeaderV1) -> bytes:
@@ -202,10 +226,19 @@ def structured_log_content_sha256(header_line: bytes, event_lines: Iterable[byte
         raise LoggingError("MH_LOG_DIGEST", "the header line must be bytes")
     digest = hashlib.sha256()
     digest.update(header_line)
-    for line in event_lines:
-        if type(line) is not bytes:
-            raise LoggingError("MH_LOG_DIGEST", "each event line must be bytes")
-        digest.update(line)
+    # Consume the caller-supplied iterable under a normalization boundary so a hostile
+    # __iter__/__next__ cannot leak raw exception text into an exception or traceback.
+    failed = False
+    try:
+        for line in event_lines:
+            if type(line) is not bytes:
+                failed = True
+                break
+            digest.update(line)
+    except Exception:
+        failed = True
+    if failed:
+        raise LoggingError("MH_LOG_DIGEST", "the event lines are invalid")
     return digest.hexdigest()
 
 

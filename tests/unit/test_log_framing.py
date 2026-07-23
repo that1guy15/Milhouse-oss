@@ -3,12 +3,15 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from datetime import UTC, datetime
+import traceback
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 import pytest
 
+from milhouse.config._models import _DAYS_MAX
 from milhouse.core.log_wire import (
     MAX_HEADER_LINE_BYTES,
+    MAX_LOG_RETENTION_DAYS,
     MAX_TRAILER_LINE_BYTES,
     StructuredLogHeaderV1,
     StructuredLogTrailerV1,
@@ -17,6 +20,52 @@ from milhouse.core.log_wire import (
     structured_log_trailer_line,
 )
 from milhouse.core.logging import LoggingError
+
+_SECRET_CANARY = "SYNTHETIC_SECRET_CANARY"
+
+
+class _HostileTz(tzinfo):
+    """A ``tzinfo`` whose offset accessors raise, simulating adversarial timestamp input."""
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        raise ValueError(_SECRET_CANARY)
+
+    def tzname(self, dt: datetime | None) -> str:
+        raise ValueError(_SECRET_CANARY)
+
+    def dst(self, dt: datetime | None) -> timedelta:
+        raise ValueError(_SECRET_CANARY)
+
+
+def _hostile_timestamp() -> datetime:
+    return datetime(2026, 7, 21, 12, 0, 0, tzinfo=_HostileTz())
+
+
+def _leak_surfaces(error: BaseException) -> str:
+    """Concatenate every surface a caught error could leak source detail through.
+
+    The exception graph is walked recursively along ``__cause__`` and ``__context__`` so a canary
+    hidden anywhere in the chain (including notes and rendered tracebacks) is detected.
+    """
+
+    seen: set[int] = set()
+    parts: list[str] = []
+
+    def visit(exc: BaseException | None) -> None:
+        if exc is None or id(exc) in seen:
+            return
+        seen.add(id(exc))
+        parts.append(str(exc))
+        parts.append(repr(exc))
+        parts.append(repr(exc.args))
+        parts.extend(str(note) for note in getattr(exc, "__notes__", ()) or ())
+        parts.append("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        visit(exc.__cause__)
+        visit(exc.__context__)
+
+    visit(error)
+    return " || ".join(parts)
+
 
 _OPENED = datetime(2026, 7, 21, 12, 0, 0, tzinfo=UTC)
 _CLOSED = datetime(2026, 7, 21, 12, 5, 0, tzinfo=UTC)
@@ -168,3 +217,98 @@ def test_header_and_trailer_projections_reject_foreign_values() -> None:
 def test_header_and_trailer_lines_stay_within_the_byte_bound() -> None:
     assert len(structured_log_header_line(_header())) <= MAX_HEADER_LINE_BYTES
     assert len(structured_log_trailer_line(_trailer())) <= MAX_TRAILER_LINE_BYTES
+
+
+def test_retention_bound_equals_the_config_retention_ceiling() -> None:
+    # The wire retention bound and the config `[retention].logs_days` ceiling are one shared value;
+    # this test fails loudly if either drifts.
+    assert MAX_LOG_RETENTION_DAYS == _DAYS_MAX
+
+
+def test_header_accepts_retention_at_the_upper_bound() -> None:
+    header = StructuredLogHeaderV1(
+        sequence=1, opened_at=_OPENED, retention_days=MAX_LOG_RETENTION_DAYS
+    )
+    assert header.retention_days == MAX_LOG_RETENTION_DAYS
+    assert (
+        json.loads(structured_log_header_line(header))["retention_days"] == MAX_LOG_RETENTION_DAYS
+    )
+
+
+def test_header_rejects_retention_above_the_upper_bound() -> None:
+    with pytest.raises(LoggingError) as captured:
+        StructuredLogHeaderV1(
+            sequence=1, opened_at=_OPENED, retention_days=MAX_LOG_RETENTION_DAYS + 1
+        )
+    assert captured.value.code == "MH_LOG_HEADER_RETENTION"
+
+
+def test_aware_non_utc_timestamps_are_normalized_to_utc() -> None:
+    # 07:00 at UTC-5 is 12:00Z; the wire must store and project the normalized UTC instant.
+    eastern = datetime(2026, 7, 21, 7, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+    header = StructuredLogHeaderV1(sequence=1, opened_at=eastern, retention_days=14)
+    assert header.opened_at.tzinfo is UTC
+    assert json.loads(structured_log_header_line(header))["opened_at"] == "2026-07-21T12:00:00.000Z"
+
+
+@pytest.mark.parametrize(
+    ("field", "code"),
+    [
+        ("opened_at", "MH_LOG_HEADER_TIME"),
+    ],
+)
+def test_header_hostile_timestamp_fails_closed_without_leaking(field: str, code: str) -> None:
+    fields: dict[str, object] = {"sequence": 1, "opened_at": _OPENED, "retention_days": 14}
+    fields[field] = _hostile_timestamp()
+    with pytest.raises(LoggingError) as captured:
+        StructuredLogHeaderV1(**fields)  # type: ignore[arg-type]
+    assert captured.value.code == code
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert _SECRET_CANARY not in _leak_surfaces(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "code"),
+    [
+        ("closed_at", "MH_LOG_TRAILER_TIME"),
+        ("expires_at", "MH_LOG_TRAILER_TIME"),
+        ("last_event_at", "MH_LOG_TRAILER_EVENT_TIME"),
+    ],
+)
+def test_trailer_hostile_timestamp_fails_closed_without_leaking(field: str, code: str) -> None:
+    with pytest.raises(LoggingError) as captured:
+        _trailer(**{field: _hostile_timestamp()})
+    assert captured.value.code == code
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert _SECRET_CANARY not in _leak_surfaces(captured.value)
+
+
+def test_digest_hostile_iterable_fails_closed_without_leaking() -> None:
+    class _HostileIter:
+        def __iter__(self) -> object:
+            raise RuntimeError(_SECRET_CANARY)
+
+    class _HostileNext:
+        def __iter__(self) -> object:
+            return self
+
+        def __next__(self) -> bytes:
+            raise RuntimeError(_SECRET_CANARY)
+
+    for event_lines in (_HostileIter(), _HostileNext()):
+        with pytest.raises(LoggingError) as captured:
+            structured_log_content_sha256(b"header\n", event_lines)  # type: ignore[arg-type]
+        assert captured.value.code == "MH_LOG_DIGEST"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+        assert _SECRET_CANARY not in _leak_surfaces(captured.value)
+
+
+def test_digest_rejects_non_bytes_event_line_without_partial_leak() -> None:
+    with pytest.raises(LoggingError) as captured:
+        structured_log_content_sha256(b"header\n", [b"ok\n", "not-bytes"])  # type: ignore[list-item]
+    assert captured.value.code == "MH_LOG_DIGEST"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
