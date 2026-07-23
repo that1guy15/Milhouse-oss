@@ -1,28 +1,42 @@
-"""CanonicalJSONV1 stored projection of catalog-owned structured log events.
+"""CanonicalJSONV1 stored projections for the W02 structured-log wire.
 
-This is the W02-owned event-line wire: it maps a constructor-controlled
-``StructuredLogEventV1`` to bounded CanonicalJSONV1 UTF-8 JSONL bytes with one trailing
-line feed, plus the injected-stream ``StreamLogSink`` that emits those exact bytes. It performs no
-file I/O, rotation, or persistence (that is W03) and carries no arbitrary-text or exception-detail
-field.
+This is the W02-owned wire: it maps constructor-controlled header, event, and trailer values to
+bounded CanonicalJSONV1 UTF-8 JSONL bytes with one trailing line feed, derives the segment
+``content_sha256`` over the header plus ordered event lines, and provides the injected-stream
+``StreamLogSink`` that emits those exact bytes. It performs no file I/O, rotation, or persistence
+(that is W03) and carries no arbitrary-text or exception-detail field.
 """
 
 from __future__ import annotations
 
+import hashlib
+import re
 import threading
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
-from milhouse.core.canonical import canonical_json_bytes
+from milhouse.core.canonical import MAX_CANONICAL_INT, canonical_json_bytes
+from milhouse.core.clock import truncate_to_milliseconds
 from milhouse.core.logging import LoggingError, StructuredLogEventV1
 from milhouse.domain.records import PrivacyClassV1
 from milhouse.privacy.egress import EgressDisposition, EgressSurface, require_egress
 
 STRUCTURED_LOG_SCHEMA_VERSION = 1
 STRUCTURED_LOG_LINE_EVENT = "event"
+STRUCTURED_LOG_LINE_HEADER = "header"
+STRUCTURED_LOG_LINE_TRAILER = "trailer"
+STRUCTURED_LOG_INSTALLATION_SCOPE = "installation"
 STRUCTURED_LOG_PRIVACY_CLASS: PrivacyClassV1 = "internal"
 MAX_EVENT_LINE_BYTES = 4_096
+MAX_HEADER_LINE_BYTES = 1_024
+MAX_TRAILER_LINE_BYTES = 1_024
+# Must equal the config `[retention].logs_days` upper bound (see tests/unit/test_log_framing.py).
+MAX_LOG_RETENTION_DAYS = 3_650
 
 _LINE_FEED = b"\n"
+_SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
 
 
 def _authorize_local_log() -> None:
@@ -74,6 +88,158 @@ def structured_log_event_line(event: StructuredLogEventV1) -> bytes:
     # never exceeds the section 4.15 bound.
     encoded = canonical_json_bytes(payload, max_bytes=MAX_EVENT_LINE_BYTES - len(_LINE_FEED))
     return encoded + _LINE_FEED
+
+
+def _validate_sequence(value: object) -> None:
+    if type(value) is not int or not 0 < value <= MAX_CANONICAL_INT:
+        raise LoggingError("MH_LOG_SEQUENCE", "a positive signed-64 sequence is required")
+
+
+def _normalized_utc(value: object, code: str) -> datetime:
+    """Normalize an aware timestamp to a safe UTC value, failing closed on hostile ``tzinfo``.
+
+    A hostile ``tzinfo`` whose ``utcoffset`` raises never reaches an exception or traceback: it is
+    caught here and a fixed ``LoggingError`` is raised outside the handler with no cause or context.
+    """
+
+    normalized: datetime | None = None
+    if type(value) is datetime:
+        try:
+            if value.tzinfo is not None and value.utcoffset() is not None:
+                normalized = truncate_to_milliseconds(value)
+        except Exception:
+            normalized = None
+    if type(normalized) is not datetime:
+        raise LoggingError(code, "an aware UTC timestamp is required")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredLogHeaderV1:
+    """Constructor-controlled header opening one stored structured-log segment."""
+
+    sequence: int
+    opened_at: datetime
+    retention_days: int
+
+    def __post_init__(self) -> None:
+        _validate_sequence(self.sequence)
+        object.__setattr__(self, "opened_at", _normalized_utc(self.opened_at, "MH_LOG_HEADER_TIME"))
+        if (
+            type(self.retention_days) is not int
+            or not 1 <= self.retention_days <= MAX_LOG_RETENTION_DAYS
+        ):
+            raise LoggingError(
+                "MH_LOG_HEADER_RETENTION", "a bounded positive retention is required"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredLogTrailerV1:
+    """Constructor-controlled trailer closing one stored structured-log segment."""
+
+    sequence: int
+    closed_at: datetime
+    last_event_at: datetime | None
+    event_count: int
+    content_sha256: str
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        _validate_sequence(self.sequence)
+        object.__setattr__(
+            self, "closed_at", _normalized_utc(self.closed_at, "MH_LOG_TRAILER_TIME")
+        )
+        object.__setattr__(
+            self, "expires_at", _normalized_utc(self.expires_at, "MH_LOG_TRAILER_TIME")
+        )
+        if type(self.event_count) is not int or not 0 <= self.event_count <= MAX_CANONICAL_INT:
+            raise LoggingError("MH_LOG_TRAILER_COUNT", "a bounded event count is required")
+        if (
+            type(self.content_sha256) is not str
+            or _SHA256_HEX_PATTERN.fullmatch(self.content_sha256) is None
+        ):
+            raise LoggingError(
+                "MH_LOG_TRAILER_DIGEST", "a lowercase hex sha-256 digest is required"
+            )
+        if self.event_count == 0:
+            if self.last_event_at is not None:
+                raise LoggingError(
+                    "MH_LOG_TRAILER_EVENT_TIME", "an empty segment has no last-event time"
+                )
+        else:
+            object.__setattr__(
+                self,
+                "last_event_at",
+                _normalized_utc(self.last_event_at, "MH_LOG_TRAILER_EVENT_TIME"),
+            )
+
+
+def structured_log_header_line(header: StructuredLogHeaderV1) -> bytes:
+    """Project a header into a bounded CanonicalJSONV1 JSONL line with a trailing LF."""
+
+    if type(header) is not StructuredLogHeaderV1:
+        raise LoggingError("MH_LOG_HEADER", "a StructuredLogHeaderV1 is required")
+    _authorize_local_log()
+
+    payload: dict[str, object] = {
+        "schema": STRUCTURED_LOG_SCHEMA_VERSION,
+        "line": STRUCTURED_LOG_LINE_HEADER,
+        "scope": STRUCTURED_LOG_INSTALLATION_SCOPE,
+        "sequence": header.sequence,
+        "opened_at": header.opened_at,
+        "retention_days": header.retention_days,
+    }
+    encoded = canonical_json_bytes(payload, max_bytes=MAX_HEADER_LINE_BYTES - len(_LINE_FEED))
+    return encoded + _LINE_FEED
+
+
+def structured_log_trailer_line(trailer: StructuredLogTrailerV1) -> bytes:
+    """Project a trailer into a bounded CanonicalJSONV1 JSONL line with a trailing LF."""
+
+    if type(trailer) is not StructuredLogTrailerV1:
+        raise LoggingError("MH_LOG_TRAILER", "a StructuredLogTrailerV1 is required")
+    _authorize_local_log()
+
+    payload: dict[str, object] = {
+        "schema": STRUCTURED_LOG_SCHEMA_VERSION,
+        "line": STRUCTURED_LOG_LINE_TRAILER,
+        "sequence": trailer.sequence,
+        "closed_at": trailer.closed_at,
+        "last_event_at": trailer.last_event_at,
+        "event_count": trailer.event_count,
+        "content_sha256": trailer.content_sha256,
+        "expires_at": trailer.expires_at,
+    }
+    encoded = canonical_json_bytes(payload, max_bytes=MAX_TRAILER_LINE_BYTES - len(_LINE_FEED))
+    return encoded + _LINE_FEED
+
+
+def structured_log_content_sha256(header_line: bytes, event_lines: Iterable[bytes]) -> str:
+    """Return the hex SHA-256 over the header line plus the ordered event lines.
+
+    Covers the exact header and event-line bytes including their line feeds and excludes the
+    trailer, per section 4.15.
+    """
+
+    if type(header_line) is not bytes:
+        raise LoggingError("MH_LOG_DIGEST", "the header line must be bytes")
+    digest = hashlib.sha256()
+    digest.update(header_line)
+    # Consume the caller-supplied iterable under a normalization boundary so a hostile
+    # __iter__/__next__ cannot leak raw exception text into an exception or traceback.
+    failed = False
+    try:
+        for line in event_lines:
+            if type(line) is not bytes:
+                failed = True
+                break
+            digest.update(line)
+    except Exception:
+        failed = True
+    if failed:
+        raise LoggingError("MH_LOG_DIGEST", "the event lines are invalid")
+    return digest.hexdigest()
 
 
 class _BinaryStream(Protocol):
@@ -141,9 +307,20 @@ class StreamLogSink:
 
 __all__ = [
     "MAX_EVENT_LINE_BYTES",
+    "MAX_HEADER_LINE_BYTES",
+    "MAX_LOG_RETENTION_DAYS",
+    "MAX_TRAILER_LINE_BYTES",
+    "STRUCTURED_LOG_INSTALLATION_SCOPE",
     "STRUCTURED_LOG_LINE_EVENT",
+    "STRUCTURED_LOG_LINE_HEADER",
+    "STRUCTURED_LOG_LINE_TRAILER",
     "STRUCTURED_LOG_PRIVACY_CLASS",
     "STRUCTURED_LOG_SCHEMA_VERSION",
     "StreamLogSink",
+    "StructuredLogHeaderV1",
+    "StructuredLogTrailerV1",
+    "structured_log_content_sha256",
     "structured_log_event_line",
+    "structured_log_header_line",
+    "structured_log_trailer_line",
 ]
