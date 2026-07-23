@@ -2,11 +2,14 @@
 
 This is the W02-owned event-line wire: it maps a constructor-controlled
 ``StructuredLogEventV1`` to bounded CanonicalJSONV1 UTF-8 JSONL bytes with one trailing
-line feed. It performs no file or sink I/O (that is W03) and carries no arbitrary-text or
-exception-detail field.
+line feed, plus the injected-stream ``StreamLogSink`` that emits those exact bytes. It performs no
+file I/O, rotation, or persistence (that is W03) and carries no arbitrary-text or exception-detail
+field.
 """
 
 from __future__ import annotations
+
+from typing import Protocol
 
 from milhouse.core.canonical import canonical_json_bytes
 from milhouse.core.logging import LoggingError, StructuredLogEventV1
@@ -72,10 +75,46 @@ def structured_log_event_line(event: StructuredLogEventV1) -> bytes:
     return encoded + _LINE_FEED
 
 
+class _BinaryStream(Protocol):
+    def write(self, data: bytes, /) -> object:
+        """Write raw bytes to the underlying stream."""
+
+
+class StreamLogSink:
+    """A ``StructuredLogSink`` that writes exact event-line bytes to an injected binary stream.
+
+    W02 owns the sink interface and the exact bytes. Binding a concrete stream (for example
+    ``sys.stderr.buffer``) and any flushing or buffering policy are W06 responsibilities. The
+    ``local_log`` egress guard runs inside ``structured_log_event_line`` before any byte is
+    written, so a denied or widened matrix emits nothing.
+    """
+
+    __slots__ = ("_stream",)
+
+    def __init__(self, stream: _BinaryStream) -> None:
+        if not callable(getattr(stream, "write", None)):
+            raise LoggingError("MH_LOG_SINK_STREAM", "a writable binary stream is required")
+        self._stream = stream
+
+    def write(self, event: StructuredLogEventV1) -> None:
+        if type(event) is not StructuredLogEventV1:
+            raise LoggingError("MH_LOG_SINK_EVENT", "a StructuredLogEventV1 is required")
+        line = structured_log_event_line(event)
+        try:
+            self._stream.write(line)
+        except LoggingError:
+            raise
+        except Exception:
+            raise LoggingError(
+                "MH_LOG_SINK_WRITE", "structured log sink stream write failed"
+            ) from None
+
+
 __all__ = [
     "MAX_EVENT_LINE_BYTES",
     "STRUCTURED_LOG_LINE_EVENT",
     "STRUCTURED_LOG_PRIVACY_CLASS",
     "STRUCTURED_LOG_SCHEMA_VERSION",
+    "StreamLogSink",
     "structured_log_event_line",
 ]
