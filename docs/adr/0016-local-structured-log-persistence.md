@@ -2,7 +2,7 @@
 
 - Status: Accepted (ratification)
 - Date: 2026-07-22
-- Authority: Owner-approved plan amendment A02 (2026-07-22) under plan section 1 change control
+- Authority: Owner-approved plan amendments A02 (2026-07-22) and A05 (2026-07-23) under plan section 1 change control
 - Amends: ADR 0007 (adds the `local_log` egress surface and the persisted structured-log contract)
 
 ## Context
@@ -105,6 +105,33 @@ refusal; disk-full, short-write, lock-timeout, capacity, and sequence-overflow f
 logging failure cannot change record acknowledgement; retention boundary, tightening-without-extension,
 backup exclusion, restore preservation, target purge, and full-purge behavior; and at least 95% branch
 coverage for the critical logging and filesystem modules.
+
+## Amendment A05: exact v1 stored schema (2026-07-23)
+
+Owner-approved plan amendment A05 (2026-07-23), under plan section 1 change control, promotes the
+section 4.15 stored-log wire to an exact, machine-checked v1 schema without changing any
+already-implemented byte. For every stored line it fixes the literal keys and canonical order, the
+literal `line` and `schema` values, scalar types, the explicit-`null` optionality rule (optional
+values are never omitted), the RFC3339 UTC millisecond timestamp and 64-character lowercase-hex digest
+encodings, the 1,024-byte header/trailer and 4,096-byte event byte bounds, the empty-segment semantics
+(`event_count` `0` with explicit-`null` `last_event_at`), and the digest coverage over the header plus
+ordered event lines excluding the trailer. It fixes the segment deadline as `expires_at = opened_at +
+retention_days` days, captured at close, tighten-only, with W02 encoding the field and W03 computing
+it, and binds the header `retention_days` domain to the `[retention].logs_days` 1-to-3,650-day
+ceiling. Every stored line remains self-describing so the mixed-line JSONL stream is parseable line by
+line.
+
+Alternatives, compatibility, and security are as in plan amendment A05: the schema was previously
+implicit in code and tests (rejected under section 1); the per-line version and line-type envelope is
+required for mixed-line JSONL (reverting it is rejected); no public format has shipped, so the schema
+is v1 with no migration and no implicit adoption of preexisting files; and the exact schema keeps
+arbitrary text, exception detail, secrets, and provider content out of every line, stderr, exception,
+and traceback, unchanged from A02.
+
+Gate G02 additionally requires a machine-checked schema lock: exact normative vectors for the minimal
+and maximal header, event, non-empty trailer, and empty trailer; the digest-coverage and empty-segment
+digest; the `expires_at = opened_at + retention_days` vector; and a test that fails if any declared
+key, literal, scalar type, or optionality rule drifts.
 
 ## Plan references
 

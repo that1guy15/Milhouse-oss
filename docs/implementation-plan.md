@@ -38,6 +38,30 @@ class. Amendment A03, approved by the owner on 2026-07-22 and ratified by ADR 00
 bounded historical DCO disposition for the D01 PR #21 squash incident without weakening future
 enforcement.
 
+Plan amendment A05, approved by the owner on 2026-07-23 and ratified by an ADR 0016 addendum,
+promotes the section 4.15 stored-log wire from a prose field summary to an exact, machine-checked v1
+schema. For every stored line it fixes the literal JSON keys and their canonical order, the literal
+`line` and `schema` values, the scalar types, the null-versus-omission rule (optional values are
+explicit JSON `null`, never omitted), the RFC3339 UTC millisecond timestamp and 64-character
+lowercase-hexadecimal digest encodings, the per-line and per-segment byte bounds, the empty-segment
+semantics, and the digest coverage. It fixes the segment deadline as `expires_at = opened_at +
+retention_days` days, captured when the segment closes and subject to the existing tighten-only rule
+(a retention tightening may move an unexpired deadline earlier; a relaxation never moves a captured
+deadline later), and it binds the header `retention_days` domain to the same 1-to-3,650-day ceiling as
+`[retention].logs_days`. Every stored line is self-describing, carrying its own `schema` version and
+`line` type, which formalizes the trailer envelope that section 4.15 previously stated only in prose.
+Reason: section 1 forbids locking a stored schema inside implementation, yet W02's wire, golden
+vectors, and tests had already fixed these bytes without a numbered amendment. Alternatives considered:
+leaving the schema implicit in code and tests (rejected because it violates section 1 and forces W03
+to infer stored semantics) and reverting the per-line version and line-type envelope (rejected because
+a mixed-line JSONL stream requires every line to be self-describing). Compatibility and migration: no
+public stored-log format has shipped, so the schema is v1 with no migration and no implicit adoption of
+preexisting files, and A05 changes no already-implemented wire byte. Security: the exact schema keeps
+arbitrary text, exception detail, secrets, and provider content out of every line, stderr, exception,
+and traceback, unchanged from A02. Revised tests: a schema-lock test asserts each declared key,
+literal, scalar type, and optionality rule for the minimal and maximal header, event, non-empty
+trailer, and empty trailer, together with the digest-coverage and the `expires_at` normative vector.
+
 ## 2. Product contract
 
 ### 2.1 Product definition
@@ -967,6 +991,14 @@ Telegram is disabled by default, escapes Markdown safely, chunks within provider
 Structured logs are installation-scoped local operational metadata. They are never a record, audit, replay, verification, acknowledgement, or feedback authority, and logging can never control or roll back record acknowledgement. The `local_log` egress surface (section 4.7) authorizes only `public → metadata` and `internal → redacted metadata`; `sensitive` and `restricted` are denied. No target IDs, paths, URLs, credentials, payloads, exception text, arbitrary messages, prompts, transcripts, responses, tool output, or provider content may enter the stored wire, stderr, or any exception or traceback. Safe counts or keyed fingerprints derived from rejected data are reclassified as internal metadata before this boundary. No external log egress or private-donor logging reuse is authorized.
 
 The stored wire is bounded `CanonicalJSONV1` UTF-8 JSONL with one LF per line and no BOM. `StructuredLogHeaderV1` carries version, line type, installation scope, a positive signed-64 sequence, canonical `opened_at`, and captured `retention_days`. `StructuredLogEventLineV1` carries version, line type, internal privacy class, canonical timestamp, a catalog-owned event name, level, sorted typed metrics, a normalized coded error, and an optional validated installation-keyed fingerprint; it has no arbitrary-text or exception-detail field. `StructuredLogTrailerV1` carries version, line type, sequence, `closed_at`, `last_event_at`, `event_count`, `content_sha256`, and `expires_at`. `content_sha256` covers the exact header plus the ordered event-line bytes including their LFs and excludes the trailer. The existing in-memory `StructuredLogEventV1` remains constructor-controlled; the stored line is a separate exact projection.
+
+Exact v1 stored schema (amendment A05). Every stored line is a single-line `CanonicalJSONV1` UTF-8 JSON object followed by exactly one LF, with keys in canonical UTF-8 code-unit order, no additional keys, and no omitted keys; optional values are explicit JSON `null` rather than omitted. Integers are JSON numbers; every timestamp is the RFC3339 UTC millisecond string `YYYY-MM-DDTHH:MM:SS.mmmZ`; `content_sha256` is exactly 64 lowercase hexadecimal characters. The three line objects are exactly:
+
+- Header — `{"line":"header","opened_at":<ts>,"retention_days":<int 1..3650>,"schema":1,"scope":"installation","sequence":<int 1..2^63-1>}`.
+- Event — `{"error":<coded-error-string|null>,"fingerprint":<installation-keyed-string|null>,"level":<LEVEL>,"line":"event","metrics":[{"kind":<kind>,"name":<name>,"value":<int>}, ...],"name":<catalog-event-name>,"privacy":"internal","schema":1,"ts":<ts>}`, where `error` and `fingerprint` are always present and are `null` when absent, `metrics` is the sorted typed-metric array, and `fingerprint` never carries raw input.
+- Trailer — `{"closed_at":<ts>,"content_sha256":<hex>,"event_count":<int 0..2^63-1>,"expires_at":<ts>,"last_event_at":<ts|null>,"line":"trailer","schema":1,"sequence":<int 1..2^63-1>}`. For an empty segment `event_count` is `0` and `last_event_at` is JSON `null` (present, never omitted); otherwise `event_count` is at least `1` and `last_event_at` is a timestamp.
+
+`content_sha256` is the SHA-256 over the exact header-line bytes plus the ordered event-line bytes including their LFs, excluding the trailer; for an empty segment it is the SHA-256 of the header line alone. Each header or trailer line is at most 1,024 bytes and each event line is at most 4,096 bytes, including its LF. A segment's `expires_at` equals its header `opened_at` plus `retention_days` days, computed when the segment closes; W02 encodes this field while W03 computes it. The header `retention_days` domain is the same 1-to-3,650-day ceiling as `[retention].logs_days`, so the wire never admits a retention value that valid configuration rejects.
 
 Files live under the securely resolved `[paths].logs` directory inside the runtime home: `structured-log.current.jsonl`, rotated `structured-log.<20-digit-sequence>.jsonl`, a `.structured-log.next.tmp` staging file, and a `structured-log.lock`. Rotated sequences use exactly twenty decimal digits; sequence reuse is forbidden until a confirmed full installation purge, and overflow fails closed. The directory is mode `0700` and files are mode `0600`; access requires the correct owner, a regular file, a single hard link, a safe ACL, no symlink, no directory replacement, and no unsafe foreign matching file, using descriptor-relative, no-follow, close-on-exec handles. Milhouse fails closed when a required platform protection is unavailable.
 
