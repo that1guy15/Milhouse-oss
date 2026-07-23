@@ -38,6 +38,11 @@ class. Amendment A03, approved by the owner on 2026-07-22 and ratified by ADR 00
 bounded historical DCO disposition for the D01 PR #21 squash incident without weakening future
 enforcement.
 
+Amendment A04, approved by the owner to reallocate deferred structured-log assertions from W02/G02 to
+their owning gates (filesystem persistence to G03, CLI and stderr binding to G06, and reports to G09),
+is recorded with the forthcoming G02 evidence packet; its number is reserved here so the register stays
+contiguous once that packet lands on `main`.
+
 Plan amendment A05, approved by the owner on 2026-07-23 and ratified by an ADR 0016 addendum,
 promotes the section 4.15 stored-log wire from a prose field summary to an exact, machine-checked v1
 schema. For every stored line it fixes the literal JSON keys and their canonical order, the literal
