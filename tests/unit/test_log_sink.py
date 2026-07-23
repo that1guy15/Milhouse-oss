@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import traceback
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -102,9 +103,17 @@ def test_stream_sink_wraps_a_hostile_stream_failure_without_leaking_detail() -> 
     with pytest.raises(LoggingError) as captured:
         StreamLogSink(_HostileStream()).write(_event())
 
-    assert captured.value.code == "MH_LOG_SINK_WRITE"
-    assert canary not in str(captured.value)
-    assert captured.value.__cause__ is None
+    error = captured.value
+    assert error.code == "MH_LOG_SINK_WRITE"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    graph = (
+        str(error),
+        repr(error),
+        repr(error.args),
+        "".join(traceback.format_exception(error)),
+    )
+    assert all(canary not in part for part in graph)
 
 
 def test_structured_logger_delivers_to_a_stream_sink_without_touching_stdio(
@@ -116,3 +125,61 @@ def test_structured_logger_delivers_to_a_stream_sink_without_touching_stdio(
     assert event is not None
     assert stream.getvalue() == structured_log_event_line(event)
     assert capsys.readouterr() == ("", "")
+
+
+class _ScriptedStream:
+    """A binary stream whose write() returns scripted values and records accepted bytes."""
+
+    def __init__(self, script: list[object]) -> None:
+        self._script = list(script)
+        self.written = bytearray()
+
+    def write(self, data: object) -> object:
+        outcome = self._script.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        buffer = bytes(data)  # type: ignore[arg-type]
+        if type(outcome) is int and 0 <= outcome <= len(buffer):
+            self.written += buffer[:outcome]
+        return outcome
+
+
+def test_stream_sink_completes_a_short_then_complete_write() -> None:
+    event = _event()
+    line = structured_log_event_line(event)
+    stream = _ScriptedStream([7, len(line) - 7])
+
+    StreamLogSink(stream).write(event)
+
+    assert bytes(stream.written) == line
+
+
+def test_stream_sink_completes_a_repeatedly_short_write() -> None:
+    event = _event()
+    line = structured_log_event_line(event)
+    stream = _ScriptedStream([1, 1, len(line) - 2])
+
+    StreamLogSink(stream).write(event)
+
+    assert bytes(stream.written) == line
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        [0],  # zero progress
+        [-1],  # negative
+        [None],  # non-integer
+        [True],  # bool is not int
+        [10_000],  # oversized (greater than the remaining length)
+        [7, OSError("short then fail")],  # partial then raise
+    ],
+)
+def test_stream_sink_fails_closed_on_invalid_or_incomplete_writes(script: list[object]) -> None:
+    stream = _ScriptedStream(script)
+    with pytest.raises(LoggingError) as captured:
+        StreamLogSink(stream).write(_event())
+
+    assert captured.value.code == "MH_LOG_SINK_WRITE"
+    # a partial or rejected acceptance is never reported as a complete event line
+    assert bytes(stream.written) != structured_log_event_line(_event())

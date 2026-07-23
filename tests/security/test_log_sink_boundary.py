@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import traceback
 from datetime import UTC, datetime
 
 import pytest
@@ -84,3 +85,49 @@ def test_stream_sink_fails_closed_and_emits_nothing_when_egress_denies(
 
     assert captured.value.code == "MH_LOG_WIRE_EGRESS"
     assert stream.getvalue() == b""
+
+
+def _graph(error: BaseException) -> tuple[str, ...]:
+    return (
+        str(error),
+        repr(error),
+        repr(error.args),
+        "".join(traceback.format_exception(error)),
+    )
+
+
+@pytest.mark.security
+def test_stream_sink_normalizes_a_stream_raised_logging_error() -> None:
+    canary = "runtime-private-logging-detail-3a7d"
+
+    class _Raiser:
+        def write(self, _data: object) -> object:
+            raise LoggingError("MH_LOG_SINK", canary)
+
+    with pytest.raises(LoggingError) as captured:
+        StreamLogSink(_Raiser()).write(_event())
+
+    error = captured.value
+    assert error.code == "MH_LOG_SINK_WRITE"  # normalized, never passed through
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert all(canary not in part for part in _graph(error))
+
+
+@pytest.mark.security
+def test_stream_sink_normalizes_a_hostile_write_descriptor() -> None:
+    canary = "runtime-private-descriptor-detail-6b2e"
+
+    class _Hostile:
+        @property
+        def write(self) -> object:
+            raise RuntimeError(canary)
+
+    with pytest.raises(LoggingError) as captured:
+        StreamLogSink(_Hostile())
+
+    error = captured.value
+    assert error.code == "MH_LOG_SINK_STREAM"
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert all(canary not in part for part in _graph(error))
