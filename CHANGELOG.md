@@ -92,3 +92,8 @@
   only and no external egress, record, publication, or retention expansion.
 - Record owner-approved amendment A03 (ADR 0017): the exact bounded D01 PR #21 historical DCO
   disposition, keeping the original squash permanently noncompliant and future enforcement unchanged.
+- Implement the W02-owned `local_log` contract (amendment A02): the fail-closed `local_log` egress
+  surface, the CanonicalJSONV1 `StructuredLogEventV1` wire and encoder, a golden vector corpus with
+  cross-process/property determinism and adversarial leak-freedom, and a stream sink that emits exact
+  event-line bytes, normalizes hostile failures, and refuses partial writes.
+- Assemble the W02 G02 evidence packet (`docs/gate-evidence/G02.md`); G02 acceptance is owner-pending.

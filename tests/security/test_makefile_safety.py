@@ -19,6 +19,7 @@ CRITICAL_COVERAGE_FILES = {
     "src/milhouse/core/clock.py",
     "src/milhouse/core/errors.py",
     "src/milhouse/core/logging.py",
+    "src/milhouse/core/log_wire.py",
     "src/milhouse/domain/_validation.py",
     "src/milhouse/domain/identity.py",
     "src/milhouse/domain/records.py",
