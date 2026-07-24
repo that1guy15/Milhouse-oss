@@ -31,11 +31,12 @@ MAX_FRAME_LINE_BYTES = 262_144 + 1_024  # a canonical record plus the small fram
 MAX_RETENTION_DAYS = 3_650  # matches the config `[retention]` ceiling
 
 _BATCH_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", flags=re.ASCII)
-_EXPORTER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", flags=re.ASCII)
+EXPORTER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", flags=re.ASCII)
 _TARGET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", flags=re.ASCII)
 _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
 _SCOPES = ("installation", "target")
-_PRIVACY_CLASSES = ("public", "internal", "sensitive", "restricted")
+# A canonical record can never be restricted (RecordDraftV1 forbids it); a segment cannot be either.
+_ALLOWED_PRIVACY = ("public", "internal", "sensitive")
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -100,8 +101,8 @@ class SegmentHeaderV1:
                 _fail("MH_SPOOL_TARGET", "target scope requires a bounded target id")
         elif self.target_id is not None:
             _fail("MH_SPOOL_TARGET", "installation scope forbids a target id")
-        if self.privacy_class not in _PRIVACY_CLASSES:
-            _fail("MH_SPOOL_PRIVACY", "a valid privacy class is required")
+        if self.privacy_class not in _ALLOWED_PRIVACY:
+            _fail("MH_SPOOL_PRIVACY", "a non-restricted privacy class is required")
         if (
             type(self.retention_days) is not int
             or not 0 < self.retention_days <= MAX_RETENTION_DAYS
@@ -110,7 +111,7 @@ class SegmentHeaderV1:
         if type(self.required_exporters) is not tuple:
             _fail("MH_SPOOL_EXPORTERS", "required exporters must be a tuple")
         for exporter in self.required_exporters:
-            if type(exporter) is not str or _EXPORTER_ID_PATTERN.fullmatch(exporter) is None:
+            if type(exporter) is not str or EXPORTER_ID_PATTERN.fullmatch(exporter) is None:
                 _fail("MH_SPOOL_EXPORTERS", "each exporter id must be bounded safe text")
         if list(self.required_exporters) != sorted(set(self.required_exporters)):
             _fail("MH_SPOOL_EXPORTERS", "required exporters must be sorted and unique")

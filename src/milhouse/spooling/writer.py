@@ -56,7 +56,7 @@ def _validate_consistency(header: SegmentHeaderV1, frames: tuple[SpoolFrameV1, .
             _fail("MH_SPOOL_PRIVACY", "each frame privacy class must match the header")
 
 
-def _atomic_publish(path: str | Path, content: bytes) -> None:
+def publish_segment_bytes(path: str | Path, content: bytes) -> None:
     exists = False
     failed = False
     try:
@@ -74,13 +74,13 @@ def _atomic_publish(path: str | Path, content: bytes) -> None:
         _fail("MH_SPOOL_WRITE", "the segment could not be durably published")
 
 
-def write_spool_segment(
-    path: str | Path, header: SegmentHeaderV1, frames: tuple[SpoolFrameV1, ...] | list[SpoolFrameV1]
-) -> None:
-    """Atomically publish a self-describing segment whose header and frames are mutually consistent.
+def build_segment_bytes(
+    header: SegmentHeaderV1, frames: tuple[SpoolFrameV1, ...] | list[SpoolFrameV1]
+) -> bytes:
+    """Validate header/frame consistency and return the exact segment bytes (header line + frames).
 
     The header must already carry the digest of the ordered frame bytes; this re-validates it so the
-    published segment is internally verifiable. Publication never overwrites an existing name.
+    returned bytes are internally verifiable. Raises a fixed ``MH_SPOOL_*`` error on any mismatch.
     """
 
     if not isinstance(header, SegmentHeaderV1):
@@ -92,5 +92,15 @@ def write_spool_segment(
     frame_lines = [spool_frame_line(frame) for frame in frame_tuple]
     if spool_content_sha256(frame_lines) != header.content_sha256:
         _fail("MH_SPOOL_DIGEST", "the header digest does not match the frame bytes")
-    content = spool_segment_header_line(header) + b"".join(frame_lines)
-    _atomic_publish(path, content)
+    return spool_segment_header_line(header) + b"".join(frame_lines)
+
+
+def write_spool_segment(
+    path: str | Path, header: SegmentHeaderV1, frames: tuple[SpoolFrameV1, ...] | list[SpoolFrameV1]
+) -> None:
+    """Atomically publish a self-describing segment whose header and frames are mutually consistent.
+
+    Publication never overwrites an existing name.
+    """
+
+    publish_segment_bytes(path, build_segment_bytes(header, frames))
