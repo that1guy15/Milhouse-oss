@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,7 +18,9 @@ from milhouse.state import (
     GlobalCommitBarrier,
     Migration,
     StateError,
-    apply_migrations,
+    acquire_lease,
+    initialize_control_state,
+    migrate,
     open_control_database,
 )
 from milhouse.state import barrier as barrier_module
@@ -184,9 +186,10 @@ def test_invalid_migration_definitions_fail_closed(
 ) -> None:
     directory = _private_dir(tmp_path)
     database = open_control_database(directory / "milhouse.sqlite3")
+    barrier = GlobalCommitBarrier(directory / "commit.lock")
     try:
         with pytest.raises(StateError) as captured:
-            apply_migrations(database, definitions, applied_at=_NOW)
+            migrate(database, definitions, barrier=barrier, applied_at=_NOW)
         assert captured.value.code == "MH_STATE_MIGRATION"
     finally:
         database.close()
@@ -196,12 +199,51 @@ def test_invalid_migration_definitions_fail_closed(
 def test_non_tuple_migrations_fail_closed(tmp_path: Path) -> None:
     directory = _private_dir(tmp_path)
     database = open_control_database(directory / "milhouse.sqlite3")
+    barrier = GlobalCommitBarrier(directory / "commit.lock")
     try:
         with pytest.raises(StateError) as captured:
-            apply_migrations(
-                database, [Migration(1, "a", ("CREATE TABLE a (x)",))], applied_at=_NOW
-            )  # type: ignore[arg-type]
+            migrate(
+                database,
+                [Migration(1, "a", ("CREATE TABLE a (x)",))],  # type: ignore[arg-type]
+                barrier=barrier,
+                applied_at=_NOW,
+            )
         assert captured.value.code == "MH_STATE_MIGRATION"
+    finally:
+        database.close()
+
+
+@pytest.mark.security
+def test_a_malformed_lease_table_is_normalized(tmp_path: Path) -> None:
+    directory = _private_dir(tmp_path)
+    database = open_control_database(directory / "milhouse.sqlite3")
+    try:
+        # a `_leases` table missing the expected columns must produce a fixed error, not raw SQLite
+        with database.transaction() as connection:
+            connection.execute("CREATE TABLE _leases (name TEXT PRIMARY KEY)")
+        with pytest.raises(StateError) as captured:
+            acquire_lease(database, "job", "worker-a", now=_NOW, ttl_seconds=60)
+        assert captured.value.code == "MH_STATE_LEASE"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+    finally:
+        database.close()
+
+
+@pytest.mark.security
+def test_an_overflowing_deadline_is_normalized(tmp_path: Path) -> None:
+    directory = _private_dir(tmp_path)
+    database = open_control_database(directory / "milhouse.sqlite3")
+    barrier = GlobalCommitBarrier(directory / "commit.lock")
+    try:
+        initialize_control_state(database, barrier=barrier, applied_at=_NOW)
+        # an instant so close to datetime.max that adding the TTL overflows: must not leak the error
+        near_max = datetime.max.replace(tzinfo=UTC) - timedelta(seconds=1)
+        with pytest.raises(StateError) as captured:
+            acquire_lease(database, "job", "worker-a", now=near_max, ttl_seconds=60)
+        assert captured.value.code == "MH_STATE_LEASE"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
     finally:
         database.close()
 
@@ -224,15 +266,15 @@ def test_barrier_lock_creation_failure_fails_closed(
 
 
 @pytest.mark.security
-def test_barrier_exclusive_os_error_fails_closed(
+def test_barrier_flock_os_error_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     barrier = GlobalCommitBarrier(_private_dir(tmp_path) / "commit.lock")
 
-    def _boom(self: object, *args: object, **kwargs: object) -> None:
-        raise OSError("planted exclusive acquire failure")
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("planted flock failure")
 
-    monkeypatch.setattr(barrier_module.FileLock, "acquire", _boom)
+    monkeypatch.setattr(barrier_module.fcntl, "flock", _boom)
     with pytest.raises(StateError) as captured:
         with barrier.exclusive():
             pass

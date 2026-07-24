@@ -1,12 +1,19 @@
-"""Ordered, checksum-enforced, transactional control-plane migrations (W03 slice 1).
+"""Ordered, checksum-enforced, barrier-gated control-plane migrations (W03 slice 1).
 
-Each migration carries a version, a name, and a tuple of single SQL statements. Migrations apply
-strictly in contiguous order from version 1; each applies together with its ledger row in one
-``BEGIN IMMEDIATE`` transaction, so a crash mid-migration leaves schema and ledger consistent. An
-already-applied migration whose checksum or name later differs, or a ledger that is not a contiguous
-prefix of the definitions, is corruption and fails closed with a fixed ``MH_STATE_MIGRATION`` error.
-Statements are single statements, not a script: SQLite's ``executescript`` implicitly commits, which
-would break the atomic schema-plus-ledger boundary.
+Each migration carries a version, a name, and a tuple of single SQL statements. ``migrate`` owns the
+exclusive global commit barrier for the whole inspect-and-apply operation, so two processes
+cannot run
+schema DDL outside the maintenance fence, and applies any unapplied migrations strictly in
+contiguous
+order from version 1. Each migration applies together with its ledger row in one ``BEGIN IMMEDIATE``
+transaction, so a crash mid-migration leaves schema and ledger consistent. A modified applied
+migration, or a ledger that is not a contiguous prefix of the definitions, is corruption and fails
+closed with a fixed ``MH_STATE_MIGRATION``. ``schema_version`` is read-only and never creates the
+ledger. Every SQLite or time failure is normalized to a fixed ``MH_STATE_*`` error raised
+outside the
+handler. Statements are single statements, not a script, because SQLite's ``executescript``
+implicitly
+commits, which would break the atomic schema-plus-ledger boundary.
 """
 
 from __future__ import annotations
@@ -17,7 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import NoReturn
 
-from milhouse.core.clock import format_timestamp
+from milhouse.core.clock import TimeError, format_timestamp
+from milhouse.state.barrier import GlobalCommitBarrier
 from milhouse.state.database import ControlDatabase
 from milhouse.state.errors import StateError
 
@@ -54,6 +62,18 @@ def _validate_definitions(migrations: tuple[Migration, ...]) -> None:
         for statement in migration.statements:
             if type(statement) is not str or not statement.strip():
                 _fail("each migration statement must be non-empty text")
+
+
+def _stamp(applied_at: datetime) -> str:
+    invalid = False
+    stamp = ""
+    try:
+        stamp = format_timestamp(applied_at)
+    except (OverflowError, TimeError):
+        invalid = True
+    if invalid:
+        _fail("the migration timestamp must be an aware in-range UTC instant")
+    return stamp
 
 
 def _ensure_schema_table(database: ControlDatabase) -> None:
@@ -108,39 +128,63 @@ def _apply_one(database: ControlDatabase, migration: Migration, checksum: str, s
         _fail("a migration statement failed to apply")
 
 
-def apply_migrations(
+def _apply_all(database: ControlDatabase, migrations: tuple[Migration, ...], stamp: str) -> int:
+    failed = False
+    try:
+        _ensure_schema_table(database)
+        applied = _load_applied(database.connection)
+        _validate_applied_prefix(applied, migrations)
+        highest = max(applied) if applied else 0
+        for migration in migrations:
+            if migration.version <= highest:
+                continue
+            _apply_one(database, migration, _checksum(migration), stamp)
+            highest = migration.version
+        return highest
+    except sqlite3.Error:
+        failed = True
+    if failed:
+        _fail("the control schema could not be inspected")
+    raise AssertionError  # pragma: no cover - unreachable; the branch above always returns or fails
+
+
+def migrate(
     database: ControlDatabase,
     migrations: tuple[Migration, ...],
     *,
+    barrier: GlobalCommitBarrier,
     applied_at: datetime,
 ) -> int:
-    """Apply any unapplied migrations in contiguous order and return the resulting schema version.
+    """Apply any unapplied migrations under the exclusive global barrier; return the schema version.
 
-    ``applied_at`` must be an aware UTC instant; it is stored as the canonical RFC3339 millisecond
-    string. Applying an empty definition set is a no-op that returns the current version.
+    The whole inspect-and-apply runs while holding the exclusive commit barrier, so concurrent
+    processes serialize through the maintenance fence. ``applied_at`` must be an aware UTC instant.
     """
 
     if type(migrations) is not tuple:
         _fail("migrations must be provided as an ordered tuple")
     _validate_definitions(migrations)
-    stamp = format_timestamp(applied_at)
-    _ensure_schema_table(database)
-    applied = _load_applied(database.connection)
-    _validate_applied_prefix(applied, migrations)
-    highest = max(applied) if applied else 0
-    for migration in migrations:
-        if migration.version <= highest:
-            continue
-        _apply_one(database, migration, _checksum(migration), stamp)
-        highest = migration.version
-    return highest
+    stamp = _stamp(applied_at)
+    with barrier.exclusive():
+        return _apply_all(database, migrations, stamp)
 
 
 def schema_version(database: ControlDatabase) -> int:
-    """Return the highest applied migration version, or 0 when no migrations have been applied."""
+    """Return the highest applied migration version, or 0 if the ledger is absent. Read-only."""
 
-    _ensure_schema_table(database)
-    row = database.connection.execute(f"SELECT max(version) FROM {_SCHEMA_TABLE}").fetchone()
-    if row is None or row[0] is None:
-        return 0
-    return int(row[0])
+    connection = database.connection
+    failed = False
+    version = 0
+    try:
+        present = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (_SCHEMA_TABLE,)
+        ).fetchone()
+        if present is not None:
+            row = connection.execute(f"SELECT max(version) FROM {_SCHEMA_TABLE}").fetchone()
+            if row is not None and row[0] is not None:
+                version = int(row[0])
+    except sqlite3.Error:
+        failed = True
+    if failed:
+        _fail("the schema version could not be read")
+    return version

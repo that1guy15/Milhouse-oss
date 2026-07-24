@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import contextlib
 import os
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from milhouse.state import (
+    GlobalCommitBarrier,
     Migration,
     StateError,
-    apply_migrations,
+    migrate,
     open_control_database,
     schema_version,
 )
@@ -20,17 +23,31 @@ _M1 = Migration(1, "create_ledger", ("CREATE TABLE ledger (id INTEGER PRIMARY KE
 _M2 = Migration(2, "create_cursor", ("CREATE TABLE cursor (name TEXT PRIMARY KEY)",))
 
 
-def _database(tmp_path: Path):
+def _db_and_barrier(tmp_path: Path):
     directory = tmp_path / "control"
     directory.mkdir(mode=0o700)
     os.chmod(directory, 0o700)
-    return open_control_database(directory / "milhouse.sqlite3")
+    database = open_control_database(directory / "milhouse.sqlite3")
+    barrier = GlobalCommitBarrier(directory / "commit.lock")
+    return database, barrier
 
 
-def test_apply_migrations_creates_tables_and_records_the_ledger(tmp_path: Path) -> None:
-    database = _database(tmp_path)
+class _SpyBarrier:
+    """A barrier stand-in recording that ``migrate`` entered the exclusive maintenance side."""
+
+    def __init__(self) -> None:
+        self.exclusive_uses = 0
+
+    @contextlib.contextmanager
+    def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
+        self.exclusive_uses += 1
+        yield
+
+
+def test_migrate_creates_tables_and_records_the_ledger(tmp_path: Path) -> None:
+    database, barrier = _db_and_barrier(tmp_path)
     try:
-        assert apply_migrations(database, (_M1, _M2), applied_at=_NOW) == 2
+        assert migrate(database, (_M1, _M2), barrier=barrier, applied_at=_NOW) == 2
         assert schema_version(database) == 2
         tables = {
             row[0]
@@ -48,47 +65,57 @@ def test_apply_migrations_creates_tables_and_records_the_ledger(tmp_path: Path) 
         database.close()
 
 
-def test_apply_migrations_is_idempotent(tmp_path: Path) -> None:
-    database = _database(tmp_path)
+def test_migrate_runs_under_the_exclusive_barrier(tmp_path: Path) -> None:
+    database, _barrier = _db_and_barrier(tmp_path)
+    spy = _SpyBarrier()
     try:
-        apply_migrations(database, (_M1, _M2), applied_at=_NOW)
-        assert apply_migrations(database, (_M1, _M2), applied_at=_NOW) == 2
+        migrate(database, (_M1,), barrier=spy, applied_at=_NOW)  # type: ignore[arg-type]
+        assert spy.exclusive_uses == 1
+    finally:
+        database.close()
+
+
+def test_migrate_is_idempotent(tmp_path: Path) -> None:
+    database, barrier = _db_and_barrier(tmp_path)
+    try:
+        migrate(database, (_M1, _M2), barrier=barrier, applied_at=_NOW)
+        assert migrate(database, (_M1, _M2), barrier=barrier, applied_at=_NOW) == 2
         count = database.connection.execute("SELECT count(*) FROM _schema_migrations").fetchone()[0]
         assert count == 2
     finally:
         database.close()
 
 
-def test_apply_migrations_extends_a_partial_ledger(tmp_path: Path) -> None:
-    database = _database(tmp_path)
+def test_migrate_extends_a_partial_ledger(tmp_path: Path) -> None:
+    database, barrier = _db_and_barrier(tmp_path)
     try:
-        assert apply_migrations(database, (_M1,), applied_at=_NOW) == 1
-        assert apply_migrations(database, (_M1, _M2), applied_at=_NOW) == 2
+        assert migrate(database, (_M1,), barrier=barrier, applied_at=_NOW) == 1
+        assert migrate(database, (_M1, _M2), barrier=barrier, applied_at=_NOW) == 2
     finally:
         database.close()
 
 
 def test_a_modified_applied_migration_is_rejected_as_corruption(tmp_path: Path) -> None:
-    database = _database(tmp_path)
+    database, barrier = _db_and_barrier(tmp_path)
     try:
-        apply_migrations(database, (_M1,), applied_at=_NOW)
+        migrate(database, (_M1,), barrier=barrier, applied_at=_NOW)
         tampered = Migration(1, "create_ledger", ("CREATE TABLE ledger (id INTEGER, extra TEXT)",))
         with pytest.raises(StateError) as captured:
-            apply_migrations(database, (tampered,), applied_at=_NOW)
+            migrate(database, (tampered,), barrier=barrier, applied_at=_NOW)
         assert captured.value.code == "MH_STATE_MIGRATION"
     finally:
         database.close()
 
 
 def test_noncontiguous_definitions_are_rejected(tmp_path: Path) -> None:
-    database = _database(tmp_path)
+    database, barrier = _db_and_barrier(tmp_path)
     try:
         gapped = (
             Migration(1, "a", ("CREATE TABLE a (x)",)),
             Migration(3, "c", ("CREATE TABLE c (x)",)),
         )
         with pytest.raises(StateError) as captured:
-            apply_migrations(database, gapped, applied_at=_NOW)
+            migrate(database, gapped, barrier=barrier, applied_at=_NOW)
         assert captured.value.code == "MH_STATE_MIGRATION"
     finally:
         database.close()
@@ -97,15 +124,14 @@ def test_noncontiguous_definitions_are_rejected(tmp_path: Path) -> None:
 def test_a_failing_statement_rolls_back_atomically_without_leaking_sqlite_detail(
     tmp_path: Path,
 ) -> None:
-    database = _database(tmp_path)
+    database, barrier = _db_and_barrier(tmp_path)
     try:
         broken = Migration(1, "broken", ("CREATE TABLE ok (x INTEGER)", "THIS IS NOT SQL"))
         with pytest.raises(StateError) as captured:
-            apply_migrations(database, (broken,), applied_at=_NOW)
+            migrate(database, (broken,), barrier=barrier, applied_at=_NOW)
         assert captured.value.code == "MH_STATE_MIGRATION"
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
-        # neither the table nor the ledger row survives the rolled-back migration
         assert schema_version(database) == 0
         remaining = {
             row[0]
@@ -119,9 +145,24 @@ def test_a_failing_statement_rolls_back_atomically_without_leaking_sqlite_detail
 
 
 def test_empty_definitions_are_a_no_op(tmp_path: Path) -> None:
-    database = _database(tmp_path)
+    database, barrier = _db_and_barrier(tmp_path)
     try:
-        assert apply_migrations(database, (), applied_at=_NOW) == 0
+        assert migrate(database, (), barrier=barrier, applied_at=_NOW) == 0
         assert schema_version(database) == 0
+    finally:
+        database.close()
+
+
+def test_schema_version_is_read_only_on_a_fresh_database(tmp_path: Path) -> None:
+    database, _barrier = _db_and_barrier(tmp_path)
+    try:
+        assert schema_version(database) == 0
+        tables = {
+            row[0]
+            for row in database.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert "_schema_migrations" not in tables  # a read must never create the ledger
     finally:
         database.close()
