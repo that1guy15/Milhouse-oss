@@ -117,7 +117,7 @@ repo-check:
 
 docs-check:
 	$(UV_RUN) python scripts/check_links.py --repo-root . --external \
-		--max-external 50 --timeout 5 --max-redirects 3 .
+		--max-external 75 --timeout 5 --max-redirects 3 .
 
 workflow-check:
 	$(UV_RUN) python scripts/validate_workflows.py --require-aggregate .github/workflows

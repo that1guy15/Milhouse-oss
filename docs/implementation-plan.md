@@ -1451,6 +1451,7 @@ Gate G03:
 - replaying 10,000 records twice yields identical logical IDs and counts;
 - files/directories are `0600`/`0700` where supported;
 - pending data is never pruned before its explicit record-class privacy expiry; intentional audited expiry is detected and is not reported as accidental loss.
+- the structured-log file surface (section 4.15) persists, rotates by size/day/policy, recovers every write/fsync/rename crash boundary, refuses malformed or conflicting segments, enforces `0600`/`0700` and no-symlink/no-foreign-inode access, and deletes only expired closed segments, and a logging failure never changes record acknowledgement — the concrete structured-log file surface deferred from G02 by amendment A04;
 - failure injection covers temporary write, file fsync, rename, directory fsync, ledger insert/commit, cursor update, derivation/checkpoint, export, destination confirmation, and exporter checkpoint.
 
 ### W04 — Secure ClickHouse, migrations, repository, and recovery
@@ -1511,7 +1512,8 @@ Gate G06:
 - second initialization preserves config and secrets;
 - demo works without Docker in spool-only mode;
 - failed required health checks return nonzero;
-- output from an installed wheel matches source-checkout behavior.
+- output from an installed wheel matches source-checkout behavior;
+- the `local_log` stderr binding and the diagnostics bundle emit only the fixed event-line bytes and never leak a secret, PII, path, prompt, transcript, or tool-output canary — the concrete CLI/stderr and diagnostics surfaces deferred from G02 by amendment A04.
 
 ### W07 — Generic file and authenticated ingestion
 
@@ -1566,6 +1568,7 @@ Gate G09:
 - symlink/path traversal tests pass;
 - reports remain bounded and declare missing/degraded data;
 - generated content contains no private identifiers or unsafe raw text;
+- generated reports carry no `local_log`-sourced or otherwise private secret, PII, path, prompt, transcript, or tool-output content — the concrete generated-report surface deferred from G02 by amendment A04;
 - repeated generation is deterministic apart from declared timestamps.
 
 ### W10 — Official-SDK MCP read surface and bounded writes
@@ -1705,7 +1708,8 @@ Gate G16:
 - a clean-host restore matches manifest, record IDs, feedback state, and health;
 - current and previous schema upgrades are automated;
 - overwrite/purge operations require explicit validated targets and confirmation;
-- reference-dataset RPO is zero for acknowledged records that have not reached configured privacy expiry, and documented recovery completes within 30 minutes.
+- reference-dataset RPO is zero for acknowledged records that have not reached configured privacy expiry, and documented recovery completes within 30 minutes;
+- backups exclude `local_log` files, restore preserves destination-host logs and never imports source-host logs, target purge leaves installation-scoped logs to ordinary expiry, and a confirmed full purge removes them — the log backup/restore/purge behavior owned here per section 4.15 and deferred from G02.
 
 ### W17 — Documentation, skills, community, CI, and supply-chain hardening
 
