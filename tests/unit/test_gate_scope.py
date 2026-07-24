@@ -31,6 +31,21 @@ _FORBIDDEN_G02_REQUIREMENTS = (
     "secret values never appear in exceptions, logs, CLI, records, reports, or diagnostics",
 )
 
+# Each deferred surface must land as a concrete obligation in its OWNING gate section (not merely
+# be named in G02/ADR), so a later package cannot pass its gate without producing the deferred
+# evidence. Key = owning gate; value = a phrase that must appear inside that gate's plan section.
+_OWNING_GATE_OBLIGATIONS = {
+    "G03": "structured-log file surface",
+    "G06": "stderr binding and the diagnostics bundle",
+    "G09": "generated reports carry no",
+    "G16": "backups exclude `local_log`",
+}
+
+
+def _gate_section(gate: str) -> str:
+    start = _PLAN.index(f"Gate {gate}:")
+    return _PLAN[start : _PLAN.index("\n### ", start)]
+
 
 def _plan_g02_scope() -> str:
     start = _PLAN.index("Gate G02:")
@@ -91,6 +106,18 @@ def test_g02_does_not_require_a_dependency_blocked_concrete_surface() -> None:
         assert forbidden not in scope, (
             "G02 must not require a concrete surface owned by a dependency-blocked package: "
             f"{forbidden!r}"
+        )
+
+
+def test_each_deferred_obligation_landed_in_its_owning_gate_section() -> None:
+    # Removing a deferred surface from G02 is only safe if the obligation now exists in the owning
+    # gate; assert each moved obligation is present in its gate section, so deleting it there fails
+    # the contract rather than silently dropping the evidence.
+    for gate, obligation in _OWNING_GATE_OBLIGATIONS.items():
+        section = _gate_section(gate)
+        assert obligation in section, (
+            f"the {gate} gate section must carry the deferred obligation {obligation!r} that "
+            f"amendment A04 moved out of G02, so a later package cannot pass {gate} without it"
         )
 
 
