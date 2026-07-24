@@ -62,7 +62,8 @@ identity-portability:
 	$(UV_RUN) python -m pytest \
 		tests/contract/test_identity_portability_contract.py \
 		tests/integration/test_identity_subprocess_integration.py \
-		tests/integration/test_log_wire_subprocess_integration.py
+		tests/integration/test_log_wire_subprocess_integration.py \
+		tests/integration/test_spool_subprocess_integration.py
 
 test-coverage:
 	mkdir -p build
