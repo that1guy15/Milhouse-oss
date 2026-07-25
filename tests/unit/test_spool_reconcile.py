@@ -1153,6 +1153,55 @@ def test_a_committed_file_in_a_replaced_directory_is_not_certified(
         database.close()
 
 
+def test_a_foreign_owned_pending_directory_is_reported_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # exercise the distinct OWNER predicate without root: shift the uid the check compares against,
+    # so the (mode-correct, world-invisible) directory reads as foreign-owned
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    pending = spool_root / "pending"
+    pending.mkdir(mode=0o700)
+    os.chmod(pending, 0o700)
+    real_uid = os.geteuid()
+    monkeypatch.setattr(reconcile_module, "_current_uid", lambda: real_uid + 1)
+    try:
+        report = reconciler.reconcile()
+        assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "pending_unsafe"),)
+        assert not report.complete
+        assert report.registered == ()
+    finally:
+        database.close()
+
+
+def test_a_foreign_owned_day_directory_is_reported_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    pending = spool_root / "pending"
+    pending.mkdir(mode=0o700)
+    os.chmod(pending, 0o700)
+    day_dir = pending / _DAY
+    day_dir.mkdir(mode=0o700)
+    os.chmod(day_dir, 0o700)
+    real_uid = os.geteuid()
+    real_current_uid = reconcile_module._current_uid
+    calls: list[int] = []
+
+    def _foreign_after_pending() -> int:
+        calls.append(1)
+        # the pending check passes with the real uid; the day check then sees a foreign owner
+        return real_current_uid() if len(calls) == 1 else real_uid + 1
+
+    monkeypatch.setattr(reconcile_module, "_current_uid", _foreign_after_pending)
+    try:
+        report = reconciler.reconcile()
+        assert SegmentAnomaly("", _DAY, "foreign_name", "day_unsafe") in report.anomalies
+        assert not report.complete
+        assert report.registered == ()
+    finally:
+        database.close()
+
+
 def test_a_symlinked_day_directory_is_reported_unsafe(tmp_path: Path) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     try:
