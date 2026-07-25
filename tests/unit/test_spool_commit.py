@@ -30,7 +30,11 @@ from milhouse.spooling import (
     spool_content_sha256,
     spool_frame_line,
 )
-from milhouse.spooling.ledger import authorize_local_persistence, validated_segment
+from milhouse.spooling.ledger import (
+    authorize_local_persistence,
+    load_exporters,
+    validated_segment,
+)
 from milhouse.state import (
     GlobalCommitBarrier,
     StateError,
@@ -339,6 +343,37 @@ def test_a_valid_row_reconstructs_a_segment_record() -> None:
 def test_every_semantically_invalid_column_is_rejected(row: tuple[object, ...]) -> None:
     with pytest.raises(ValueError):
         validated_segment(row, ())
+
+
+def test_an_invalid_delivery_status_is_rejected_by_the_check(tmp_path: Path) -> None:
+    database, store, _spool_root = _spool(tmp_path)
+    try:
+        frames = _frames()
+        store.commit_segment(_header(frames), frames, committed_at=_NOW)
+        with pytest.raises(sqlite3.IntegrityError):
+            with database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO _segment_exporters (batch_id, exporter_id, delivery_status) "
+                    "VALUES ('batch-1', 'other', 'bogus')"
+                )
+    finally:
+        database.close()
+
+
+def test_the_exporter_status_validator_fails_closed_without_the_check() -> None:
+    # defense in depth: even against a tampered or rebuilt table WITHOUT the CHECK constraint, the
+    # read-time validator rejects an invalid delivery status
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute(
+            "CREATE TABLE _segment_exporters "
+            "(batch_id TEXT, exporter_id TEXT, delivery_status TEXT)"
+        )
+        connection.execute("INSERT INTO _segment_exporters VALUES ('b', 'alpha', 'bogus')")
+        with pytest.raises(ValueError):
+            load_exporters(connection, "b")
+    finally:
+        connection.close()
 
 
 def test_a_malformed_exporter_id_fails_closed(tmp_path: Path) -> None:

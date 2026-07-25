@@ -516,6 +516,40 @@ def test_a_committed_file_that_disagrees_with_any_ledger_field_is_not_healthy(
         database.close()
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        # add a well-formed extra exporter row
+        "INSERT INTO _segment_exporters (batch_id, exporter_id, delivery_status) "
+        "VALUES ('batch-1', 'extra', 'pending')",
+        # rename an exporter to a different valid identity
+        "UPDATE _segment_exporters SET exporter_id = 'renamed' "
+        "WHERE batch_id = 'batch-1' AND exporter_id = 'alpha'",
+        # remove one of several exporters (the sole-exporter deletion is covered separately)
+        "DELETE FROM _segment_exporters WHERE batch_id = 'batch-1' AND exporter_id = 'beta'",
+    ],
+)
+def test_an_exporter_set_change_in_any_direction_is_not_healthy(
+    tmp_path: Path, mutation: str
+) -> None:
+    # every mutation passes per-row validation (well-formed ids and statuses); only the exact
+    # identity-set comparison against the durable header can catch it
+    database, store, _spool_root, reconciler = _reconciler(tmp_path)
+    try:
+        header, frames = _segment(exporters=("alpha", "beta"))
+        store.commit_segment(header, frames, committed_at=_NOW)
+        with database.transaction() as connection:
+            connection.execute(mutation)
+        report = reconciler.reconcile()
+        assert report.healthy == 0
+        assert report.anomalies == (
+            SegmentAnomaly("batch-1", _DAY, "corrupt_file", "ledger_mismatch"),
+        )
+        assert report.registered == ()
+    finally:
+        database.close()
+
+
 def test_a_corrupt_committed_file_is_flagged(tmp_path: Path) -> None:
     database, store, spool_root, reconciler = _reconciler(tmp_path)
     try:
