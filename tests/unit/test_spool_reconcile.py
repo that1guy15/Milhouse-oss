@@ -202,6 +202,130 @@ def test_acquiring_the_writer_reconciles_orphans_before_any_commit(tmp_path: Pat
         database.close()
 
 
+def test_a_commit_through_a_long_lived_writer_registers_a_later_crash_orphan(
+    tmp_path: Path,
+) -> None:
+    # the gate review's reproduction: writer A outlives its constructor; writer B then crashes a
+    # commit after publication; a commit through A must register B's orphan BEFORE A's new row
+    database, barrier, spool_root = _control(tmp_path)
+    second = open_control_database(tmp_path / "control" / "milhouse.sqlite3")
+    try:
+        writer_a = DurableSpool(
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        assert writer_a.last_reconciliation.registered == ()
+
+        writer_b = DurableSpool(
+            database=second,
+            barrier=GlobalCommitBarrier(tmp_path / "control" / "commit.lock"),
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+
+        class _TxnFailDatabase:
+            @property
+            def connection(self) -> object:
+                return second.connection
+
+            def transaction(self) -> object:
+                raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
+
+        writer_b._database = _TxnFailDatabase()  # type: ignore[attr-defined]
+        between_header, between_frames = _segment(batch_id="between-1")
+        with pytest.raises(SpoolError) as crashed:
+            writer_b.commit_segment(between_header, between_frames, committed_at=_NOW)
+        assert crashed.value.code == "MH_SPOOL_COMMIT"
+        assert _count(database) == 0  # the orphan is durable but unregistered
+
+        later_header, later_frames = _segment(batch_id="later-2")
+        writer_a.commit_segment(later_header, later_frames, committed_at=_NOW)
+
+        # A's commit registered the orphan within its own critical section, before its new row
+        assert writer_a.last_reconciliation.registered == (OrphanRegistration("between-1", _DAY),)
+        origins = {r.batch_id: r.origin for r in writer_a.list_segments()}
+        assert origins == {"between-1": "reconciled", "later-2": "committed"}
+    finally:
+        second.close()
+        database.close()
+
+
+def test_a_same_batch_retry_through_a_long_lived_writer_converges(tmp_path: Path) -> None:
+    # the retry itself heals: the pre-commit scan registers the crash orphan, then publication
+    # refuses the existing name — the caller distinguishes done from colliding without re-acquiring
+    database, barrier, spool_root = _control(tmp_path)
+    try:
+        writer_a = DurableSpool(
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        header, frames = _segment(batch_id="batch-1")
+        _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
+
+        with pytest.raises(SpoolError) as retried:
+            writer_a.commit_segment(header, frames, committed_at=_NOW)
+        assert retried.value.code == "MH_SPOOL_EXISTS"
+        registered = writer_a.read_segment("batch-1")
+        assert registered is not None
+        assert registered.origin == "reconciled"
+        assert _count(database) == 1
+    finally:
+        database.close()
+
+
+def test_an_orphan_from_another_process_is_registered_by_a_commit(tmp_path: Path) -> None:
+    # cross-process interleaving: a separate OS process durably publishes an orphan after writer A
+    # was constructed; A's next commit registers it
+    import subprocess
+    import sys
+
+    database, barrier, spool_root = _control(tmp_path)
+    try:
+        writer_a = DurableSpool(
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        header, frames = _segment(batch_id="foreign-proc-1")
+        content_path = tmp_path / "content.bin"
+        content_path.write_bytes(build_segment_bytes(header, frames))
+        day_dir = spool_root / "pending" / _DAY
+        day_dir.mkdir(mode=0o700, parents=True)
+        os.chmod(spool_root / "pending", 0o700)
+        os.chmod(day_dir, 0o700)
+        script = (
+            "import pathlib, sys\n"
+            "from milhouse.spooling import publish_segment_bytes\n"
+            "content = pathlib.Path(sys.argv[1]).read_bytes()\n"
+            "publish_segment_bytes(pathlib.Path(sys.argv[2]), content)\n"
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(content_path),
+                str(day_dir / "foreign-proc-1.jsonl"),
+            ],
+            check=True,
+            timeout=60,
+        )
+
+        later_header, later_frames = _segment(batch_id="later-2")
+        writer_a.commit_segment(later_header, later_frames, committed_at=_NOW)
+        assert writer_a.last_reconciliation.registered == (
+            OrphanRegistration("foreign-proc-1", _DAY),
+        )
+        assert {r.batch_id for r in writer_a.list_segments()} == {"foreign-proc-1", "later-2"}
+    finally:
+        database.close()
+
+
 def test_acquisition_barrier_failure_surfaces_a_spool_error(tmp_path: Path) -> None:
     database, barrier, spool_root = _control(tmp_path)
     os.chmod(tmp_path / "control" / "commit.lock", 0o644)  # a tampered lock fails the secure open
@@ -233,6 +357,12 @@ def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) ->
         header, frames = _segment(batch_id="batch-1")
 
         class _TxnFailDatabase:
+            # reads (the pre-commit scan) succeed; only the write-side boundary fails, exactly
+            # like a crash between publication and the ledger insert
+            @property
+            def connection(self) -> object:
+                return database.connection
+
             def transaction(self) -> object:
                 raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
 
@@ -262,18 +392,26 @@ def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) ->
         database.close()
 
 
-def test_acquisition_reconciles_under_the_exclusive_barrier_side(tmp_path: Path) -> None:
-    # pin the barrier MODE: acquisition must reconcile under exclusive() (a regression to shared()
-    # would let two concurrent acquisitions scan the same orphan) and a commit under shared()
+def test_the_no_gap_lock_protocol_holds_exclusive_across_reconcile_and_commit(
+    tmp_path: Path,
+) -> None:
+    # pin the no-gap protocol: acquisition reconciles under ONE exclusive hold, and every commit
+    # runs reconcile+publish+insert under ONE exclusive hold — never a shared publish, never an
+    # unlock window between reconciliation and publication
     database, _barrier, spool_root = _control(tmp_path)
     calls: list[str] = []
+    held_through_publish: list[bool] = []
+    pending = spool_root / "pending"
 
     class _SpyBarrier(GlobalCommitBarrier):
         @contextlib.contextmanager
         def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
             calls.append("exclusive")
+            before = pending.exists()
             with super().exclusive(blocking=blocking):
                 yield
+            # if publication happened during THIS single hold, pending appears while it was held
+            held_through_publish.append(not before and pending.exists())
 
         @contextlib.contextmanager
         def shared(self, *, blocking: bool = True) -> Iterator[None]:
@@ -291,7 +429,9 @@ def test_acquisition_reconciles_under_the_exclusive_barrier_side(tmp_path: Path)
         assert calls == ["exclusive"]
         header, frames = _segment()
         store.commit_segment(header, frames, committed_at=_NOW)
-        assert calls == ["exclusive", "shared"]
+        # exactly one more exclusive hold covered the whole reconcile+publish+insert; no shared use
+        assert calls == ["exclusive", "exclusive"]
+        assert held_through_publish == [False, True]
     finally:
         database.close()
 

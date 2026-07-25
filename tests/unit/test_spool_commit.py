@@ -558,9 +558,9 @@ def test_spool_directories_are_created_inside_the_barrier(tmp_path: Path) -> Non
 
     class _AssertingBarrier:
         @contextlib.contextmanager
-        def shared(self, *, blocking: bool = True) -> Iterator[None]:
+        def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
             assert not pending.exists()  # no namespace mutation before the barrier is held
-            with real_barrier.shared(blocking=blocking):
+            with real_barrier.exclusive(blocking=blocking):
                 yield
 
     store._barrier = _AssertingBarrier()  # type: ignore[attr-defined]
@@ -586,7 +586,9 @@ def test_a_duplicate_batch_fails_closed_without_touching_the_ledger(tmp_path: Pa
         database.close()
 
 
-def test_a_ledger_failure_after_publication_is_commit_uncertain(tmp_path: Path) -> None:
+def test_an_unreadable_ledger_fails_the_commit_before_any_publication(tmp_path: Path) -> None:
+    # the pre-commit mandatory scan reads the ledger first: a broken ledger now fails closed
+    # BEFORE any file is published, instead of leaving a commit-uncertain orphan
     database, store, spool_root = _spool(tmp_path)
     try:
         with database.transaction() as connection:
@@ -594,10 +596,10 @@ def test_a_ledger_failure_after_publication_is_commit_uncertain(tmp_path: Path) 
         frames = _frames()
         with pytest.raises(SpoolError) as captured:
             store.commit_segment(_header(frames), frames, committed_at=_NOW)
-        assert captured.value.code == "MH_SPOOL_COMMIT"
+        assert captured.value.code == "MH_SPOOL_LEDGER"
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
-        assert (spool_root / "pending" / _DAY / "batch-1.jsonl").exists()  # a registrable orphan
+        assert not (spool_root / "pending").exists()  # nothing was published
     finally:
         database.close()
 
@@ -608,6 +610,12 @@ def test_a_transaction_boundary_failure_after_publication_is_commit_uncertain(
     database, store, spool_root = _spool(tmp_path)
 
     class _TxnFailDatabase:
+        # reads (the pre-commit scan) succeed against the real connection; only the write-side
+        # transaction boundary fails, exactly like a crash between publication and the insert
+        @property
+        def connection(self) -> object:
+            return database.connection
+
         def transaction(self) -> object:
             raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
 
