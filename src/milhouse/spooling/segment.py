@@ -30,7 +30,7 @@ MAX_HEADER_LINE_BYTES = 8_192
 MAX_FRAME_LINE_BYTES = 262_144 + 1_024  # a canonical record plus the small frame envelope
 MAX_RETENTION_DAYS = 3_650  # matches the config `[retention]` ceiling
 
-_BATCH_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", flags=re.ASCII)
+BATCH_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", flags=re.ASCII)
 EXPORTER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", flags=re.ASCII)
 _TARGET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", flags=re.ASCII)
 _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
@@ -44,7 +44,7 @@ def _fail(code: str, message: str) -> NoReturn:
 
 
 def _validate_batch_id(value: object) -> None:
-    if type(value) is not str or _BATCH_ID_PATTERN.fullmatch(value) is None:
+    if type(value) is not str or BATCH_ID_PATTERN.fullmatch(value) is None:
         _fail("MH_SPOOL_BATCH_ID", "a bounded safe batch id is required")
 
 

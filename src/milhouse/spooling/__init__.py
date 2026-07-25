@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-from milhouse.spooling.commit import (
-    DurableSpool,
-    ExporterDelivery,
-    SegmentRecord,
-)
+from milhouse.spooling.commit import DurableSpool
 from milhouse.spooling.errors import SpoolError
+from milhouse.spooling.ledger import ExporterDelivery, SegmentRecord
 from milhouse.spooling.reader import (
     ParsedSegment,
     parse_segment_bytes,
     read_trusted_segment,
     read_untrusted_segment,
+)
+from milhouse.spooling.reconcile import (
+    OrphanRegistration,
+    ReconciliationReport,
+    SegmentAnomaly,
+    SpoolReconciler,
+    run_reconciliation_scan,
 )
 from milhouse.spooling.segment import (
     SegmentHeaderV1,
@@ -30,16 +34,21 @@ from milhouse.spooling.writer import (
 __all__ = [
     "DurableSpool",
     "ExporterDelivery",
+    "OrphanRegistration",
     "ParsedSegment",
+    "ReconciliationReport",
+    "SegmentAnomaly",
     "SegmentHeaderV1",
     "SegmentRecord",
     "SpoolError",
     "SpoolFrameV1",
+    "SpoolReconciler",
     "build_segment_bytes",
     "parse_segment_bytes",
     "publish_segment_bytes",
     "read_trusted_segment",
     "read_untrusted_segment",
+    "run_reconciliation_scan",
     "spool_content_sha256",
     "spool_frame_line",
     "spool_segment_header_line",

@@ -30,7 +30,7 @@ from milhouse.spooling import (
     spool_content_sha256,
     spool_frame_line,
 )
-from milhouse.spooling.commit import _authorize, _validated_segment
+from milhouse.spooling.ledger import authorize_local_persistence, validated_segment
 from milhouse.state import (
     GlobalCommitBarrier,
     StateError,
@@ -121,14 +121,16 @@ def _spool(tmp_path: Path):
     spool_root = tmp_path / "spool"
     spool_root.mkdir(mode=0o700)
     os.chmod(spool_root, 0o700)
-    store = DurableSpool(database=database, barrier=barrier, spool_root=spool_root)
+    store = DurableSpool(
+        database=database, barrier=barrier, spool_root=spool_root, installation_id=_INSTALLATION_ID
+    )
     return database, store, spool_root
 
 
 def test_migration_creates_the_segment_and_exporter_ledgers(tmp_path: Path) -> None:
     database, _store, _spool_root = _spool(tmp_path)
     try:
-        assert schema_version(database) == 2
+        assert schema_version(database) == 3
         tables = {
             row[0]
             for row in database.connection.execute(
@@ -294,6 +296,7 @@ _VALID_ROW: tuple[object, ...] = (
     100,
     "d" * 64,
     "2026-07-24T00:00:00.000Z",
+    "committed",
 )
 
 
@@ -304,10 +307,11 @@ def _mutate(index: int, value: object) -> tuple[object, ...]:
 
 
 def test_a_valid_row_reconstructs_a_segment_record() -> None:
-    record = _validated_segment(_VALID_ROW, ())
+    record = validated_segment(_VALID_ROW, ())
     assert record.batch_id == "batch-1"
     assert record.day == _DAY
     assert record.committed_at == "2026-07-24T00:00:00.000Z"
+    assert record.origin == "committed"
 
 
 @pytest.mark.parametrize(
@@ -329,11 +333,12 @@ def test_a_valid_row_reconstructs_a_segment_record() -> None:
         _mutate(12, "z" * 64),  # file digest: not hex
         _mutate(13, "not-a-stamp"),  # committed_at: not a canonical stamp
         _mutate(13, "2025-01-01T00:00:00.000Z"),  # canonical stamp, wrong day
+        _mutate(14, "bogus"),  # origin: not a known origin
     ],
 )
 def test_every_semantically_invalid_column_is_rejected(row: tuple[object, ...]) -> None:
     with pytest.raises(ValueError):
-        _validated_segment(row, ())
+        validated_segment(row, ())
 
 
 def test_a_malformed_exporter_id_fails_closed(tmp_path: Path) -> None:
@@ -375,13 +380,13 @@ def test_check_constraints_reject_an_invalid_write(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("privacy_class", ["public", "internal", "sensitive"])
 def test_authorize_admits_every_local_persistable_class(privacy_class: str) -> None:
-    _authorize(privacy_class)  # returns without raising
+    authorize_local_persistence(privacy_class)  # returns without raising
 
 
 def test_authorize_denies_a_restricted_class() -> None:
     # Defense behind the header check: if a restricted class reached commit, egress would deny it.
     with pytest.raises(SpoolError) as captured:
-        _authorize("restricted")
+        authorize_local_persistence("restricted")
     assert captured.value.code == "MH_SPOOL_EGRESS"
 
 
@@ -390,12 +395,35 @@ def test_the_store_rejects_a_non_control_database_or_barrier(tmp_path: Path) -> 
     barrier = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")
     try:
         with pytest.raises(SpoolError) as database_error:
-            DurableSpool(database=object(), barrier=barrier, spool_root=spool_root)  # type: ignore[arg-type]
+            DurableSpool(
+                database=object(),  # type: ignore[arg-type]
+                barrier=barrier,
+                spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
+            )
         assert database_error.value.code == "MH_SPOOL_STORE"
         with pytest.raises(SpoolError) as barrier_error:
-            DurableSpool(database=database, barrier=object(), spool_root=spool_root)  # type: ignore[arg-type]
+            DurableSpool(
+                database=database,
+                barrier=object(),  # type: ignore[arg-type]
+                spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
+            )
         assert barrier_error.value.code == "MH_SPOOL_STORE"
     finally:
+        database.close()
+
+
+def test_commit_reports_a_barrier_acquisition_failure(tmp_path: Path) -> None:
+    database, store, _spool_root = _spool(tmp_path)
+    os.chmod(tmp_path / "control" / "commit.lock", 0o644)  # tamper the lock after acquisition
+    try:
+        frames = _frames()
+        with pytest.raises(SpoolError) as captured:
+            store.commit_segment(_header(frames), frames, committed_at=_NOW)
+        assert captured.value.code == "MH_SPOOL_BARRIER"
+    finally:
+        os.chmod(tmp_path / "control" / "commit.lock", 0o600)
         database.close()
 
 
@@ -428,6 +456,7 @@ def test_the_store_rejects_a_mismatched_barrier_or_spool_root(tmp_path: Path) ->
                 database=database,
                 barrier=GlobalCommitBarrier(foreign / "commit.lock"),
                 spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
             )
         assert barrier_error.value.code == "MH_SPOOL_STORE"
         with pytest.raises(SpoolError) as spool_error:
@@ -435,6 +464,7 @@ def test_the_store_rejects_a_mismatched_barrier_or_spool_root(tmp_path: Path) ->
                 database=database,
                 barrier=GlobalCommitBarrier(tmp_path / "control" / "commit.lock"),
                 spool_root=foreign,
+                installation_id=_INSTALLATION_ID,
             )
         assert spool_error.value.code == "MH_SPOOL_STORE"
         # A barrier beside the database but on a different lock file shares no flock with
@@ -444,8 +474,17 @@ def test_the_store_rejects_a_mismatched_barrier_or_spool_root(tmp_path: Path) ->
                 database=database,
                 barrier=GlobalCommitBarrier(tmp_path / "control" / "other.lock"),
                 spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
             )
         assert wrong_lock.value.code == "MH_SPOOL_STORE"
+        with pytest.raises(SpoolError) as id_error:
+            DurableSpool(
+                database=database,
+                barrier=GlobalCommitBarrier(tmp_path / "control" / "commit.lock"),
+                spool_root=spool_root,
+                installation_id="bad",
+            )
+        assert id_error.value.code == "MH_SPOOL_IDENTITY"
     finally:
         database.close()
 

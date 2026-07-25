@@ -445,7 +445,7 @@ def test_reader_installation_pattern_matches_the_domain(candidate: str) -> None:
 
     from milhouse.domain.identity import InstallationIdV1
 
-    reader_accepts = reader_module._INSTALLATION_ID_PATTERN.fullmatch(candidate) is not None
+    reader_accepts = reader_module.INSTALLATION_ID_PATTERN.fullmatch(candidate) is not None
     try:
         TypeAdapter(InstallationIdV1).validate_python(candidate)
         domain_accepts = True

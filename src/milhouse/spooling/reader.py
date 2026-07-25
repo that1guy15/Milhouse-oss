@@ -72,7 +72,7 @@ _TRUSTED_FILE_MODE = 0o600
 # The same installation-id shape the domain enforces (identity.py InstallationIdV1), validated at
 # the trusted-reader boundary so a malformed value fails closed as a fixed code rather than leaking
 # out of a downstream pydantic error.
-_INSTALLATION_ID_PATTERN = re.compile(
+INSTALLATION_ID_PATTERN = re.compile(
     r"mh_in1_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}", flags=re.ASCII
 )
 
@@ -297,7 +297,7 @@ def parse_segment_bytes(content: bytes) -> ParsedSegment:
 def _require_installation_id(installation_id: str) -> None:
     if (
         type(installation_id) is not str
-        or _INSTALLATION_ID_PATTERN.fullmatch(installation_id) is None
+        or INSTALLATION_ID_PATTERN.fullmatch(installation_id) is None
     ):
         # Contained here so a malformed caller-supplied id never reaches a downstream pydantic error
         # that would echo the rejected input.
