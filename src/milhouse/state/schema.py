@@ -68,6 +68,18 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX _segment_exporters_by_status ON _segment_exporters (delivery_status)",
         ),
     ),
+    Migration(
+        3,
+        "add_segment_origin",
+        (
+            # Reconciliation registers a durably-published-but-unrecorded orphan segment whose exact
+            # commit instant is lost, so it records a reconstructed day-start committed_at and marks
+            # the row 'reconciled'. A normal commit omits the column and defaults to 'committed', so
+            # the ledger never asserts a false precise commit time as if it were original.
+            "ALTER TABLE _segments ADD COLUMN origin TEXT NOT NULL DEFAULT 'committed' "
+            "CHECK (origin IN ('committed', 'reconciled'))",
+        ),
+    ),
 )
 
 
