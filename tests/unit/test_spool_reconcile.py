@@ -34,6 +34,7 @@ from milhouse.spooling import reconcile as reconcile_module
 from milhouse.spooling.reconcile import _fingerprint
 from milhouse.state import (
     GlobalCommitBarrier,
+    StateError,
     initialize_control_state,
     open_control_database,
 )
@@ -216,6 +217,156 @@ def test_acquisition_barrier_failure_surfaces_a_spool_error(tmp_path: Path) -> N
     finally:
         os.chmod(tmp_path / "control" / "commit.lock", 0o600)
         database.close()
+
+
+def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) -> None:
+    # end-to-end convergence: crash a real commit after publication, re-acquire via the normal
+    # writer API, and prove a same-batch retry is distinguishable from an unrecoverable collision
+    database, barrier, spool_root = _control(tmp_path)
+    try:
+        store = DurableSpool(
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        header, frames = _segment(batch_id="batch-1")
+
+        class _TxnFailDatabase:
+            def transaction(self) -> object:
+                raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
+
+        store._database = _TxnFailDatabase()  # type: ignore[attr-defined]
+        with pytest.raises(SpoolError) as crashed:
+            store.commit_segment(header, frames, committed_at=_NOW)
+        assert crashed.value.code == "MH_SPOOL_COMMIT"  # published durably, no ledger row
+        assert _count(database) == 0
+
+        # a fresh acquisition through the normal writer API registers the crash artifact...
+        recovered = DurableSpool(
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        registered = recovered.read_segment("batch-1")
+        assert registered is not None
+        assert registered.origin == "reconciled"
+        # ...so a retry of the SAME batch converges: publication refuses the existing name while
+        # the ledger already carries the batch, letting the caller distinguish done from colliding
+        with pytest.raises(SpoolError) as retried:
+            recovered.commit_segment(header, frames, committed_at=_NOW)
+        assert retried.value.code == "MH_SPOOL_EXISTS"
+        assert _count(database) == 1  # no duplicate ledger rows from the retry
+    finally:
+        database.close()
+
+
+def test_acquisition_reconciles_under_the_exclusive_barrier_side(tmp_path: Path) -> None:
+    # pin the barrier MODE: acquisition must reconcile under exclusive() (a regression to shared()
+    # would let two concurrent acquisitions scan the same orphan) and a commit under shared()
+    database, _barrier, spool_root = _control(tmp_path)
+    calls: list[str] = []
+
+    class _SpyBarrier(GlobalCommitBarrier):
+        @contextlib.contextmanager
+        def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
+            calls.append("exclusive")
+            with super().exclusive(blocking=blocking):
+                yield
+
+        @contextlib.contextmanager
+        def shared(self, *, blocking: bool = True) -> Iterator[None]:
+            calls.append("shared")
+            with super().shared(blocking=blocking):
+                yield
+
+    try:
+        store = DurableSpool(
+            database=database,
+            barrier=_SpyBarrier(tmp_path / "control" / "commit.lock"),
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        assert calls == ["exclusive"]
+        header, frames = _segment()
+        store.commit_segment(header, frames, committed_at=_NOW)
+        assert calls == ["exclusive", "shared"]
+    finally:
+        database.close()
+
+
+def test_a_second_writer_acquisition_waits_for_the_exclusive_barrier(tmp_path: Path) -> None:
+    import threading
+
+    database, barrier, spool_root = _control(tmp_path)
+    header, frames = _segment(batch_id="orphan-1")
+    _publish_orphan(spool_root, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames))
+    acquired = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def _acquire() -> None:
+        # a second writer with its own connection and barrier descriptor (SQLite connections are
+        # thread-bound, and a separate flock descriptor genuinely contends with the held lock)
+        second = open_control_database(tmp_path / "control" / "milhouse.sqlite3")
+        try:
+            store = DurableSpool(
+                database=second,
+                barrier=GlobalCommitBarrier(tmp_path / "control" / "commit.lock"),
+                spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
+            )
+            outcome["registered"] = store.last_reconciliation.registered
+        finally:
+            second.close()
+        acquired.set()
+
+    try:
+        with barrier.exclusive():
+            worker = threading.Thread(target=_acquire, daemon=True)
+            worker.start()
+            # while the first writer holds the exclusive barrier, the second cannot finish acquiring
+            assert not acquired.wait(timeout=0.5)
+        assert acquired.wait(timeout=10)  # released: the queued acquisition completes...
+        assert outcome["registered"] == (OrphanRegistration("orphan-1", _DAY),)  # ...and reconciled
+    finally:
+        database.close()
+
+
+def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> None:
+    import milhouse.spooling as spooling
+
+    # Pin the export surface: the only exported symbol that both publishes a segment and registers
+    # it in the ledger is DurableSpool, whose acquisition mandatorily reconciles.
+    # publish_segment_bytes/write_spool_segment publish FILES only (a crash-equivalent orphan that
+    # the next acquisition registers), and run_reconciliation_scan IS the reconciliation itself.
+    # No ledger-writing helper is exported; widening this surface is a deliberate, reviewed change.
+    assert set(spooling.__all__) == {
+        "DurableSpool",
+        "ExporterDelivery",
+        "OrphanRegistration",
+        "ParsedSegment",
+        "ReconciliationReport",
+        "SegmentAnomaly",
+        "SegmentHeaderV1",
+        "SegmentRecord",
+        "SpoolError",
+        "SpoolFrameV1",
+        "SpoolReconciler",
+        "build_segment_bytes",
+        "parse_segment_bytes",
+        "publish_segment_bytes",
+        "read_trusted_segment",
+        "read_untrusted_segment",
+        "run_reconciliation_scan",
+        "spool_content_sha256",
+        "spool_frame_line",
+        "spool_segment_header_line",
+        "write_spool_segment",
+    }
+    assert "insert_segment_row" not in spooling.__all__
+    with pytest.raises(TypeError):
+        DurableSpool(database=None, barrier=None, spool_root="x")  # type: ignore[call-arg]
 
 
 # --- orphan registration -------------------------------------------------------------------------
