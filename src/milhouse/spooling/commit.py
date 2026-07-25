@@ -178,33 +178,27 @@ class DurableSpool:
         return self._last_reconciliation
 
     def _reconcile_exclusively(self, action: Callable[[], None] | None) -> ReconciliationReport:
-        """Hold the exclusive barrier across mandatory reconciliation and an optional commit action.
+        """Run mandatory reconciliation and an optional commit action in one exclusive hold.
 
-        There is deliberately no unlock window between reconciliation and the action: another
-        writer's crash orphan can never appear between recovery and this writer's publication.
+        The barrier-owning wrapper in the reconcile module acquires the exclusive side itself and
+        passes its live authority token to the scan, so there is no unlock window between recovery
+        and the action and no call path that can scan without owning the barrier.
         """
 
         # Imported here to keep the reconcile module's dependency on the ledger one-directional.
-        from milhouse.spooling.reconcile import _run_reconciliation_scan
+        from milhouse.spooling.reconcile import _reconcile_under_barrier
 
-        report: ReconciliationReport | None = None
-        barrier_failed = False
-        try:
-            with self._barrier.exclusive():
-                report = _run_reconciliation_scan(
-                    database=self._database,
-                    spool_root=self._spool_root,
-                    installation_id=self._installation_id,
-                )
-                self._last_reconciliation = report
-                if action is not None and report.complete:
-                    action()
-        except StateError:
-            # The scan and ledger paths remap their own StateErrors; this only catches a
-            # barrier-acquisition failure so the writer API never surfaces a non-MH_SPOOL_* error.
-            barrier_failed = True
-        if barrier_failed or report is None:
-            _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
+        def _observe(report: ReconciliationReport) -> None:
+            self._last_reconciliation = report
+
+        report = _reconcile_under_barrier(
+            database=self._database,
+            barrier=self._barrier,
+            spool_root=self._spool_root,
+            installation_id=self._installation_id,
+            action=action,
+            observe=_observe,
+        )
         if not report.complete:
             # A truncated inventory cannot prove orphan absence or batch uniqueness, so mandatory
             # recovery fails closed: neither acquisition nor a commit may proceed on a partial view.

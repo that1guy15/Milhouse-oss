@@ -132,6 +132,25 @@ def _close(descriptor: int) -> None:
         pass
 
 
+class ExclusiveHold:
+    """An authority token proving a live exclusive barrier hold.
+
+    Only :meth:`GlobalCommitBarrier.exclusive` activates a hold, and it deactivates the token when
+    the context exits, so code requiring exclusive authority validates ``hold.active`` at runtime
+    instead of trusting a docstring precondition. A directly constructed token is never active, and
+    a token captured from a completed hold is stale and inactive.
+    """
+
+    __slots__ = ("_active",)
+
+    def __init__(self) -> None:
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+
 class GlobalCommitBarrier:
     """A cross-process, writer-preferring readers-writer commit barrier over one lock file pair."""
 
@@ -174,21 +193,28 @@ class GlobalCommitBarrier:
             _close(main_fd)
 
     @contextmanager
-    def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
-        """Hold the exclusive side; block new shared entrants and drain existing ones."""
+    def exclusive(self, *, blocking: bool = True) -> Iterator[ExclusiveHold]:
+        """Hold the exclusive side; block new shared entrants and drain existing ones.
+
+        Yields an :class:`ExclusiveHold` authority token that is active only for the lifetime of
+        the hold, so exclusive-only operations can validate their authority at runtime.
+        """
 
         main_fd = _secure_lock_descriptor(self._path)
         gate_fd: int | None = None
         gate_held = False
         main_held = False
+        hold = ExclusiveHold()
         try:
             gate_fd = _secure_lock_descriptor(self._gate_path)
             _acquire(gate_fd, fcntl.LOCK_EX, blocking=blocking)
             gate_held = True
             _acquire(main_fd, fcntl.LOCK_EX, blocking=blocking)
             main_held = True
-            yield
+            hold._active = True
+            yield hold
         finally:
+            hold._active = False
             if main_held:
                 _release(main_fd)
             if gate_held and gate_fd is not None:

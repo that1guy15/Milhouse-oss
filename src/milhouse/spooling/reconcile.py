@@ -31,6 +31,7 @@ import re
 import sqlite3
 import stat
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -58,7 +59,7 @@ from milhouse.spooling.segment import (
     FRAME_VERSION,
     SCHEMA_VERSION,
 )
-from milhouse.state.barrier import GlobalCommitBarrier
+from milhouse.state.barrier import ExclusiveHold, GlobalCommitBarrier
 from milhouse.state.database import ControlDatabase
 from milhouse.state.errors import StateError
 
@@ -215,18 +216,42 @@ def _secure_dir_names(
     return names, identity, None
 
 
-def _run_reconciliation_scan(
-    *, database: ControlDatabase, spool_root: str | Path, installation_id: str
+def _reconcile_under_barrier(
+    *,
+    database: ControlDatabase,
+    barrier: GlobalCommitBarrier,
+    spool_root: str | Path,
+    installation_id: str,
+    action: Callable[[], None] | None = None,
+    observe: Callable[[ReconciliationReport], None] | None = None,
 ) -> ReconciliationReport:
-    """Run the raw mutating scan. INTERNAL: only barrier-owning entrypoints may call this.
+    """The only reconciliation entrypoint: acquires the exclusive barrier itself, then scans.
 
-    This function is deliberately not exported: it mutates the ledger and cannot itself verify the
-    exclusive barrier, so the only supported reconciliation entrypoints are
-    :class:`milhouse.spooling.commit.DurableSpool` (construction and every commit) and
-    :meth:`SpoolReconciler.reconcile`, each of which acquires the exclusive barrier around it.
+    There is no standalone callable that executes the scan without owning barrier authority: this
+    wrapper acquires the exclusive side and passes the live :class:`ExclusiveHold` token to
+    :meth:`_Scan.run`, which validates it before its first ledger read — so even a direct internal
+    call of the scan fails closed before any mutation. ``action`` (the commit path's
+    publish+ledger callback) runs inside the same hold when the scan is complete, preserving the
+    no-gap reconcile-to-commit handoff; ``observe`` receives the report inside the hold before the
+    action runs, so a caller records it even when the action then fails.
     """
 
-    return _Scan(database, lexical_absolute_path(spool_root), installation_id).run()
+    report: ReconciliationReport | None = None
+    barrier_failed = False
+    try:
+        with barrier.exclusive() as hold:
+            report = _Scan(database, lexical_absolute_path(spool_root), installation_id).run(hold)
+            if observe is not None:
+                observe(report)
+            if action is not None and report.complete:
+                action()
+    except StateError:
+        # The scan and ledger paths remap their own StateErrors; this only catches a
+        # barrier-acquisition failure so callers never surface a non-MH_SPOOL_* error.
+        barrier_failed = True
+    if barrier_failed or report is None:
+        _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
+    return report
 
 
 class _Scan:
@@ -255,7 +280,11 @@ class _Scan:
         self._stopped = False
         self._complete = True
 
-    def run(self) -> ReconciliationReport:
+    def run(self, authority: ExclusiveHold) -> ReconciliationReport:
+        if not isinstance(authority, ExclusiveHold) or not authority.active:
+            # Validated BEFORE the first ledger read: a direct call without a live exclusive hold
+            # fails closed with no mutation. Underscore convention is not enforcement; this is.
+            _fail("MH_SPOOL_BARRIER", "reconciliation requires a live exclusive barrier hold")
         ledger, malformed = self._ledger_index()
         for batch_id in sorted(malformed):
             # the batch id came from a row that failed validation, so it may not be well formed
@@ -524,17 +553,9 @@ class SpoolReconciler:
     def reconcile(self) -> ReconciliationReport:
         """Scan pending against the ledger under the exclusive barrier; register valid orphans."""
 
-        report: ReconciliationReport | None = None
-        barrier_failed = False
-        try:
-            with self._barrier.exclusive():
-                report = _run_reconciliation_scan(
-                    database=self._database,
-                    spool_root=self._spool_root,
-                    installation_id=self._installation_id,
-                )
-        except StateError:
-            barrier_failed = True
-        if barrier_failed or report is None:
-            _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
-        return report
+        return _reconcile_under_barrier(
+            database=self._database,
+            barrier=self._barrier,
+            spool_root=self._spool_root,
+            installation_id=self._installation_id,
+        )

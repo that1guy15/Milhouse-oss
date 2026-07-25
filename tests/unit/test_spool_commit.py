@@ -558,10 +558,10 @@ def test_spool_directories_are_created_inside_the_barrier(tmp_path: Path) -> Non
 
     class _AssertingBarrier:
         @contextlib.contextmanager
-        def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
+        def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
             assert not pending.exists()  # no namespace mutation before the barrier is held
-            with real_barrier.exclusive(blocking=blocking):
-                yield
+            with real_barrier.exclusive(blocking=blocking) as hold:
+                yield hold
 
     store._barrier = _AssertingBarrier()  # type: ignore[attr-defined]
     try:

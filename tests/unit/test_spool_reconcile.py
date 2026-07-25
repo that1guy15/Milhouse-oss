@@ -404,11 +404,11 @@ def test_the_no_gap_lock_protocol_holds_exclusive_across_reconcile_and_commit(
 
     class _SpyBarrier(GlobalCommitBarrier):
         @contextlib.contextmanager
-        def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
+        def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
             calls.append("exclusive")
             before = pending.exists()
-            with super().exclusive(blocking=blocking):
-                yield
+            with super().exclusive(blocking=blocking) as hold:
+                yield hold
             # if publication happened during THIS single hold, pending appears while it was held
             held_through_publish.append(not before and pending.exists())
 
@@ -514,25 +514,25 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
 def test_every_reconciliation_entrypoint_holds_exclusive_before_mutating(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # spy on the internal scan: when any supported entrypoint invokes it, the exclusive barrier must
-    # already be held (a probe acquisition from a second descriptor must fail BUSY)
+    # spy on the scan body itself: whenever any supported entrypoint reaches it, the exclusive
+    # barrier must already be held (a probe acquisition from a second descriptor fails BUSY) and the
+    # authority token passed to it must be live
     database, barrier, spool_root = _control(tmp_path)
     probe = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")
-    real_scan = reconcile_module._run_reconciliation_scan
-    held_checks: list[bool] = []
+    real_run = reconcile_module._Scan.run
+    held_checks: list[tuple[bool, bool]] = []
 
-    def _asserting_scan(**kwargs: object):  # type: ignore[no-untyped-def]
+    def _asserting_run(self, authority):  # type: ignore[no-untyped-def]
         blocked = False
         try:
             with probe.exclusive(blocking=False):
                 pass
         except StateError:
             blocked = True
-        held_checks.append(blocked)
-        return real_scan(**kwargs)  # type: ignore[arg-type]
+        held_checks.append((blocked, bool(getattr(authority, "active", False))))
+        return real_run(self, authority)
 
-    monkeypatch.setattr(reconcile_module, "_run_reconciliation_scan", _asserting_scan)
-    monkeypatch.setattr("milhouse.spooling.reconcile._run_reconciliation_scan", _asserting_scan)
+    monkeypatch.setattr(reconcile_module._Scan, "run", _asserting_run)
     try:
         store = DurableSpool(  # entrypoint 1: writer acquisition
             database=database,
@@ -549,7 +549,67 @@ def test_every_reconciliation_entrypoint_holds_exclusive_before_mutating(
             installation_id=_INSTALLATION_ID,
         )
         reconciler.reconcile()  # entrypoint 3: the explicit startup pass
-        assert held_checks == [True, True, True]  # exclusive was held at every scan invocation
+        # exclusive was held and the authority token live at every scan invocation
+        assert held_checks == [(True, True), (True, True), (True, True)]
+    finally:
+        database.close()
+
+
+def test_a_direct_unheld_scan_call_fails_before_any_mutation(tmp_path: Path) -> None:
+    # the re-review's reproduction: the raw scan body must be impossible to run without owning
+    # barrier authority — a direct internal call with no live hold fails before touching the ledger
+    from milhouse.state.barrier import ExclusiveHold
+
+    database, barrier, spool_root = _control(tmp_path)
+    header, frames = _segment(batch_id="orphan-1")
+    _publish_orphan(spool_root, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames))
+    try:
+        assert not hasattr(reconcile_module, "_run_reconciliation_scan")  # the old bypass is gone
+        for bogus_authority in (None, object(), ExclusiveHold()):  # absent, foreign, inactive
+            scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
+            with pytest.raises(SpoolError) as captured:
+                scan.run(bogus_authority)  # type: ignore[arg-type]
+            assert captured.value.code == "MH_SPOOL_BARRIER"
+        # a STALE token captured from a completed hold is inactive and equally refused
+        with barrier.exclusive() as hold:
+            pass
+        assert not hold.active
+        with pytest.raises(SpoolError) as stale:
+            reconcile_module._Scan(database, spool_root, _INSTALLATION_ID).run(hold)
+        assert stale.value.code == "MH_SPOOL_BARRIER"
+        # nothing mutated: the orphan remains unregistered and both tables are unchanged
+        assert _count(database) == 0
+        assert _count(database, "_segment_exporters") == 0
+    finally:
+        database.close()
+
+
+def test_the_barrier_wrapper_acquires_exclusive_itself(tmp_path: Path) -> None:
+    # the only module-level reconciliation callable owns the barrier: a probe acquisition from a
+    # second descriptor fails busy while its observe callback runs
+    database, barrier, spool_root = _control(tmp_path)
+    probe = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")
+    held: list[bool] = []
+
+    def _observe(_report: object) -> None:
+        blocked = False
+        try:
+            with probe.exclusive(blocking=False):
+                pass
+        except StateError:
+            blocked = True
+        held.append(blocked)
+
+    try:
+        report = reconcile_module._reconcile_under_barrier(
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+            observe=_observe,
+        )
+        assert held == [True]
+        assert report.complete
     finally:
         database.close()
 
@@ -1552,10 +1612,10 @@ def test_reconciliation_happens_inside_the_exclusive_barrier(tmp_path: Path) -> 
 
     class _AssertingBarrier:
         @contextlib.contextmanager
-        def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
+        def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
             assert _count(database) == 0  # not yet registered when the exclusive lock is taken
-            with real_barrier.exclusive(blocking=blocking):
-                yield
+            with real_barrier.exclusive(blocking=blocking) as hold:
+                yield hold
 
     reconciler._barrier = _AssertingBarrier()  # type: ignore[attr-defined]
     try:
