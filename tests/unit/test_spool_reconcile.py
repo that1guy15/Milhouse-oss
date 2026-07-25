@@ -722,6 +722,86 @@ def test_a_non_canonical_day_directory_is_rejected_without_a_poison_row(
         database.close()
 
 
+def test_a_regular_file_where_a_day_directory_belongs_is_unsafe(tmp_path: Path) -> None:
+    # a valid day NAME that is not a directory: the O_DIRECTORY open fails ENOTDIR and the entry is
+    # reported unsafe, never listed or followed
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    try:
+        pending = spool_root / "pending"
+        pending.mkdir(mode=0o700)
+        os.chmod(pending, 0o700)
+        (pending / _DAY).write_bytes(b"not a directory")
+        report = reconciler.reconcile()
+        assert report.anomalies == (SegmentAnomaly("", _DAY, "foreign_name", "day_unsafe"),)
+        assert report.scanned == 0
+    finally:
+        database.close()
+
+
+def test_an_overlong_foreign_file_name_is_fingerprinted(tmp_path: Path) -> None:
+    # a near-NAME_MAX entry name never reaches the report raw; the batch-id pattern (max 128) fails
+    # and only the fixed-length fingerprint is recorded
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    try:
+        name = "n" * 240 + ".jsonl"
+        day_dir = spool_root / "pending" / _DAY
+        day_dir.mkdir(mode=0o700, parents=True)
+        os.chmod(spool_root / "pending", 0o700)
+        os.chmod(day_dir, 0o700)
+        (day_dir / name).write_bytes(b"x")
+        os.chmod(day_dir / name, 0o600)
+        report = reconciler.reconcile()
+        assert report.anomalies == (
+            SegmentAnomaly(_fingerprint(name), _DAY, "foreign_name", "batch_id"),
+        )
+        assert "n" * 100 not in repr(report.anomalies[0])
+    finally:
+        database.close()
+
+
+def test_an_overlong_ledger_batch_id_is_fingerprinted(tmp_path: Path) -> None:
+    database, _store, _spool_root, reconciler = _reconciler(tmp_path)
+    injected = "x" * 300  # exceeds the 128-char batch-id bound; passes every table constraint
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO _segments (batch_id, day, schema_version, frame_version, "
+                "config_generation, scope, target_id, privacy_class, retention_days, record_count, "
+                "content_sha256, byte_size, file_sha256, committed_at, origin) VALUES "
+                "(?, '2026-07-24', 1, 1, ?, 'target', 't', 'internal', 30, 1, ?, 10, ?, "
+                "'2026-07-24T00:00:00.000Z', 'committed')",
+                (injected, "a" * 64, "c" * 64, "d" * 64),
+            )
+        report = reconciler.reconcile()
+        assert report.anomalies == (
+            SegmentAnomaly(_fingerprint(injected), "", "corrupt_ledger", "unreadable_row"),
+        )
+        assert "x" * 100 not in repr(report.anomalies[0])
+    finally:
+        database.close()
+
+
+def test_a_control_byte_directory_name_is_fingerprinted(tmp_path: Path) -> None:
+    # POSIX permits newline and control bytes in names; the raw name must never reach the report
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    canary = "SECRET\nCANARY\x01-day"
+    try:
+        pending = spool_root / "pending"
+        pending.mkdir(mode=0o700)
+        os.chmod(pending, 0o700)
+        (pending / canary).mkdir(mode=0o700)
+        report = reconciler.reconcile()
+        assert report.anomalies == (
+            SegmentAnomaly("", _fingerprint(canary), "foreign_name", "day"),
+        )
+        surface = repr(report.anomalies[0]) + repr(report)
+        assert "SECRET" not in surface
+        assert "CANARY" not in surface
+        assert "\\n" not in report.anomalies[0].day and "\n" not in report.anomalies[0].day
+    finally:
+        database.close()
+
+
 def test_a_symlinked_day_directory_is_reported_unsafe(tmp_path: Path) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     try:
@@ -815,7 +895,13 @@ def test_too_many_total_files_stops_the_scan(
     os.chmod(day_dir, 0o700)
     (day_dir / "batch-1.jsonl").write_bytes(b"x")
     try:
-        assert SegmentAnomaly("", "", "limit", "scan_limit") in reconciler.reconcile().anomalies
+        report = reconciler.reconcile()
+        # the scan STOPS at the bound: the limit anomaly is the only outcome — the over-limit file
+        # is neither scanned, classified (no corrupt_orphan), nor registered
+        assert report.anomalies == (SegmentAnomaly("", "", "limit", "scan_limit"),)
+        assert report.scanned == 0
+        assert report.registered == ()
+        assert report.healthy == 0
     finally:
         database.close()
 
