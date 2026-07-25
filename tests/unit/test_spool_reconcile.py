@@ -31,7 +31,6 @@ from milhouse.spooling import (
     spool_frame_line,
 )
 from milhouse.spooling import reconcile as reconcile_module
-from milhouse.spooling.reconcile import _fingerprint
 from milhouse.state import (
     GlobalCommitBarrier,
     StateError,
@@ -914,7 +913,7 @@ def test_an_orphan_whose_name_disagrees_with_its_header_is_flagged(tmp_path: Pat
     ("name", "detail"),
     [("batch-1.txt", "suffix"), ("..sneaky.jsonl", "batch_id")],
 )
-def test_a_foreign_file_name_is_fingerprinted(tmp_path: Path, name: str, detail: str) -> None:
+def test_a_foreign_file_name_is_omitted(tmp_path: Path, name: str, detail: str) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     try:
         pending = spool_root / "pending"
@@ -926,15 +925,13 @@ def test_a_foreign_file_name_is_fingerprinted(tmp_path: Path, name: str, detail:
         (day_dir / name).write_bytes(b"x")
         os.chmod(day_dir / name, 0o600)
         report = reconciler.reconcile()
-        assert report.anomalies == (
-            SegmentAnomaly(_fingerprint(name), _DAY, "foreign_name", detail),
-        )
+        assert report.anomalies == (SegmentAnomaly("", _DAY, "foreign_name", detail),)
         assert name not in report.anomalies[0].batch_id
     finally:
         database.close()
 
 
-def test_an_invalid_day_name_is_fingerprinted_and_leaks_no_raw_name(tmp_path: Path) -> None:
+def test_an_invalid_day_name_is_omitted_and_leaks_no_raw_name(tmp_path: Path) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     try:
         pending = spool_root / "pending"
@@ -943,10 +940,15 @@ def test_an_invalid_day_name_is_fingerprinted_and_leaks_no_raw_name(tmp_path: Pa
         canary = "CANARY_SECRET-not-a-day"
         (pending / canary).mkdir(mode=0o700)
         report = reconciler.reconcile()
-        assert report.anomalies == (
-            SegmentAnomaly("", _fingerprint(canary), "foreign_name", "day"),
-        )
-        assert canary not in repr(report.anomalies[0])
+        assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "day"),)
+        # neither the raw name nor ANY derivative (incl. a dictionary-recoverable bare SHA-256
+        # of it) reaches the report: the field is omitted entirely
+        import hashlib
+
+        surface = repr(report)
+        assert canary not in surface
+        assert hashlib.sha256(canary.encode()).hexdigest()[:16] not in surface
+        assert "sha256:" not in surface
     finally:
         database.close()
 
@@ -961,7 +963,7 @@ def test_a_non_canonical_day_directory_is_rejected_without_a_poison_row(
         _publish_orphan(spool_root, day, "batch-1.jsonl", build_segment_bytes(header, frames))
         report = reconciler.reconcile()
         assert report.registered == ()
-        assert report.anomalies == (SegmentAnomaly("", _fingerprint(day), "foreign_name", "day"),)
+        assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "day"),)
         assert _count(database) == 0
         assert store.list_segments() == ()  # the ledger stays readable — no poison row
     finally:
@@ -984,7 +986,7 @@ def test_a_regular_file_where_a_day_directory_belongs_is_unsafe(tmp_path: Path) 
         database.close()
 
 
-def test_an_overlong_foreign_file_name_is_fingerprinted(tmp_path: Path) -> None:
+def test_an_overlong_foreign_file_name_is_omitted(tmp_path: Path) -> None:
     # a near-NAME_MAX entry name never reaches the report raw; the batch-id pattern (max 128) fails
     # and only the fixed-length fingerprint is recorded
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
@@ -997,15 +999,13 @@ def test_an_overlong_foreign_file_name_is_fingerprinted(tmp_path: Path) -> None:
         (day_dir / name).write_bytes(b"x")
         os.chmod(day_dir / name, 0o600)
         report = reconciler.reconcile()
-        assert report.anomalies == (
-            SegmentAnomaly(_fingerprint(name), _DAY, "foreign_name", "batch_id"),
-        )
+        assert report.anomalies == (SegmentAnomaly("", _DAY, "foreign_name", "batch_id"),)
         assert "n" * 100 not in repr(report.anomalies[0])
     finally:
         database.close()
 
 
-def test_an_overlong_ledger_batch_id_is_fingerprinted(tmp_path: Path) -> None:
+def test_an_overlong_ledger_batch_id_is_omitted(tmp_path: Path) -> None:
     database, _store, _spool_root, reconciler = _reconciler(tmp_path)
     injected = "x" * 300  # exceeds the 128-char batch-id bound; passes every table constraint
     try:
@@ -1019,15 +1019,13 @@ def test_an_overlong_ledger_batch_id_is_fingerprinted(tmp_path: Path) -> None:
                 (injected, "a" * 64, "c" * 64, "d" * 64),
             )
         report = reconciler.reconcile()
-        assert report.anomalies == (
-            SegmentAnomaly(_fingerprint(injected), "", "corrupt_ledger", "unreadable_row"),
-        )
+        assert report.anomalies == (SegmentAnomaly("", "", "corrupt_ledger", "unreadable_row"),)
         assert "x" * 100 not in repr(report.anomalies[0])
     finally:
         database.close()
 
 
-def test_a_control_byte_directory_name_is_fingerprinted(tmp_path: Path) -> None:
+def test_a_control_byte_directory_name_is_omitted(tmp_path: Path) -> None:
     # POSIX permits newline and control bytes in names; the raw name must never reach the report
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     canary = "SECRET\nCANARY\x01-day"
@@ -1037,9 +1035,7 @@ def test_a_control_byte_directory_name_is_fingerprinted(tmp_path: Path) -> None:
         os.chmod(pending, 0o700)
         (pending / canary).mkdir(mode=0o700)
         report = reconciler.reconcile()
-        assert report.anomalies == (
-            SegmentAnomaly("", _fingerprint(canary), "foreign_name", "day"),
-        )
+        assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "day"),)
         surface = repr(report.anomalies[0]) + repr(report)
         assert "SECRET" not in surface
         assert "CANARY" not in surface
@@ -1427,7 +1423,7 @@ def test_a_barrier_acquisition_failure_surfaces_a_spool_error(tmp_path: Path) ->
         database.close()
 
 
-def test_a_malformed_ledger_batch_id_is_fingerprinted_not_echoed(tmp_path: Path) -> None:
+def test_a_malformed_ledger_batch_id_is_omitted_not_echoed(tmp_path: Path) -> None:
     database, _store, _spool_root, reconciler = _reconciler(tmp_path)
     injected = "evil\nINJECTED-CANARY"
     try:
@@ -1441,9 +1437,7 @@ def test_a_malformed_ledger_batch_id_is_fingerprinted_not_echoed(tmp_path: Path)
                 (injected, "a" * 64, "c" * 64, "d" * 64),
             )
         report = reconciler.reconcile()
-        assert report.anomalies == (
-            SegmentAnomaly(_fingerprint(injected), "", "corrupt_ledger", "unreadable_row"),
-        )
+        assert report.anomalies == (SegmentAnomaly("", "", "corrupt_ledger", "unreadable_row"),)
         assert "INJECTED-CANARY" not in repr(report.anomalies[0])
     finally:
         database.close()

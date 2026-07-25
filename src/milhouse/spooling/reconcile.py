@@ -15,8 +15,8 @@ enumeration and then, comparing against the fully validated ``_segments`` ledger
   immutable field, both digests, byte size, and the exact required-exporter identity set;
 * reports every ledger row whose file is missing, every malformed ledger row, every file that
   disagrees with its row, every batch id that appears at more than one path (registering none of
-  them), and every foreign entry — carrying only fixed reasons and keyed name fingerprints, never a
-  raw path.
+  them), and every foreign entry — carrying only validated identifiers and fixed reasons; an
+  invalid name is omitted entirely, so no raw or derived untrusted name reaches a report surface.
 
 The scan never deletes, quarantines, or moves a file; it registers valid orphans and returns a
 :class:`ReconciliationReport`. Every failure is a fixed ``MH_SPOOL_*`` error raised outside any
@@ -26,7 +26,6 @@ handler.
 from __future__ import annotations
 
 import errno
-import hashlib
 import os
 import re
 import sqlite3
@@ -100,8 +99,9 @@ class SegmentAnomaly:
     its row), ``corrupt_orphan`` (an unrecorded file that fails trusted validation or egress),
     ``conflict`` (a batch id at more than one path), ``foreign_name`` (an entry whose name is not a
     well-formed ``<batch-id>.jsonl`` under a valid day), or ``limit`` (a scan bound was exceeded).
-    ``batch_id`` and ``day`` are validated identifiers or fixed ``sha256:`` fingerprints of an
-    untrusted name; ``detail`` is a fixed reason or ``MH_SPOOL_*`` code — never a raw path.
+    ``batch_id`` and ``day`` are validated identifiers or empty when the underlying name was
+    invalid (untrusted names are omitted entirely, never echoed or fingerprinted); ``detail`` is a
+    fixed reason or ``MH_SPOOL_*`` code — never a raw path.
     """
 
     batch_id: str
@@ -138,16 +138,17 @@ def _current_uid() -> int:
     return int(geteuid())
 
 
-def _fingerprint(name: str) -> str:
-    """A stable, path-free fingerprint of an untrusted spool entry name for the report."""
-
-    return "sha256:" + hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-
-
 def _safe_id(batch_id: str) -> str:
-    """Keep a well-formed batch id readable in the report; fingerprint anything else."""
+    """Keep a well-formed batch id readable in the report; OMIT anything else entirely.
 
-    return batch_id if BATCH_ID_PATTERN.fullmatch(batch_id) is not None else _fingerprint(batch_id)
+    An invalid name is untrusted input. The re-review showed a truncated bare SHA-256 is
+    dictionary-recoverable for low-entropy names, and no keyed pseudonymization primitive is wired
+    into the spool subsystem yet, so no derivative of an invalid name reaches any report surface:
+    the field is empty and only the fixed reason identifies the anomaly class. Quarantine (a later
+    slice) handles the file itself.
+    """
+
+    return batch_id if BATCH_ID_PATTERN.fullmatch(batch_id) is not None else ""
 
 
 def _is_valid_day(day: str) -> bool:
@@ -335,7 +336,7 @@ class _Scan:
         candidates: list[tuple[str, str, Path]] = []
         for day in day_names:
             if not _is_valid_day(day):
-                self._anomaly("", _fingerprint(day), "foreign_name", "day")
+                self._anomaly("", "", "foreign_name", "day")
                 continue
             entries, entry_problem = _secure_dir_names(pending / day)
             if entry_problem is not None:
@@ -359,11 +360,11 @@ class _Scan:
 
     def _classify_name(self, path: Path, day: str, name: str) -> tuple[str, str, Path] | None:
         if not name.endswith(_SEGMENT_SUFFIX):
-            self._anomaly(_fingerprint(name), day, "foreign_name", "suffix")
+            self._anomaly("", day, "foreign_name", "suffix")
             return None
         batch_id = name[: -len(_SEGMENT_SUFFIX)]
         if BATCH_ID_PATTERN.fullmatch(batch_id) is None:
-            self._anomaly(_fingerprint(name), day, "foreign_name", "batch_id")
+            self._anomaly("", day, "foreign_name", "batch_id")
             return None
         return day, batch_id, path
 
