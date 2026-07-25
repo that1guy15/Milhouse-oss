@@ -425,6 +425,16 @@ def test_authorize_denies_a_restricted_class() -> None:
     assert captured.value.code == "MH_SPOOL_EGRESS"
 
 
+def test_an_egress_denial_leaks_no_rejected_privacy_value() -> None:
+    with pytest.raises(SpoolError) as captured:
+        authorize_local_persistence("restricted")
+    error = captured.value
+    surface = " ".join([error.code, str(error), repr(error), *(str(a) for a in error.args)])
+    assert "restricted" not in surface  # the rejected value never reaches the error surface
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
 def test_the_store_rejects_a_non_control_database_or_barrier(tmp_path: Path) -> None:
     database, _store, spool_root = _spool(tmp_path)
     barrier = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")

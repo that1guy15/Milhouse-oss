@@ -442,6 +442,66 @@ def test_an_orphan_minted_by_a_foreign_installation_is_not_registered(tmp_path: 
         database.close()
 
 
+def test_recovery_authorizes_the_exact_local_persistence_surfaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # spy on require_egress itself: recovery must authorize exactly LOCAL_SPOOL and LOCAL_SQLITE
+    # with the segment's privacy class and require REDACTED_RECORD — a rewrite querying one surface,
+    # a wrong surface, or accepting any disposition must fail this test
+    from milhouse.privacy import EgressDisposition, EgressSurface
+    from milhouse.spooling import ledger as ledger_module
+
+    database, barrier, spool_root = _control(tmp_path)
+    reconciler = SpoolReconciler(
+        database=database, barrier=barrier, spool_root=spool_root, installation_id=_INSTALLATION_ID
+    )
+    calls: list[tuple[object, str]] = []
+
+    def _spy(*, surface: object, privacy_class: str) -> object:
+        calls.append((surface, privacy_class))
+        return EgressDisposition.REDACTED_RECORD
+
+    monkeypatch.setattr(ledger_module, "require_egress", _spy)
+    try:
+        header, frames = _segment()
+        _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
+        report = reconciler.reconcile()
+        assert len(report.registered) == 1
+        assert calls == [
+            (EgressSurface.LOCAL_SPOOL, "internal"),
+            (EgressSurface.LOCAL_SQLITE, "internal"),
+        ]
+    finally:
+        database.close()
+
+
+def test_an_unexpected_disposition_registers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a disposition other than REDACTED_RECORD, returned WITHOUT PrivacyError, must still deny:
+    # normalized to MH_SPOOL_EGRESS with zero segment and exporter rows
+    from milhouse.privacy import EgressDisposition
+    from milhouse.spooling import ledger as ledger_module
+
+    database, barrier, spool_root = _control(tmp_path)
+    reconciler = SpoolReconciler(
+        database=database, barrier=barrier, spool_root=spool_root, installation_id=_INSTALLATION_ID
+    )
+    monkeypatch.setattr(ledger_module, "require_egress", lambda **_kw: EgressDisposition.METADATA)
+    try:
+        header, frames = _segment()
+        _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
+        report = reconciler.reconcile()
+        assert report.registered == ()
+        assert report.anomalies == (
+            SegmentAnomaly("batch-1", _DAY, "corrupt_orphan", "MH_SPOOL_EGRESS"),
+        )
+        assert _count(database) == 0
+        assert _count(database, "_segment_exporters") == 0
+    finally:
+        database.close()
+
+
 def test_an_egress_denied_orphan_is_not_registered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
