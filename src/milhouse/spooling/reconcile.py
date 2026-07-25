@@ -201,10 +201,16 @@ def _secure_dir_names(path: Path) -> tuple[tuple[str, ...] | None, str | None]:
     return names, None
 
 
-def run_reconciliation_scan(
+def _run_reconciliation_scan(
     *, database: ControlDatabase, spool_root: str | Path, installation_id: str
 ) -> ReconciliationReport:
-    """Reconcile the pending spool with the ledger. The caller MUST hold the exclusive barrier."""
+    """Run the raw mutating scan. INTERNAL: only barrier-owning entrypoints may call this.
+
+    This function is deliberately not exported: it mutates the ledger and cannot itself verify the
+    exclusive barrier, so the only supported reconciliation entrypoints are
+    :class:`milhouse.spooling.commit.DurableSpool` (construction and every commit) and
+    :meth:`SpoolReconciler.reconcile`, each of which acquires the exclusive barrier around it.
+    """
 
     return _Scan(database, lexical_absolute_path(spool_root), installation_id).run()
 
@@ -469,7 +475,7 @@ class SpoolReconciler:
         barrier_failed = False
         try:
             with self._barrier.exclusive():
-                report = run_reconciliation_scan(
+                report = _run_reconciliation_scan(
                     database=self._database,
                     spool_root=self._spool_root,
                     installation_id=self._installation_id,

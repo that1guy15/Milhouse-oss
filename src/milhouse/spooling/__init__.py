@@ -16,7 +16,6 @@ from milhouse.spooling.reconcile import (
     ReconciliationReport,
     SegmentAnomaly,
     SpoolReconciler,
-    run_reconciliation_scan,
 )
 from milhouse.spooling.segment import (
     SegmentHeaderV1,
@@ -48,7 +47,6 @@ __all__ = [
     "publish_segment_bytes",
     "read_trusted_segment",
     "read_untrusted_segment",
-    "run_reconciliation_scan",
     "spool_content_sha256",
     "spool_frame_line",
     "spool_segment_header_line",

@@ -185,13 +185,13 @@ class DurableSpool:
         """
 
         # Imported here to keep the reconcile module's dependency on the ledger one-directional.
-        from milhouse.spooling.reconcile import run_reconciliation_scan
+        from milhouse.spooling.reconcile import _run_reconciliation_scan
 
         report: ReconciliationReport | None = None
         barrier_failed = False
         try:
             with self._barrier.exclusive():
-                report = run_reconciliation_scan(
+                report = _run_reconciliation_scan(
                     database=self._database,
                     spool_root=self._spool_root,
                     installation_id=self._installation_id,

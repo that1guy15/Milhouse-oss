@@ -476,11 +476,13 @@ def test_a_second_writer_acquisition_waits_for_the_exclusive_barrier(tmp_path: P
 def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> None:
     import milhouse.spooling as spooling
 
-    # Pin the export surface: the only exported symbol that both publishes a segment and registers
-    # it in the ledger is DurableSpool, whose acquisition mandatorily reconciles.
+    # Pin the export surface: the only exported symbols that can mutate reconciliation/ledger state
+    # are DurableSpool (construction and every commit reconcile under the exclusive barrier) and
+    # SpoolReconciler.reconcile (acquires the exclusive barrier internally).
     # publish_segment_bytes/write_spool_segment publish FILES only (a crash-equivalent orphan that
-    # the next acquisition registers), and run_reconciliation_scan IS the reconciliation itself.
-    # No ledger-writing helper is exported; widening this surface is a deliberate, reviewed change.
+    # the next reconciliation registers). The raw mutating scan is NOT exported: a barrier-less
+    # reconciliation entrypoint was the re-review's P1 bypass. Widening this surface is a
+    # deliberate, reviewed change.
     assert set(spooling.__all__) == {
         "DurableSpool",
         "ExporterDelivery",
@@ -498,15 +500,59 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "publish_segment_bytes",
         "read_trusted_segment",
         "read_untrusted_segment",
-        "run_reconciliation_scan",
         "spool_content_sha256",
         "spool_frame_line",
         "spool_segment_header_line",
         "write_spool_segment",
     }
     assert "insert_segment_row" not in spooling.__all__
+    assert "run_reconciliation_scan" not in spooling.__all__
+    assert not hasattr(spooling, "run_reconciliation_scan")
     with pytest.raises(TypeError):
         DurableSpool(database=None, barrier=None, spool_root="x")  # type: ignore[call-arg]
+
+
+def test_every_reconciliation_entrypoint_holds_exclusive_before_mutating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # spy on the internal scan: when any supported entrypoint invokes it, the exclusive barrier must
+    # already be held (a probe acquisition from a second descriptor must fail BUSY)
+    database, barrier, spool_root = _control(tmp_path)
+    probe = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")
+    real_scan = reconcile_module._run_reconciliation_scan
+    held_checks: list[bool] = []
+
+    def _asserting_scan(**kwargs: object):  # type: ignore[no-untyped-def]
+        blocked = False
+        try:
+            with probe.exclusive(blocking=False):
+                pass
+        except StateError:
+            blocked = True
+        held_checks.append(blocked)
+        return real_scan(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(reconcile_module, "_run_reconciliation_scan", _asserting_scan)
+    monkeypatch.setattr("milhouse.spooling.reconcile._run_reconciliation_scan", _asserting_scan)
+    try:
+        store = DurableSpool(  # entrypoint 1: writer acquisition
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        header, frames = _segment()
+        store.commit_segment(header, frames, committed_at=_NOW)  # entrypoint 2: every commit
+        reconciler = SpoolReconciler(
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        reconciler.reconcile()  # entrypoint 3: the explicit startup pass
+        assert held_checks == [True, True, True]  # exclusive was held at every scan invocation
+    finally:
+        database.close()
 
 
 # --- orphan registration -------------------------------------------------------------------------
