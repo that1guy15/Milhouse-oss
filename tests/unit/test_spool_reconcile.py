@@ -600,17 +600,36 @@ def test_a_missing_segment_file_is_flagged(tmp_path: Path) -> None:
 # --- conflicting duplicates (P1-3) ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("identical", [True, False])
-def test_a_batch_at_two_paths_registers_none(tmp_path: Path, identical: bool) -> None:
+@pytest.mark.parametrize("variant", ["identical", "different_frames", "different_exporters"])
+def test_a_batch_at_two_paths_registers_none(tmp_path: Path, variant: str) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     try:
         header_a, frames_a = _segment(batch_id="batch-1")
         content_a = build_segment_bytes(header_a, frames_a)
-        if identical:
+        if variant == "identical":
             content_b = content_a
-        else:
+        elif variant == "different_exporters":
             header_b, frames_b = _segment(batch_id="batch-1", exporters=("clickhouse", "extra"))
             content_b = build_segment_bytes(header_b, frames_b)
+        else:  # genuinely different frame content: other source events, other record ids
+            frames_b = tuple(
+                SpoolFrameV1(batch_id="batch-1", sequence=index, record=_envelope(f"other-{index}"))
+                for index in (1, 2)
+            )
+            lines = [spool_frame_line(frame) for frame in frames_b]
+            header_b = SegmentHeaderV1(
+                batch_id="batch-1",
+                config_generation="a" * 64,
+                scope="target",
+                target_id="example-target",
+                privacy_class="internal",
+                retention_days=30,
+                required_exporters=("clickhouse",),
+                record_count=len(frames_b),
+                content_sha256=spool_content_sha256(lines),
+            )
+            content_b = build_segment_bytes(header_b, frames_b)
+            assert content_b != content_a  # the two durable histories genuinely conflict
         _publish_orphan(spool_root, "2026-07-23", "batch-1.jsonl", content_a)
         _publish_orphan(spool_root, "2026-07-24", "batch-1.jsonl", content_b)
 
