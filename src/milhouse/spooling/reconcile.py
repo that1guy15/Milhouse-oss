@@ -112,12 +112,19 @@ class SegmentAnomaly:
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationReport:
-    """The outcome of one reconciliation scan."""
+    """The outcome of one reconciliation scan.
+
+    ``complete`` is False when any enumeration bound or unreadable/unsafe directory truncated the
+    inventory. An incomplete scan is certification- and mutation-free: it registers nothing,
+    certifies nothing healthy, and asserts no missing files, because a truncated inventory cannot
+    prove global batch uniqueness or absence.
+    """
 
     registered: tuple[OrphanRegistration, ...]
     anomalies: tuple[SegmentAnomaly, ...]
     healthy: int
     scanned: int
+    complete: bool
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -218,9 +225,11 @@ def _run_reconciliation_scan(
 class _Scan:
     __slots__ = (
         "_anomalies",
+        "_complete",
         "_database",
         "_healthy",
         "_installation_id",
+        "_pending_registrations",
         "_registered",
         "_scanned",
         "_spool_root",
@@ -232,10 +241,12 @@ class _Scan:
         self._spool_root = spool_root
         self._installation_id = installation_id
         self._registered: list[OrphanRegistration] = []
+        self._pending_registrations: list[tuple[ParsedSegment, str, str]] = []
         self._anomalies: list[SegmentAnomaly] = []
         self._healthy = 0
         self._scanned = 0
         self._stopped = False
+        self._complete = True
 
     def run(self) -> ReconciliationReport:
         ledger, malformed = self._ledger_index()
@@ -246,26 +257,38 @@ class _Scan:
         candidates = self._inventory()
         counts = Counter(batch_id for _day, batch_id, _path in candidates)
         seen: set[str] = set()
-        for day, batch_id, path in candidates:
-            seen.add(batch_id)
-            if counts[batch_id] > 1:
-                self._anomaly(batch_id, day, "conflict", "duplicate_batch_id")
-            elif batch_id in malformed:
-                continue  # the malformed-row anomaly already covers this batch
-            elif batch_id in ledger:
-                self._verify_committed(path, day, batch_id, ledger[batch_id])
-            else:
-                self._reconcile_orphan(path, day, batch_id)
+        if self._complete:
+            for day, batch_id, path in candidates:
+                if self._stopped:
+                    # the anomaly cap fired mid-verification: the rest of the pass is unproven
+                    self._complete = False
+                    break
+                seen.add(batch_id)
+                if counts[batch_id] > 1:
+                    self._anomaly(batch_id, day, "conflict", "duplicate_batch_id")
+                elif batch_id in malformed:
+                    continue  # the malformed-row anomaly already covers this batch
+                elif batch_id in ledger:
+                    self._verify_committed(path, day, batch_id, ledger[batch_id])
+                else:
+                    self._reconcile_orphan(path, day, batch_id)
 
-        for batch_id, record in ledger.items():
-            if batch_id not in seen:
-                self._anomaly(batch_id, record.day, "missing_file", "absent")
+        if self._complete:
+            # Mutation happens only after a complete, within-bounds inventory proved every candidate
+            # batch id globally unique, so a bound can never truncate authority onto a partial view.
+            for parsed, batch_id, day in self._pending_registrations:
+                self._register(parsed, batch_id, day)
+                self._registered.append(OrphanRegistration(batch_id, day))
+            for batch_id, record in ledger.items():
+                if batch_id not in seen:
+                    self._anomaly(batch_id, record.day, "missing_file", "absent")
 
         return ReconciliationReport(
             registered=tuple(self._registered),
             anomalies=tuple(self._anomalies),
-            healthy=self._healthy,
+            healthy=self._healthy if self._complete else 0,
             scanned=self._scanned,
+            complete=self._complete,
         )
 
     def _anomaly(self, batch_id: str, day: str, kind: str, detail: str) -> None:
@@ -300,12 +323,15 @@ class _Scan:
         pending = self._spool_root / _PENDING
         day_names, problem = _secure_dir_names(pending)
         if problem is not None:
+            # an unlistable pending directory means the inventory cannot be proven complete
             self._anomaly("", "", "foreign_name", f"pending_{problem}")
+            self._complete = False
             return []
         assert day_names is not None
         if len(day_names) > _MAX_DAYS:
             self._anomaly("", "", "limit", "day_limit")
-            day_names = day_names[:_MAX_DAYS]
+            self._complete = False
+            return []
         candidates: list[tuple[str, str, Path]] = []
         for day in day_names:
             if not _is_valid_day(day):
@@ -313,17 +339,22 @@ class _Scan:
                 continue
             entries, entry_problem = _secure_dir_names(pending / day)
             if entry_problem is not None:
+                # an unlistable or truncated day leaves possible batches (and duplicates) unseen
                 self._anomaly("", day, "foreign_name", f"day_{entry_problem}")
+                self._complete = False
                 continue
             assert entries is not None
             for name in entries:
                 if self._scanned >= _MAX_TOTAL:
                     self._anomaly("", "", "limit", "scan_limit")
+                    self._complete = False
                     return candidates
                 self._scanned += 1
                 resolved = self._classify_name(pending / day / name, day, name)
                 if resolved is not None:
                     candidates.append(resolved)
+        if self._stopped:
+            self._complete = False  # the anomaly cap fired during inventory
         return candidates
 
     def _classify_name(self, path: Path, day: str, name: str) -> tuple[str, str, Path] | None:
@@ -359,8 +390,8 @@ class _Scan:
         except SpoolError as denied:
             self._anomaly(batch_id, day, "corrupt_orphan", denied.code)
             return
-        self._register(parsed, batch_id, day)
-        self._registered.append(OrphanRegistration(batch_id, day))
+        # registration is deferred: mutation begins only after the whole pass proves complete
+        self._pending_registrations.append((parsed, batch_id, day))
 
     def _trusted_read(self, path: Path) -> tuple[ParsedSegment | None, str | None]:
         parsed: ParsedSegment | None = None

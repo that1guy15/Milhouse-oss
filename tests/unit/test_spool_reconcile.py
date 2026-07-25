@@ -155,7 +155,7 @@ def test_reconciling_an_empty_spool_reports_nothing(tmp_path: Path) -> None:
     database, _store, _spool_root, reconciler = _reconciler(tmp_path)
     try:
         report = reconciler.reconcile()
-        assert report == reconcile_module.ReconciliationReport((), (), 0, 0)
+        assert report == reconcile_module.ReconciliationReport((), (), 0, 0, complete=True)
     finally:
         database.close()
 
@@ -1087,6 +1087,117 @@ def test_a_world_writable_pending_directory_is_reported_unsafe(tmp_path: Path) -
         assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "pending_unsafe"),)
     finally:
         os.chmod(pending, 0o700)
+        database.close()
+
+
+def test_a_duplicate_straddling_the_day_bound_registers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the re-review's reproduction class: a conflicting copy hidden just beyond a bound must make
+    # the whole pass mutation-free, never register the visible copy arbitrarily
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    monkeypatch.setattr(reconcile_module, "_MAX_DAYS", 1)
+    header_a, frames_a = _segment(batch_id="batch-1")
+    header_b, frames_b = _segment(batch_id="batch-1", exporters=("clickhouse", "extra"))
+    _publish_orphan(
+        spool_root, "2026-07-23", "batch-1.jsonl", build_segment_bytes(header_a, frames_a)
+    )
+    _publish_orphan(
+        spool_root, "2026-07-24", "batch-1.jsonl", build_segment_bytes(header_b, frames_b)
+    )
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.healthy == 0
+        assert SegmentAnomaly("", "", "limit", "day_limit") in report.anomalies
+        assert _count(database) == 0
+        assert _count(database, "_segment_exporters") == 0
+        # re-runs stay mutation-free and deterministic
+        assert reconciler.reconcile().registered == ()
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_a_duplicate_straddling_the_total_bound_registers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    monkeypatch.setattr(reconcile_module, "_MAX_TOTAL", 1)
+    header_a, frames_a = _segment(batch_id="batch-1")
+    header_b, frames_b = _segment(batch_id="batch-1", exporters=("clickhouse", "extra"))
+    _publish_orphan(
+        spool_root, "2026-07-23", "batch-1.jsonl", build_segment_bytes(header_a, frames_a)
+    )
+    _publish_orphan(
+        spool_root, "2026-07-24", "batch-1.jsonl", build_segment_bytes(header_b, frames_b)
+    )
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.healthy == 0
+        assert SegmentAnomaly("", "", "limit", "scan_limit") in report.anomalies
+        assert _count(database) == 0
+        assert _count(database, "_segment_exporters") == 0
+        assert reconciler.reconcile().registered == ()
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_a_valid_orphan_beyond_the_anomaly_cap_is_not_registered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    monkeypatch.setattr(reconcile_module, "_MAX_ANOMALIES", 1)
+    header, frames = _segment(batch_id="batch-1")
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
+    pending = spool_root / "pending"
+    for junk in ("not-a-day-1", "not-a-day-2", "not-a-day-3"):
+        (pending / junk).mkdir(mode=0o700)
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()  # the valid orphan is NOT registered past the cap
+        assert SegmentAnomaly("", "", "limit", "anomaly_limit") in report.anomalies
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_the_writer_fails_closed_on_a_truncated_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # mandatory recovery cannot certify a partial view: acquisition and commits both fail closed
+    database, barrier, spool_root = _control(tmp_path)
+    header, frames = _segment(batch_id="orphan-1")
+    _publish_orphan(spool_root, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames))
+    try:
+        store = DurableSpool(  # a complete scan first: acquisition succeeds and registers
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        monkeypatch.setattr(reconcile_module, "_MAX_TOTAL", 0)
+        later_header, later_frames = _segment(batch_id="later-2")
+        with pytest.raises(SpoolError) as commit_error:
+            store.commit_segment(later_header, later_frames, committed_at=_NOW)
+        assert commit_error.value.code == "MH_SPOOL_INCOMPLETE"
+        # nothing was published or recorded for the refused commit
+        assert not (spool_root / "pending" / _DAY / "later-2.jsonl").exists()
+        assert {r.batch_id for r in store.list_segments()} == {"orphan-1"}
+        with pytest.raises(SpoolError) as acquire_error:
+            DurableSpool(
+                database=database,
+                barrier=barrier,
+                spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
+            )
+        assert acquire_error.value.code == "MH_SPOOL_INCOMPLETE"
+    finally:
         database.close()
 
 

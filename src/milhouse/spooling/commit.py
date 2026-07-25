@@ -197,7 +197,7 @@ class DurableSpool:
                     installation_id=self._installation_id,
                 )
                 self._last_reconciliation = report
-                if action is not None:
+                if action is not None and report.complete:
                     action()
         except StateError:
             # The scan and ledger paths remap their own StateErrors; this only catches a
@@ -205,6 +205,10 @@ class DurableSpool:
             barrier_failed = True
         if barrier_failed or report is None:
             _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
+        if not report.complete:
+            # A truncated inventory cannot prove orphan absence or batch uniqueness, so mandatory
+            # recovery fails closed: neither acquisition nor a commit may proceed on a partial view.
+            _fail("MH_SPOOL_INCOMPLETE", "reconciliation was truncated by a scan bound")
         return report
 
     def commit_segment(
