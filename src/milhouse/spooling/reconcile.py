@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
-from milhouse.config.filesystem import lexical_absolute_path
+from milhouse.config.filesystem import FileIdentity, lexical_absolute_path
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
     ORIGIN_RECONCILED,
@@ -162,10 +162,14 @@ def _is_valid_day(day: str) -> bool:
     return valid
 
 
-def _secure_dir_names(path: Path) -> tuple[tuple[str, ...] | None, str | None]:
+def _secure_dir_names(
+    path: Path,
+) -> tuple[tuple[str, ...] | None, FileIdentity | None, str | None]:
     """List a directory over an owned 0700 no-follow descriptor, capping entries before collecting.
 
-    Returns ``(names, None)`` on success (``()`` if absent), or ``(None, reason)`` where reason is
+    Returns ``(names, identity, None)`` on success (``((), None, None)`` if absent), where
+    ``identity`` is the opened directory's device/inode so a later per-file read can prove it still
+    operates beneath the exact inventoried directory; or ``(None, None, reason)`` where reason is
     ``unsafe`` (symlink, non-directory, wrong owner, or mode) or ``unreadable``.
     """
 
@@ -174,13 +178,15 @@ def _secure_dir_names(path: Path) -> tuple[tuple[str, ...] | None, str | None]:
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
-        return (), None
+        return (), None, None
     except OSError as exc:
-        return None, "unsafe" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "unreadable"
+        return None, None, "unsafe" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "unreadable"
     problem: str | None = None
     names: tuple[str, ...] | None = None
+    identity: FileIdentity | None = None
     try:
         info = os.fstat(descriptor)
+        identity = FileIdentity.from_stat(info)
         if (
             not stat.S_ISDIR(info.st_mode)
             or info.st_uid != _current_uid()
@@ -205,8 +211,8 @@ def _secure_dir_names(path: Path) -> tuple[tuple[str, ...] | None, str | None]:
         except OSError:  # pragma: no cover - defensive: close failure on a valid descriptor
             problem = problem or "unreadable"
     if problem is not None:
-        return None, problem
-    return names, None
+        return None, None, problem
+    return names, identity, None
 
 
 def _run_reconciliation_scan(
@@ -256,10 +262,10 @@ class _Scan:
             self._anomaly(_safe_id(batch_id), "", "corrupt_ledger", "unreadable_row")
 
         candidates = self._inventory()
-        counts = Counter(batch_id for _day, batch_id, _path in candidates)
+        counts = Counter(batch_id for _day, batch_id, _path, _identity in candidates)
         seen: set[str] = set()
         if self._complete:
-            for day, batch_id, path in candidates:
+            for day, batch_id, path, day_identity in candidates:
                 if self._stopped:
                     # the anomaly cap fired mid-verification: the rest of the pass is unproven
                     self._complete = False
@@ -270,9 +276,9 @@ class _Scan:
                 elif batch_id in malformed:
                     continue  # the malformed-row anomaly already covers this batch
                 elif batch_id in ledger:
-                    self._verify_committed(path, day, batch_id, ledger[batch_id])
+                    self._verify_committed(path, day, batch_id, ledger[batch_id], day_identity)
                 else:
-                    self._reconcile_orphan(path, day, batch_id)
+                    self._reconcile_orphan(path, day, batch_id, day_identity)
 
         if self._complete:
             # Mutation happens only after a complete, within-bounds inventory proved every candidate
@@ -320,9 +326,9 @@ class _Scan:
             _fail("MH_SPOOL_LEDGER", "the segment ledger could not be read")
         return ledger, malformed
 
-    def _inventory(self) -> list[tuple[str, str, Path]]:
+    def _inventory(self) -> list[tuple[str, str, Path, FileIdentity]]:
         pending = self._spool_root / _PENDING
-        day_names, problem = _secure_dir_names(pending)
+        day_names, _pending_identity, problem = _secure_dir_names(pending)
         if problem is not None:
             # an unlistable pending directory means the inventory cannot be proven complete
             self._anomaly("", "", "foreign_name", f"pending_{problem}")
@@ -333,18 +339,18 @@ class _Scan:
             self._anomaly("", "", "limit", "day_limit")
             self._complete = False
             return []
-        candidates: list[tuple[str, str, Path]] = []
+        candidates: list[tuple[str, str, Path, FileIdentity]] = []
         for day in day_names:
             if not _is_valid_day(day):
                 self._anomaly("", "", "foreign_name", "day")
                 continue
-            entries, entry_problem = _secure_dir_names(pending / day)
+            entries, day_identity, entry_problem = _secure_dir_names(pending / day)
             if entry_problem is not None:
                 # an unlistable or truncated day leaves possible batches (and duplicates) unseen
                 self._anomaly("", day, "foreign_name", f"day_{entry_problem}")
                 self._complete = False
                 continue
-            assert entries is not None
+            assert entries is not None and day_identity is not None
             for name in entries:
                 if self._scanned >= _MAX_TOTAL:
                     self._anomaly("", "", "limit", "scan_limit")
@@ -353,7 +359,7 @@ class _Scan:
                 self._scanned += 1
                 resolved = self._classify_name(pending / day / name, day, name)
                 if resolved is not None:
-                    candidates.append(resolved)
+                    candidates.append((*resolved, day_identity))
         if self._stopped:
             self._complete = False  # the anomaly cap fired during inventory
         return candidates
@@ -368,8 +374,15 @@ class _Scan:
             return None
         return day, batch_id, path
 
-    def _verify_committed(self, path: Path, day: str, batch_id: str, record: SegmentRecord) -> None:
-        parsed, code = self._trusted_read(path)
+    def _verify_committed(
+        self,
+        path: Path,
+        day: str,
+        batch_id: str,
+        record: SegmentRecord,
+        day_identity: FileIdentity,
+    ) -> None:
+        parsed, code = self._trusted_read(path, day_identity)
         if code is not None:
             self._anomaly(batch_id, day, "corrupt_file", code)
         elif not _agrees(parsed, day, batch_id, record):
@@ -377,8 +390,10 @@ class _Scan:
         else:
             self._healthy += 1
 
-    def _reconcile_orphan(self, path: Path, day: str, batch_id: str) -> None:
-        parsed, code = self._trusted_read(path)
+    def _reconcile_orphan(
+        self, path: Path, day: str, batch_id: str, day_identity: FileIdentity
+    ) -> None:
+        parsed, code = self._trusted_read(path, day_identity)
         if code is not None:
             self._anomaly(batch_id, day, "corrupt_orphan", code)
             return
@@ -394,11 +409,17 @@ class _Scan:
         # registration is deferred: mutation begins only after the whole pass proves complete
         self._pending_registrations.append((parsed, batch_id, day))
 
-    def _trusted_read(self, path: Path) -> tuple[ParsedSegment | None, str | None]:
+    def _trusted_read(
+        self, path: Path, day_identity: FileIdentity
+    ) -> tuple[ParsedSegment | None, str | None]:
         parsed: ParsedSegment | None = None
         code: str | None = None
         try:
-            parsed = read_trusted_segment(path, installation_id=self._installation_id)
+            parsed = read_trusted_segment(
+                path,
+                installation_id=self._installation_id,
+                expected_parent=day_identity,
+            )
         except SpoolError as error:
             code = error.code
         return parsed, code

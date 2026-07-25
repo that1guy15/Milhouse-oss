@@ -1044,6 +1044,115 @@ def test_a_control_byte_directory_name_is_omitted(tmp_path: Path) -> None:
         database.close()
 
 
+def _swap_then_read(swap_action, calls: list[int]):  # type: ignore[no-untyped-def]
+    """A deterministic race hook: run the swap before the first trusted read, then delegate."""
+
+    from milhouse.spooling.reader import read_trusted_segment as real_read
+
+    def _wrapper(path, *, installation_id, expected_parent=None):  # type: ignore[no-untyped-def]
+        if not calls:
+            calls.append(1)
+            swap_action()
+        return real_read(path, installation_id=installation_id, expected_parent=expected_parent)
+
+    return _wrapper
+
+
+def test_a_day_directory_replaced_after_enumeration_registers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the re-review's reproduction: swap the owned 0700 day directory between enumeration and the
+    # trusted read, leaving a same-name file with a DIFFERENT exporter policy; the read must bind to
+    # the inventoried directory identity and fail closed instead of registering the replacement
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    header_a, frames_a = _segment(batch_id="batch-1", exporters=("alpha",))
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header_a, frames_a))
+    day_dir = spool_root / "pending" / _DAY
+
+    def _swap() -> None:
+        os.rename(day_dir, spool_root / "pending" / "displaced")
+        day_dir.mkdir(mode=0o700)
+        os.chmod(day_dir, 0o700)
+        header_b, frames_b = _segment(batch_id="batch-1", exporters=("beta",))
+        publish_segment_bytes(day_dir / "batch-1.jsonl", build_segment_bytes(header_b, frames_b))
+
+    calls: list[int] = []
+    monkeypatch.setattr(reconcile_module, "read_trusted_segment", _swap_then_read(_swap, calls))
+    try:
+        report = reconciler.reconcile()
+        assert calls == [1]  # the swap genuinely ran before the read
+        assert report.registered == ()
+        assert report.healthy == 0
+        assert report.anomalies == (
+            SegmentAnomaly("batch-1", _DAY, "corrupt_orphan", "MH_SPOOL_CHANGED"),
+        )
+        assert _count(database) == 0
+        assert _count(database, "_segment_exporters") == 0  # the beta policy was never bound
+    finally:
+        database.close()
+
+
+def test_an_ancestor_directory_replaced_after_enumeration_registers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ancestor variant: the whole pending tree is swapped for a same-shape replacement
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    header_a, frames_a = _segment(batch_id="batch-1", exporters=("alpha",))
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header_a, frames_a))
+    pending = spool_root / "pending"
+
+    def _swap() -> None:
+        os.rename(pending, spool_root / "pending-displaced")
+        day_dir = pending / _DAY
+        day_dir.mkdir(mode=0o700, parents=True)
+        os.chmod(pending, 0o700)
+        os.chmod(day_dir, 0o700)
+        header_b, frames_b = _segment(batch_id="batch-1", exporters=("beta",))
+        publish_segment_bytes(day_dir / "batch-1.jsonl", build_segment_bytes(header_b, frames_b))
+
+    calls: list[int] = []
+    monkeypatch.setattr(reconcile_module, "read_trusted_segment", _swap_then_read(_swap, calls))
+    try:
+        report = reconciler.reconcile()
+        assert calls == [1]
+        assert report.registered == ()
+        assert report.anomalies == (
+            SegmentAnomaly("batch-1", _DAY, "corrupt_orphan", "MH_SPOOL_CHANGED"),
+        )
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_a_committed_file_in_a_replaced_directory_is_not_certified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the committed-verification path must also bind to the inventoried directory identity
+    database, store, spool_root, reconciler = _reconciler(tmp_path)
+    header, frames = _segment(batch_id="batch-1")
+    store.commit_segment(header, frames, committed_at=_NOW)
+    day_dir = spool_root / "pending" / _DAY
+    content = build_segment_bytes(header, frames)
+
+    def _swap() -> None:
+        os.rename(day_dir, spool_root / "pending" / "displaced")
+        day_dir.mkdir(mode=0o700)
+        os.chmod(day_dir, 0o700)
+        publish_segment_bytes(day_dir / "batch-1.jsonl", content)  # even byte-identical content
+
+    calls: list[int] = []
+    monkeypatch.setattr(reconcile_module, "read_trusted_segment", _swap_then_read(_swap, calls))
+    try:
+        report = reconciler.reconcile()
+        assert calls == [1]
+        assert report.healthy == 0
+        assert report.anomalies == (
+            SegmentAnomaly("batch-1", _DAY, "corrupt_file", "MH_SPOOL_CHANGED"),
+        )
+    finally:
+        database.close()
+
+
 def test_a_symlinked_day_directory_is_reported_unsafe(tmp_path: Path) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     try:

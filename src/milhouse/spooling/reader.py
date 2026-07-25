@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from milhouse.config.filesystem import (
+    FileIdentity,
     FileSnapshot,
     SecureFileError,
     SecureFileErrorKind,
@@ -304,21 +305,25 @@ def _require_installation_id(installation_id: str) -> None:
         _fail("MH_SPOOL_IDENTITY", "a well-formed installation id is required")
 
 
-def _open_regular(path: str | Path, *, require_private_parent: bool) -> tuple[int, FileSnapshot]:
+def _open_regular(
+    path: str | Path, *, require_private_parent: bool
+) -> tuple[int, FileSnapshot, FileIdentity]:
     kind: SecureFileErrorKind | None = None
     descriptor: int | None = None
     snapshot: FileSnapshot | None = None
+    parent: FileIdentity | None = None
     try:
         opened = open_regular_file_no_follow(path, require_private_parent=require_private_parent)
         descriptor = opened.descriptor
         snapshot = opened.snapshot
+        parent = opened.parent_identity
     except SecureFileError as error:
         kind = error.kind
     if kind is not None:
         _fail(_READ_CODE_BY_KIND.get(kind, "MH_SPOOL_READ"), "the segment file could not be opened")
-    if descriptor is None or snapshot is None:  # pragma: no cover - open returns a fd or sets kind
+    if descriptor is None or snapshot is None or parent is None:  # pragma: no cover - defensive
         _fail("MH_SPOOL_READ", "the segment file could not be opened")
-    return descriptor, snapshot
+    return descriptor, snapshot, parent
 
 
 def _is_trusted_regular_file(metadata: os.stat_result) -> bool:
@@ -392,11 +397,16 @@ def read_untrusted_segment(path: str | Path) -> ParsedSegment:
     as trusted durable state; use :func:`read_trusted_segment` for that.
     """
 
-    descriptor, snapshot = _open_regular(path, require_private_parent=False)
+    descriptor, snapshot, _parent = _open_regular(path, require_private_parent=False)
     return parse_segment_bytes(_read_descriptor(descriptor, snapshot, harden=False))
 
 
-def read_trusted_segment(path: str | Path, *, installation_id: str) -> ParsedSegment:
+def read_trusted_segment(
+    path: str | Path,
+    *,
+    installation_id: str,
+    expected_parent: FileIdentity | None = None,
+) -> ParsedSegment:
     """Securely read and fully validate a durable segment as trusted state (the acceptance path).
 
     ``installation_id`` is mandatory: the file is opened no-follow under an owned ``0700`` parent,
@@ -404,11 +414,22 @@ def read_trusted_segment(path: str | Path, *, installation_id: str) -> ParsedSeg
     bytes are read under the size bound and re-checked against the open-time snapshot to reject any
     mutation during selection, and every record's deterministic identity is re-derived against the
     installation so a canonical-but-forged or foreign record fails closed. There is no argument that
-    can bypass provenance.
+    can bypass provenance. A caller that inventoried the parent directory earlier should pass its
+    captured identity as ``expected_parent``: if the file's actual parent inode differs — the
+    directory was replaced between enumeration and this read — the read fails closed with
+    ``MH_SPOOL_CHANGED`` before a single content byte is consumed.
     """
 
     _require_installation_id(installation_id)
-    descriptor, snapshot = _open_regular(path, require_private_parent=True)
+    descriptor, snapshot, parent = _open_regular(path, require_private_parent=True)
+    if expected_parent is not None and parent != expected_parent:
+        changed = True
+        try:
+            os.close(descriptor)
+        except OSError:  # pragma: no cover - defensive: close failure on a valid descriptor
+            pass
+        if changed:
+            _fail("MH_SPOOL_CHANGED", "the segment's parent directory changed since enumeration")
     parsed = parse_segment_bytes(_read_descriptor(descriptor, snapshot, harden=True))
     _verify_identity(parsed.frames, installation_id)
     return parsed
