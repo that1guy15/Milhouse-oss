@@ -296,9 +296,7 @@ class _Scan:
         if self._complete:
             for day, batch_id, path, day_identity in candidates:
                 if self._stopped:
-                    # the anomaly cap fired mid-verification: the rest of the pass is unproven
-                    self._complete = False
-                    break
+                    break  # the anomaly cap fired: the rest of the pass is unproven
                 seen.add(batch_id)
                 if counts[batch_id] > 1:
                     self._anomaly(batch_id, day, "conflict", "duplicate_batch_id")
@@ -309,15 +307,27 @@ class _Scan:
                 else:
                     self._reconcile_orphan(path, day, batch_id, day_identity)
 
+        # Missing-ledger-file classification is classification, so it runs BEFORE any mutation.
         if self._complete:
-            # Mutation happens only after a complete, within-bounds inventory proved every candidate
-            # batch id globally unique, so a bound can never truncate authority onto a partial view.
+            for batch_id, record in ledger.items():
+                if self._stopped:
+                    break  # the cap fired (possibly during the candidate phase): stop classifying
+                if batch_id not in seen:
+                    self._anomaly(batch_id, record.day, "missing_file", "absent")
+
+        # After every phase and again immediately before mutation: a fired anomaly cap voids the
+        # pass even when it fired on the FINAL classified item (the re-review's reproduction, where
+        # a top-of-loop check alone never runs again).
+        if self._stopped:
+            self._complete = False
+        if self._complete:
+            # Mutation happens only after complete, within-bounds classification proved every
+            # candidate batch id globally unique and the anomaly budget was never exhausted.
             for parsed, batch_id, day in self._pending_registrations:
                 self._register(parsed, batch_id, day)
                 self._registered.append(OrphanRegistration(batch_id, day))
-            for batch_id, record in ledger.items():
-                if batch_id not in seen:
-                    self._anomaly(batch_id, record.day, "missing_file", "absent")
+        else:
+            self._pending_registrations.clear()
 
         return ReconciliationReport(
             registered=tuple(self._registered),

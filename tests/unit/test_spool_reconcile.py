@@ -1381,6 +1381,69 @@ def test_a_valid_orphan_beyond_the_anomaly_cap_is_not_registered(
         database.close()
 
 
+def test_the_anomaly_cap_on_the_final_candidate_registers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the re-review's reproduction: a positive cap where the LAST classified candidate fires
+    # anomaly_limit — there is no next loop iteration, so only a post-phase check can void the pass
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    monkeypatch.setattr(reconcile_module, "_MAX_ANOMALIES", 1)
+    header, frames = _segment(batch_id="a-valid")
+    _publish_orphan(spool_root, _DAY, "a-valid.jsonl", build_segment_bytes(header, frames))
+    day_dir = spool_root / "pending" / _DAY
+    for corrupt in ("b-corrupt.jsonl", "c-corrupt.jsonl"):  # sorted after a-valid
+        (day_dir / corrupt).write_bytes(b"junk\n")
+        os.chmod(day_dir / corrupt, 0o600)
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()  # the staged a-valid orphan was discarded, not promoted
+        assert report.healthy == 0
+        assert SegmentAnomaly("", "", "limit", "anomaly_limit") in report.anomalies
+        assert _count(database) == 0
+        assert _count(database, "_segment_exporters") == 0
+        # re-runs stay mutation-free and deterministic
+        assert reconciler.reconcile().registered == ()
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_the_anomaly_cap_during_missing_file_classification_registers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the analogous boundary in the other classification phase: missing-file anomalies exhaust the
+    # cap after an orphan was staged — the staged orphan must still be discarded
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    monkeypatch.setattr(reconcile_module, "_MAX_ANOMALIES", 2)
+    header, frames = _segment(batch_id="a-valid")
+    _publish_orphan(spool_root, _DAY, "a-valid.jsonl", build_segment_bytes(header, frames))
+    try:
+        with database.transaction() as connection:
+            for name in ("m1", "m2", "m3"):  # valid committed rows whose files are absent
+                connection.execute(
+                    "INSERT INTO _segments (batch_id, day, schema_version, frame_version, "
+                    "config_generation, scope, target_id, privacy_class, retention_days, "
+                    "record_count, content_sha256, byte_size, file_sha256, committed_at, origin) "
+                    "VALUES (?, '2026-07-24', 1, 1, ?, 'target', 't', 'internal', 30, 1, ?, 10, ?, "
+                    "'2026-07-24T12:00:00.000Z', 'committed')",
+                    (name, "a" * 64, "c" * 64, "d" * 64),
+                )
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.healthy == 0
+        assert SegmentAnomaly("", "", "limit", "anomaly_limit") in report.anomalies
+        rows = {
+            row[0]
+            for row in database.connection.execute("SELECT batch_id FROM _segments").fetchall()
+        }
+        assert rows == {"m1", "m2", "m3"}  # only the pre-inserted rows; a-valid was not promoted
+        assert _count(database, "_segment_exporters") == 0
+    finally:
+        database.close()
+
+
 def test_the_writer_fails_closed_on_a_truncated_reconciliation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
