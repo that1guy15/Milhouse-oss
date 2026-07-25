@@ -413,6 +413,23 @@ def test_check_constraints_reject_an_invalid_write(tmp_path: Path) -> None:
         database.close()
 
 
+def test_the_origin_check_rejects_an_unknown_origin(tmp_path: Path) -> None:
+    database, _store, _spool_root = _spool(tmp_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):  # migration 3's origin CHECK
+            with database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO _segments (batch_id, day, schema_version, frame_version, "
+                    "config_generation, scope, target_id, privacy_class, retention_days, "
+                    "record_count, content_sha256, byte_size, file_sha256, committed_at, origin) "
+                    "VALUES ('b', '2026-07-24', 1, 1, ?, 'target', 't', 'internal', 30, 1, ?, 10, "
+                    "?, '2026-07-24T00:00:00.000Z', 'bogus')",
+                    ("a" * 64, "b" * 64, "c" * 64),
+                )
+    finally:
+        database.close()
+
+
 @pytest.mark.parametrize("privacy_class", ["public", "internal", "sensitive"])
 def test_authorize_admits_every_local_persistable_class(privacy_class: str) -> None:
     authorize_local_persistence(privacy_class)  # returns without raising

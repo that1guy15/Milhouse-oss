@@ -1026,9 +1026,39 @@ def test_the_ledger_api_surfaces_committed_and_reconciled_origins(tmp_path: Path
 
         origins = {record.batch_id: record.origin for record in store.list_segments()}
         assert origins == {"committed-1": "committed", "reconciled-1": "reconciled"}
+        # read_segment must preserve the distinction independently of list_segments
         reconciled = store.read_segment("reconciled-1")
         assert reconciled is not None
+        assert reconciled.origin == "reconciled"
         assert reconciled.committed_at == f"{_DAY}T00:00:00.000Z"
+        committed = store.read_segment("committed-1")
+        assert committed is not None
+        assert committed.origin == "committed"
+    finally:
+        database.close()
+
+
+def test_a_row_without_an_origin_value_defaults_to_committed(tmp_path: Path) -> None:
+    # legacy compatibility: a row written without the origin column (as any pre-migration-3 writer
+    # would) takes the column DEFAULT and reads back as a committed record
+    database, store, _spool_root, _reconciler_unused = _reconciler(tmp_path)
+    try:
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO _segments (batch_id, day, schema_version, frame_version, "
+                "config_generation, scope, target_id, privacy_class, retention_days, record_count, "
+                "content_sha256, byte_size, file_sha256, committed_at) VALUES "
+                "('legacy-1', '2026-07-24', 1, 1, ?, 'target', 't', 'internal', 30, 1, ?, 10, ?, "
+                "'2026-07-24T12:00:00.000Z')",
+                ("a" * 64, "c" * 64, "d" * 64),
+            )
+        stored = database.connection.execute(
+            "SELECT origin FROM _segments WHERE batch_id = 'legacy-1'"
+        ).fetchone()[0]
+        assert stored == "committed"
+        record = store.read_segment("legacy-1")
+        assert record is not None
+        assert record.origin == "committed"  # the default flows through full validation
     finally:
         database.close()
 
