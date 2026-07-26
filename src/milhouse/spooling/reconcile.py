@@ -15,8 +15,8 @@ enumeration and then, comparing against the fully validated ``_segments`` ledger
   immutable field, both digests, byte size, and the exact required-exporter identity set;
 * reports every ledger row whose file is missing, every malformed ledger row, every file that
   disagrees with its row, every batch id that appears at more than one path (registering none of
-  them), and every foreign entry — carrying only fixed reasons and keyed name fingerprints, never a
-  raw path.
+  them), and every foreign entry — carrying only validated identifiers and fixed reasons; an
+  invalid name is omitted entirely, so no raw or derived untrusted name reaches a report surface.
 
 The scan never deletes, quarantines, or moves a file; it registers valid orphans and returns a
 :class:`ReconciliationReport`. Every failure is a fixed ``MH_SPOOL_*`` error raised outside any
@@ -26,18 +26,18 @@ handler.
 from __future__ import annotations
 
 import errno
-import hashlib
 import os
 import re
 import sqlite3
 import stat
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
-from milhouse.config.filesystem import lexical_absolute_path
+from milhouse.config.filesystem import FileIdentity, lexical_absolute_path
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
     ORIGIN_RECONCILED,
@@ -59,7 +59,7 @@ from milhouse.spooling.segment import (
     FRAME_VERSION,
     SCHEMA_VERSION,
 )
-from milhouse.state.barrier import GlobalCommitBarrier
+from milhouse.state.barrier import ExclusiveHold, GlobalCommitBarrier
 from milhouse.state.database import ControlDatabase
 from milhouse.state.errors import StateError
 
@@ -100,8 +100,9 @@ class SegmentAnomaly:
     its row), ``corrupt_orphan`` (an unrecorded file that fails trusted validation or egress),
     ``conflict`` (a batch id at more than one path), ``foreign_name`` (an entry whose name is not a
     well-formed ``<batch-id>.jsonl`` under a valid day), or ``limit`` (a scan bound was exceeded).
-    ``batch_id`` and ``day`` are validated identifiers or fixed ``sha256:`` fingerprints of an
-    untrusted name; ``detail`` is a fixed reason or ``MH_SPOOL_*`` code — never a raw path.
+    ``batch_id`` and ``day`` are validated identifiers or empty when the underlying name was
+    invalid (untrusted names are omitted entirely, never echoed or fingerprinted); ``detail`` is a
+    fixed reason or ``MH_SPOOL_*`` code — never a raw path.
     """
 
     batch_id: str
@@ -112,12 +113,19 @@ class SegmentAnomaly:
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationReport:
-    """The outcome of one reconciliation scan."""
+    """The outcome of one reconciliation scan.
+
+    ``complete`` is False when any enumeration bound or unreadable/unsafe directory truncated the
+    inventory. An incomplete scan is certification- and mutation-free: it registers nothing,
+    certifies nothing healthy, and asserts no missing files, because a truncated inventory cannot
+    prove global batch uniqueness or absence.
+    """
 
     registered: tuple[OrphanRegistration, ...]
     anomalies: tuple[SegmentAnomaly, ...]
     healthy: int
     scanned: int
+    complete: bool
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -131,16 +139,17 @@ def _current_uid() -> int:
     return int(geteuid())
 
 
-def _fingerprint(name: str) -> str:
-    """A stable, path-free fingerprint of an untrusted spool entry name for the report."""
-
-    return "sha256:" + hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-
-
 def _safe_id(batch_id: str) -> str:
-    """Keep a well-formed batch id readable in the report; fingerprint anything else."""
+    """Keep a well-formed batch id readable in the report; OMIT anything else entirely.
 
-    return batch_id if BATCH_ID_PATTERN.fullmatch(batch_id) is not None else _fingerprint(batch_id)
+    An invalid name is untrusted input. The re-review showed a truncated bare SHA-256 is
+    dictionary-recoverable for low-entropy names, and no keyed pseudonymization primitive is wired
+    into the spool subsystem yet, so no derivative of an invalid name reaches any report surface:
+    the field is empty and only the fixed reason identifies the anomaly class. Quarantine (a later
+    slice) handles the file itself.
+    """
+
+    return batch_id if BATCH_ID_PATTERN.fullmatch(batch_id) is not None else ""
 
 
 def _is_valid_day(day: str) -> bool:
@@ -154,10 +163,14 @@ def _is_valid_day(day: str) -> bool:
     return valid
 
 
-def _secure_dir_names(path: Path) -> tuple[tuple[str, ...] | None, str | None]:
+def _secure_dir_names(
+    path: Path,
+) -> tuple[tuple[str, ...] | None, FileIdentity | None, str | None]:
     """List a directory over an owned 0700 no-follow descriptor, capping entries before collecting.
 
-    Returns ``(names, None)`` on success (``()`` if absent), or ``(None, reason)`` where reason is
+    Returns ``(names, identity, None)`` on success (``((), None, None)`` if absent), where
+    ``identity`` is the opened directory's device/inode so a later per-file read can prove it still
+    operates beneath the exact inventoried directory; or ``(None, None, reason)`` where reason is
     ``unsafe`` (symlink, non-directory, wrong owner, or mode) or ``unreadable``.
     """
 
@@ -166,13 +179,15 @@ def _secure_dir_names(path: Path) -> tuple[tuple[str, ...] | None, str | None]:
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
-        return (), None
+        return (), None, None
     except OSError as exc:
-        return None, "unsafe" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "unreadable"
+        return None, None, "unsafe" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "unreadable"
     problem: str | None = None
     names: tuple[str, ...] | None = None
+    identity: FileIdentity | None = None
     try:
         info = os.fstat(descriptor)
+        identity = FileIdentity.from_stat(info)
         if (
             not stat.S_ISDIR(info.st_mode)
             or info.st_uid != _current_uid()
@@ -197,24 +212,89 @@ def _secure_dir_names(path: Path) -> tuple[tuple[str, ...] | None, str | None]:
         except OSError:  # pragma: no cover - defensive: close failure on a valid descriptor
             problem = problem or "unreadable"
     if problem is not None:
-        return None, problem
-    return names, None
+        return None, None, problem
+    return names, identity, None
 
 
-def run_reconciliation_scan(
-    *, database: ControlDatabase, spool_root: str | Path, installation_id: str
+def _require_bound_state_root(
+    database: object, barrier: object, spool_root: str | Path, installation_id: str
+) -> Path:
+    """Require database, barrier, and spool root to share one canonical state root.
+
+    A barrier from a different state root is not authority for this database/spool pair, so the
+    binding is validated here (the wrapper) as well as at the public constructors, and the scan
+    additionally re-validates the live token's own barrier identity against the database.
+    """
+
+    if not isinstance(barrier, GlobalCommitBarrier):
+        _fail("MH_SPOOL_STORE", "a commit barrier is required")
+    database_path = getattr(database, "path", None)
+    if database_path is None:
+        _fail("MH_SPOOL_STORE", "a control database is required")
+    control_dir = lexical_absolute_path(database_path).parent
+    state_root = control_dir.parent
+    resolved_spool = lexical_absolute_path(spool_root)
+    if lexical_absolute_path(barrier.path) != control_dir / _BARRIER_NAME:
+        _fail("MH_SPOOL_STORE", "the barrier must be the control-plane commit lock")
+    if resolved_spool != state_root / _SPOOL:
+        _fail("MH_SPOOL_STORE", "the spool root must be <state_root>/spool")
+    if (
+        type(installation_id) is not str
+        or INSTALLATION_ID_PATTERN.fullmatch(installation_id) is None
+    ):
+        _fail("MH_SPOOL_IDENTITY", "a well-formed installation id is required")
+    return resolved_spool
+
+
+def _reconcile_under_barrier(
+    *,
+    database: ControlDatabase,
+    barrier: GlobalCommitBarrier,
+    spool_root: str | Path,
+    installation_id: str,
+    action: Callable[[], None] | None = None,
+    observe: Callable[[ReconciliationReport], None] | None = None,
 ) -> ReconciliationReport:
-    """Reconcile the pending spool with the ledger. The caller MUST hold the exclusive barrier."""
+    """The only reconciliation entrypoint: acquires the exclusive barrier itself, then scans.
 
-    return _Scan(database, lexical_absolute_path(spool_root), installation_id).run()
+    There is no standalone callable that executes the scan without owning barrier authority: this
+    wrapper first validates that database, barrier, and spool root share one canonical state root,
+    then acquires the exclusive side and passes the live :class:`ExclusiveHold` token to
+    :meth:`_Scan.run`, which re-validates the token's barrier identity against the database before
+    its first ledger read — so even a direct internal call of the scan, or a live token issued by a
+    different state root's barrier, fails closed before any mutation. ``action`` (the commit path's
+    publish+ledger callback) runs inside the same hold when the scan is complete, preserving the
+    no-gap reconcile-to-commit handoff; ``observe`` receives the report inside the hold before the
+    action runs, so a caller records it even when the action then fails.
+    """
+
+    spool_root = _require_bound_state_root(database, barrier, spool_root, installation_id)
+    report: ReconciliationReport | None = None
+    barrier_failed = False
+    try:
+        with barrier.exclusive() as hold:
+            report = _Scan(database, lexical_absolute_path(spool_root), installation_id).run(hold)
+            if observe is not None:
+                observe(report)
+            if action is not None and report.complete:
+                action()
+    except StateError:
+        # The scan and ledger paths remap their own StateErrors; this only catches a
+        # barrier-acquisition failure so callers never surface a non-MH_SPOOL_* error.
+        barrier_failed = True
+    if barrier_failed or report is None:
+        _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
+    return report
 
 
 class _Scan:
     __slots__ = (
         "_anomalies",
+        "_complete",
         "_database",
         "_healthy",
         "_installation_id",
+        "_pending_registrations",
         "_registered",
         "_scanned",
         "_spool_root",
@@ -226,40 +306,85 @@ class _Scan:
         self._spool_root = spool_root
         self._installation_id = installation_id
         self._registered: list[OrphanRegistration] = []
+        self._pending_registrations: list[tuple[ParsedSegment, str, str]] = []
         self._anomalies: list[SegmentAnomaly] = []
         self._healthy = 0
         self._scanned = 0
         self._stopped = False
+        self._complete = True
 
-    def run(self) -> ReconciliationReport:
+    def run(self, authority: ExclusiveHold) -> ReconciliationReport:
+        # Validated BEFORE the first ledger read: a direct call without a live exclusive hold of
+        # THIS control plane's own commit lock fails closed with no mutation. A live token from any
+        # other barrier is not authority for this database/spool pair — "some barrier is held" is
+        # exactly the bypass the gate review reproduced. Underscore convention is not enforcement;
+        # this identity comparison is.
+        database_path = getattr(self._database, "path", None)
+        expected_lock = (
+            lexical_absolute_path(database_path).parent / _BARRIER_NAME
+            if database_path is not None
+            else None
+        )
+        if (
+            not isinstance(authority, ExclusiveHold)
+            or not authority.active
+            or expected_lock is None
+            or lexical_absolute_path(authority.barrier_path) != expected_lock
+        ):
+            _fail(
+                "MH_SPOOL_BARRIER",
+                "reconciliation requires a live exclusive hold of this control plane's barrier",
+            )
         ledger, malformed = self._ledger_index()
         for batch_id in sorted(malformed):
             # the batch id came from a row that failed validation, so it may not be well formed
             self._anomaly(_safe_id(batch_id), "", "corrupt_ledger", "unreadable_row")
 
         candidates = self._inventory()
-        counts = Counter(batch_id for _day, batch_id, _path in candidates)
+        counts = Counter(batch_id for _day, batch_id, _path, _identity in candidates)
         seen: set[str] = set()
-        for day, batch_id, path in candidates:
-            seen.add(batch_id)
-            if counts[batch_id] > 1:
-                self._anomaly(batch_id, day, "conflict", "duplicate_batch_id")
-            elif batch_id in malformed:
-                continue  # the malformed-row anomaly already covers this batch
-            elif batch_id in ledger:
-                self._verify_committed(path, day, batch_id, ledger[batch_id])
-            else:
-                self._reconcile_orphan(path, day, batch_id)
+        if self._complete:
+            for day, batch_id, path, day_identity in candidates:
+                if self._capped():
+                    break  # the anomaly cap fired: the rest of the pass is unproven
+                seen.add(batch_id)
+                if counts[batch_id] > 1:
+                    self._anomaly(batch_id, day, "conflict", "duplicate_batch_id")
+                elif batch_id in malformed:
+                    continue  # the malformed-row anomaly already covers this batch
+                elif batch_id in ledger:
+                    self._verify_committed(path, day, batch_id, ledger[batch_id], day_identity)
+                else:
+                    self._reconcile_orphan(path, day, batch_id, day_identity)
 
-        for batch_id, record in ledger.items():
-            if batch_id not in seen:
-                self._anomaly(batch_id, record.day, "missing_file", "absent")
+        # Missing-ledger-file classification is classification, so it runs BEFORE any mutation.
+        if self._complete:
+            for batch_id, record in ledger.items():
+                if self._capped():
+                    break  # the cap fired (possibly during the candidate phase): stop classifying
+                if batch_id not in seen:
+                    self._anomaly(batch_id, record.day, "missing_file", "absent")
+
+        # After every phase and again immediately before mutation: a fired anomaly cap voids the
+        # pass even when it fired on the FINAL classified item (the re-review's reproduction, where
+        # a top-of-loop check alone never runs again).
+        if self._capped():
+            self._complete = False
+        if self._complete:
+            # Mutation happens only after complete, within-bounds classification proved every
+            # candidate batch id globally unique and the anomaly budget was never exhausted.
+            for parsed, batch_id, day in self._pending_registrations:
+                self._register(parsed, batch_id, day)
+                self._registered.append(OrphanRegistration(batch_id, day))
+        else:
+            self._pending_registrations.clear()
 
         return ReconciliationReport(
             registered=tuple(self._registered),
             anomalies=tuple(self._anomalies),
-            healthy=self._healthy,
+            healthy=self._healthy if self._complete else 0,
             scanned=self._scanned,
+            complete=self._complete,
         )
 
     def _anomaly(self, batch_id: str, day: str, kind: str, detail: str) -> None:
@@ -268,6 +393,9 @@ class _Scan:
         elif not self._stopped:
             self._stopped = True
             self._anomalies.append(SegmentAnomaly("", "", "limit", "anomaly_limit"))
+
+    def _capped(self) -> bool:
+        return self._stopped
 
     def _ledger_index(self) -> tuple[dict[str, SegmentRecord], set[str]]:
         ledger: dict[str, SegmentRecord] = {}
@@ -290,48 +418,71 @@ class _Scan:
             _fail("MH_SPOOL_LEDGER", "the segment ledger could not be read")
         return ledger, malformed
 
-    def _inventory(self) -> list[tuple[str, str, Path]]:
+    def _inventory(self) -> list[tuple[str, str, Path, FileIdentity]]:
         pending = self._spool_root / _PENDING
-        day_names, problem = _secure_dir_names(pending)
+        day_names, _pending_identity, problem = _secure_dir_names(pending)
         if problem is not None:
+            # an unlistable pending directory means the inventory cannot be proven complete
             self._anomaly("", "", "foreign_name", f"pending_{problem}")
+            self._complete = False
             return []
         assert day_names is not None
         if len(day_names) > _MAX_DAYS:
             self._anomaly("", "", "limit", "day_limit")
-            day_names = day_names[:_MAX_DAYS]
-        candidates: list[tuple[str, str, Path]] = []
+            self._complete = False
+            return []
+        candidates: list[tuple[str, str, Path, FileIdentity]] = []
         for day in day_names:
+            if self._capped():
+                # The anomaly cap bounds lock-hold WORK, not just report size: once it fires, no
+                # further directory is opened and no further entry is classified.
+                self._complete = False
+                return candidates
             if not _is_valid_day(day):
-                self._anomaly("", _fingerprint(day), "foreign_name", "day")
+                self._anomaly("", "", "foreign_name", "day")
                 continue
-            entries, entry_problem = _secure_dir_names(pending / day)
+            entries, day_identity, entry_problem = _secure_dir_names(pending / day)
             if entry_problem is not None:
+                # an unlistable or truncated day leaves possible batches (and duplicates) unseen
                 self._anomaly("", day, "foreign_name", f"day_{entry_problem}")
+                self._complete = False
                 continue
-            assert entries is not None
+            assert entries is not None and day_identity is not None
             for name in entries:
+                if self._capped():
+                    self._complete = False
+                    return candidates
                 if self._scanned >= _MAX_TOTAL:
                     self._anomaly("", "", "limit", "scan_limit")
+                    self._complete = False
                     return candidates
                 self._scanned += 1
                 resolved = self._classify_name(pending / day / name, day, name)
                 if resolved is not None:
-                    candidates.append(resolved)
+                    candidates.append((*resolved, day_identity))
+        if self._capped():
+            self._complete = False  # the anomaly cap fired on the final inventory item
         return candidates
 
     def _classify_name(self, path: Path, day: str, name: str) -> tuple[str, str, Path] | None:
         if not name.endswith(_SEGMENT_SUFFIX):
-            self._anomaly(_fingerprint(name), day, "foreign_name", "suffix")
+            self._anomaly("", day, "foreign_name", "suffix")
             return None
         batch_id = name[: -len(_SEGMENT_SUFFIX)]
         if BATCH_ID_PATTERN.fullmatch(batch_id) is None:
-            self._anomaly(_fingerprint(name), day, "foreign_name", "batch_id")
+            self._anomaly("", day, "foreign_name", "batch_id")
             return None
         return day, batch_id, path
 
-    def _verify_committed(self, path: Path, day: str, batch_id: str, record: SegmentRecord) -> None:
-        parsed, code = self._trusted_read(path)
+    def _verify_committed(
+        self,
+        path: Path,
+        day: str,
+        batch_id: str,
+        record: SegmentRecord,
+        day_identity: FileIdentity,
+    ) -> None:
+        parsed, code = self._trusted_read(path, day_identity)
         if code is not None:
             self._anomaly(batch_id, day, "corrupt_file", code)
         elif not _agrees(parsed, day, batch_id, record):
@@ -339,8 +490,10 @@ class _Scan:
         else:
             self._healthy += 1
 
-    def _reconcile_orphan(self, path: Path, day: str, batch_id: str) -> None:
-        parsed, code = self._trusted_read(path)
+    def _reconcile_orphan(
+        self, path: Path, day: str, batch_id: str, day_identity: FileIdentity
+    ) -> None:
+        parsed, code = self._trusted_read(path, day_identity)
         if code is not None:
             self._anomaly(batch_id, day, "corrupt_orphan", code)
             return
@@ -353,14 +506,20 @@ class _Scan:
         except SpoolError as denied:
             self._anomaly(batch_id, day, "corrupt_orphan", denied.code)
             return
-        self._register(parsed, batch_id, day)
-        self._registered.append(OrphanRegistration(batch_id, day))
+        # registration is deferred: mutation begins only after the whole pass proves complete
+        self._pending_registrations.append((parsed, batch_id, day))
 
-    def _trusted_read(self, path: Path) -> tuple[ParsedSegment | None, str | None]:
+    def _trusted_read(
+        self, path: Path, day_identity: FileIdentity
+    ) -> tuple[ParsedSegment | None, str | None]:
         parsed: ParsedSegment | None = None
         code: str | None = None
         try:
-            parsed = read_trusted_segment(path, installation_id=self._installation_id)
+            parsed = read_trusted_segment(
+                path,
+                installation_id=self._installation_id,
+                expected_parent=day_identity,
+            )
         except SpoolError as error:
             code = error.code
         return parsed, code
@@ -465,17 +624,9 @@ class SpoolReconciler:
     def reconcile(self) -> ReconciliationReport:
         """Scan pending against the ledger under the exclusive barrier; register valid orphans."""
 
-        report: ReconciliationReport | None = None
-        barrier_failed = False
-        try:
-            with self._barrier.exclusive():
-                report = run_reconciliation_scan(
-                    database=self._database,
-                    spool_root=self._spool_root,
-                    installation_id=self._installation_id,
-                )
-        except StateError:
-            barrier_failed = True
-        if barrier_failed or report is None:
-            _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
-        return report
+        return _reconcile_under_barrier(
+            database=self._database,
+            barrier=self._barrier,
+            spool_root=self._spool_root,
+            installation_id=self._installation_id,
+        )

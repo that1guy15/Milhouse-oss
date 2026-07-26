@@ -2,17 +2,19 @@
 
 A :class:`DurableSpool` binds one control database, one commit barrier, one spool root, and the
 installation identity, all under the same canonical state root, so a caller cannot publish under a
-different barrier than maintenance holds. Acquiring the store is a writer acquisition: per ADR 0004
-and plan sections 3.4/4.3 it performs mandatory spool/ledger reconciliation under the exclusive
-barrier before any commit is possible, so a durably-published but unrecorded orphan is registered
-before this writer proceeds and recovery is never opt-in.
+different barrier than maintenance holds. Per ADR 0004 and plan sections 3.4/4.3, mandatory
+spool/ledger reconciliation runs on writer acquisition AND inside every commit's own exclusive
+critical section with no unlock window before publication, so recovery is never opt-in and a
+long-lived writer can never proceed while another writer's crash left a durably-published segment
+unregistered.
 
 Per ADR 0004 and plan section 4.7 a commit is a deliberate, authorized, reconciled operation: it
 authorizes the ``local_spool`` and ``local_sqlite`` egress surfaces (restricted input is rejected
-before any mutation), derives the ``YYYY-MM-DD`` partition from the commit instant, then, while
-holding the shared commit barrier, creates the partition directory, atomically publishes the exact
-segment bytes (write, flush, fsync, no-replace rename, parent fsync), and inserts the segment ledger
-row (``origin = 'committed'``) plus one row per required exporter in a single SQLite transaction. A
+before any mutation), derives the ``YYYY-MM-DD`` partition from the commit instant, then, holding
+the exclusive commit barrier across reconciliation and publication, creates the partition
+directory, atomically publishes the exact segment bytes (write, flush, fsync, no-replace rename,
+parent fsync), and inserts the segment ledger row (``origin = 'committed'``) plus one row per
+required exporter in a single SQLite transaction. A
 crash or ledger failure after publication leaves a durable orphan and is reported as the fixed
 commit-uncertain ``MH_SPOOL_COMMIT``, never as success. The ledger preserves every immutable header
 field so recovery never infers policy from newer configuration, and every read is validated so a
@@ -26,6 +28,7 @@ import hashlib
 import os
 import sqlite3
 import stat
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
@@ -162,33 +165,45 @@ class DurableSpool:
         self._spool_root = resolved_spool
         self._installation_id = installation_id
         # A writer acquisition performs mandatory recovery: reconcile the spool with the ledger
-        # under the exclusive barrier before any commit is possible, so recovery is never opt-in and
-        # this writer cannot proceed while an earlier durable segment is absent from the ledger.
-        # Imported here to keep the reconcile module's dependency on the ledger one-directional.
-        from milhouse.spooling.reconcile import run_reconciliation_scan
-
-        report: ReconciliationReport | None = None
-        barrier_failed = False
-        try:
-            with self._barrier.exclusive():
-                report = run_reconciliation_scan(
-                    database=self._database,
-                    spool_root=self._spool_root,
-                    installation_id=self._installation_id,
-                )
-        except StateError:
-            # The scan itself remaps its own StateErrors; this only catches a barrier-acquisition
-            # failure so the writer API never surfaces a non-MH_SPOOL_* error.
-            barrier_failed = True
-        if barrier_failed or report is None:
-            _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
-        self._last_reconciliation = report
+        # under the exclusive barrier before any commit is possible. This constructor pass is an
+        # additional check; every commit ALSO reconciles inside its own exclusive critical section
+        # with no unlock window, so a long-lived writer can never proceed past another writer's
+        # later crash orphan (the gate review's reproduced handoff gap).
+        self._last_reconciliation = self._reconcile_exclusively(action=None)
 
     @property
     def last_reconciliation(self) -> ReconciliationReport:
-        """The reconciliation report produced when this writer acquired the store."""
+        """The report from this writer's most recent mandatory reconciliation pass."""
 
         return self._last_reconciliation
+
+    def _reconcile_exclusively(self, action: Callable[[], None] | None) -> ReconciliationReport:
+        """Run mandatory reconciliation and an optional commit action in one exclusive hold.
+
+        The barrier-owning wrapper in the reconcile module acquires the exclusive side itself and
+        passes its live authority token to the scan, so there is no unlock window between recovery
+        and the action and no call path that can scan without owning the barrier.
+        """
+
+        # Imported here to keep the reconcile module's dependency on the ledger one-directional.
+        from milhouse.spooling.reconcile import _reconcile_under_barrier
+
+        def _observe(report: ReconciliationReport) -> None:
+            self._last_reconciliation = report
+
+        report = _reconcile_under_barrier(
+            database=self._database,
+            barrier=self._barrier,
+            spool_root=self._spool_root,
+            installation_id=self._installation_id,
+            action=action,
+            observe=_observe,
+        )
+        if not report.complete:
+            # A truncated inventory cannot prove orphan absence or batch uniqueness, so mandatory
+            # recovery fails closed: neither acquisition nor a commit may proceed on a partial view.
+            _fail("MH_SPOOL_INCOMPLETE", "reconciliation was truncated by a scan bound")
+        return report
 
     def commit_segment(
         self,
@@ -197,7 +212,12 @@ class DurableSpool:
         *,
         committed_at: datetime,
     ) -> SegmentRecord:
-        """Authorize, publish, and record one segment under the shared commit barrier."""
+        """Reconcile, authorize, publish, and record one segment in one exclusive critical section.
+
+        Mandatory recovery runs first, under the same exclusive barrier hold as the publication and
+        ledger insert, so no other writer can create an orphan between reconciliation and this
+        commit and this writer cannot proceed while an earlier durable segment is unregistered.
+        """
 
         if not isinstance(header, SegmentHeaderV1):
             _fail("MH_SPOOL_HEADER", "a segment header is required")
@@ -226,16 +246,13 @@ class DurableSpool:
                 for exporter in header.required_exporters
             ),
         )
-        barrier_failed = False
-        try:
-            with self._barrier.shared():
-                day_dir = _pending_day_dir(self._spool_root, day)
-                publish_segment_bytes(day_dir / f"{header.batch_id}.jsonl", content)
-                self._commit_ledger(record)
-        except StateError:
-            barrier_failed = True
-        if barrier_failed:
-            _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
+
+        def _publish_and_record() -> None:
+            day_dir = _pending_day_dir(self._spool_root, day)
+            publish_segment_bytes(day_dir / f"{header.batch_id}.jsonl", content)
+            self._commit_ledger(record)
+
+        self._reconcile_exclusively(action=_publish_and_record)
         return record
 
     def _commit_ledger(self, record: SegmentRecord) -> None:

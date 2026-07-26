@@ -30,7 +30,11 @@ from milhouse.spooling import (
     spool_content_sha256,
     spool_frame_line,
 )
-from milhouse.spooling.ledger import authorize_local_persistence, validated_segment
+from milhouse.spooling.ledger import (
+    authorize_local_persistence,
+    load_exporters,
+    validated_segment,
+)
 from milhouse.state import (
     GlobalCommitBarrier,
     StateError,
@@ -341,6 +345,37 @@ def test_every_semantically_invalid_column_is_rejected(row: tuple[object, ...]) 
         validated_segment(row, ())
 
 
+def test_an_invalid_delivery_status_is_rejected_by_the_check(tmp_path: Path) -> None:
+    database, store, _spool_root = _spool(tmp_path)
+    try:
+        frames = _frames()
+        store.commit_segment(_header(frames), frames, committed_at=_NOW)
+        with pytest.raises(sqlite3.IntegrityError):
+            with database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO _segment_exporters (batch_id, exporter_id, delivery_status) "
+                    "VALUES ('batch-1', 'other', 'bogus')"
+                )
+    finally:
+        database.close()
+
+
+def test_the_exporter_status_validator_fails_closed_without_the_check() -> None:
+    # defense in depth: even against a tampered or rebuilt table WITHOUT the CHECK constraint, the
+    # read-time validator rejects an invalid delivery status
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute(
+            "CREATE TABLE _segment_exporters "
+            "(batch_id TEXT, exporter_id TEXT, delivery_status TEXT)"
+        )
+        connection.execute("INSERT INTO _segment_exporters VALUES ('b', 'alpha', 'bogus')")
+        with pytest.raises(ValueError):
+            load_exporters(connection, "b")
+    finally:
+        connection.close()
+
+
 def test_a_malformed_exporter_id_fails_closed(tmp_path: Path) -> None:
     # The _segment_exporters table constrains delivery_status but not exporter_id shape, so a
     # foreign or tampered exporter row must still fail closed on read.
@@ -378,6 +413,23 @@ def test_check_constraints_reject_an_invalid_write(tmp_path: Path) -> None:
         database.close()
 
 
+def test_the_origin_check_rejects_an_unknown_origin(tmp_path: Path) -> None:
+    database, _store, _spool_root = _spool(tmp_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):  # migration 3's origin CHECK
+            with database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO _segments (batch_id, day, schema_version, frame_version, "
+                    "config_generation, scope, target_id, privacy_class, retention_days, "
+                    "record_count, content_sha256, byte_size, file_sha256, committed_at, origin) "
+                    "VALUES ('b', '2026-07-24', 1, 1, ?, 'target', 't', 'internal', 30, 1, ?, 10, "
+                    "?, '2026-07-24T00:00:00.000Z', 'bogus')",
+                    ("a" * 64, "b" * 64, "c" * 64),
+                )
+    finally:
+        database.close()
+
+
 @pytest.mark.parametrize("privacy_class", ["public", "internal", "sensitive"])
 def test_authorize_admits_every_local_persistable_class(privacy_class: str) -> None:
     authorize_local_persistence(privacy_class)  # returns without raising
@@ -388,6 +440,16 @@ def test_authorize_denies_a_restricted_class() -> None:
     with pytest.raises(SpoolError) as captured:
         authorize_local_persistence("restricted")
     assert captured.value.code == "MH_SPOOL_EGRESS"
+
+
+def test_an_egress_denial_leaks_no_rejected_privacy_value() -> None:
+    with pytest.raises(SpoolError) as captured:
+        authorize_local_persistence("restricted")
+    error = captured.value
+    surface = " ".join([error.code, str(error), repr(error), *(str(a) for a in error.args)])
+    assert "restricted" not in surface  # the rejected value never reaches the error surface
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_the_store_rejects_a_non_control_database_or_barrier(tmp_path: Path) -> None:
@@ -491,17 +553,18 @@ def test_the_store_rejects_a_mismatched_barrier_or_spool_root(tmp_path: Path) ->
 
 def test_spool_directories_are_created_inside_the_barrier(tmp_path: Path) -> None:
     database, store, spool_root = _spool(tmp_path)
-    real_barrier = store._barrier  # type: ignore[attr-defined]
     pending = spool_root / "pending"
 
-    class _AssertingBarrier:
+    class _AssertingBarrier(GlobalCommitBarrier):
         @contextlib.contextmanager
-        def shared(self, *, blocking: bool = True) -> Iterator[None]:
+        def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
             assert not pending.exists()  # no namespace mutation before the barrier is held
-            with real_barrier.shared(blocking=blocking):
-                yield
+            with super().exclusive(blocking=blocking) as hold:
+                yield hold
 
-    store._barrier = _AssertingBarrier()  # type: ignore[attr-defined]
+    store._barrier = _AssertingBarrier(  # type: ignore[attr-defined]
+        tmp_path / "control" / "commit.lock"
+    )
     try:
         frames = _frames()
         store.commit_segment(_header(frames), frames, committed_at=_NOW)
@@ -524,7 +587,9 @@ def test_a_duplicate_batch_fails_closed_without_touching_the_ledger(tmp_path: Pa
         database.close()
 
 
-def test_a_ledger_failure_after_publication_is_commit_uncertain(tmp_path: Path) -> None:
+def test_an_unreadable_ledger_fails_the_commit_before_any_publication(tmp_path: Path) -> None:
+    # the pre-commit mandatory scan reads the ledger first: a broken ledger now fails closed
+    # BEFORE any file is published, instead of leaving a commit-uncertain orphan
     database, store, spool_root = _spool(tmp_path)
     try:
         with database.transaction() as connection:
@@ -532,10 +597,10 @@ def test_a_ledger_failure_after_publication_is_commit_uncertain(tmp_path: Path) 
         frames = _frames()
         with pytest.raises(SpoolError) as captured:
             store.commit_segment(_header(frames), frames, committed_at=_NOW)
-        assert captured.value.code == "MH_SPOOL_COMMIT"
+        assert captured.value.code == "MH_SPOOL_LEDGER"
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
-        assert (spool_root / "pending" / _DAY / "batch-1.jsonl").exists()  # a registrable orphan
+        assert not (spool_root / "pending").exists()  # nothing was published
     finally:
         database.close()
 
@@ -546,6 +611,16 @@ def test_a_transaction_boundary_failure_after_publication_is_commit_uncertain(
     database, store, spool_root = _spool(tmp_path)
 
     class _TxnFailDatabase:
+        # reads (the pre-commit scan) succeed against the real connection; only the write-side
+        # transaction boundary fails, exactly like a crash between publication and the insert
+        @property
+        def path(self) -> Path:
+            return database.path
+
+        @property
+        def connection(self) -> object:
+            return database.connection
+
         def transaction(self) -> object:
             raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
 

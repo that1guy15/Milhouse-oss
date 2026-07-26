@@ -132,6 +132,41 @@ def _close(descriptor: int) -> None:
         pass
 
 
+class ExclusiveHold:
+    """An authority token proving a live exclusive hold of ONE specific barrier.
+
+    Only :meth:`GlobalCommitBarrier.exclusive` activates a hold, and it deactivates the token when
+    the context exits, so code requiring exclusive authority validates both ``hold.active`` and
+    ``hold.barrier_path`` — the canonical lock the token was issued for — at runtime instead of
+    trusting a docstring precondition. A live token is authority ONLY for its own barrier: a
+    consumer must compare ``barrier_path`` against the lock protecting the state it is about to
+    mutate. A directly constructed token is never active, a token captured from a completed hold is
+    stale and inactive, and the active bit is not assignable (name-mangled slot behind a read-only
+    property), so a token cannot be activated by attribute assignment.
+    """
+
+    __slots__ = ("__active", "__barrier_path")
+
+    def __init__(self, barrier_path: Path) -> None:
+        self.__barrier_path = lexical_absolute_path(barrier_path)
+        self.__active = False
+
+    @property
+    def active(self) -> bool:
+        return self.__active
+
+    @property
+    def barrier_path(self) -> Path:
+        return self.__barrier_path
+
+    def _issue(self) -> None:
+        # Called only by GlobalCommitBarrier.exclusive once the lock is genuinely held.
+        self.__active = True
+
+    def _revoke(self) -> None:
+        self.__active = False
+
+
 class GlobalCommitBarrier:
     """A cross-process, writer-preferring readers-writer commit barrier over one lock file pair."""
 
@@ -174,21 +209,28 @@ class GlobalCommitBarrier:
             _close(main_fd)
 
     @contextmanager
-    def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
-        """Hold the exclusive side; block new shared entrants and drain existing ones."""
+    def exclusive(self, *, blocking: bool = True) -> Iterator[ExclusiveHold]:
+        """Hold the exclusive side; block new shared entrants and drain existing ones.
+
+        Yields an :class:`ExclusiveHold` authority token that is active only for the lifetime of
+        the hold, so exclusive-only operations can validate their authority at runtime.
+        """
 
         main_fd = _secure_lock_descriptor(self._path)
         gate_fd: int | None = None
         gate_held = False
         main_held = False
+        hold = ExclusiveHold(self._path)
         try:
             gate_fd = _secure_lock_descriptor(self._gate_path)
             _acquire(gate_fd, fcntl.LOCK_EX, blocking=blocking)
             gate_held = True
             _acquire(main_fd, fcntl.LOCK_EX, blocking=blocking)
             main_held = True
-            yield
+            hold._issue()
+            yield hold
         finally:
+            hold._revoke()
             if main_held:
                 _release(main_fd)
             if gate_held and gate_fd is not None:
