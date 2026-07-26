@@ -226,6 +226,10 @@ def test_a_commit_through_a_long_lived_writer_registers_a_later_crash_orphan(
 
         class _TxnFailDatabase:
             @property
+            def path(self) -> Path:
+                return second.path
+
+            @property
             def connection(self) -> object:
                 return second.connection
 
@@ -358,6 +362,10 @@ def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) ->
         class _TxnFailDatabase:
             # reads (the pre-commit scan) succeed; only the write-side boundary fails, exactly
             # like a crash between publication and the ledger insert
+            @property
+            def path(self) -> Path:
+                return database.path
+
             @property
             def connection(self) -> object:
                 return database.connection
@@ -565,7 +573,8 @@ def test_a_direct_unheld_scan_call_fails_before_any_mutation(tmp_path: Path) -> 
     _publish_orphan(spool_root, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames))
     try:
         assert not hasattr(reconcile_module, "_run_reconciliation_scan")  # the old bypass is gone
-        for bogus_authority in (None, object(), ExclusiveHold()):  # absent, foreign, inactive
+        own_lock = tmp_path / "control" / "commit.lock"
+        for bogus_authority in (None, object(), ExclusiveHold(own_lock)):  # absent/foreign/inactive
             scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
             with pytest.raises(SpoolError) as captured:
                 scan.run(bogus_authority)  # type: ignore[arg-type]
@@ -580,6 +589,127 @@ def test_a_direct_unheld_scan_call_fails_before_any_mutation(tmp_path: Path) -> 
         # nothing mutated: the orphan remains unregistered and both tables are unchanged
         assert _count(database) == 0
         assert _count(database, "_segment_exporters") == 0
+    finally:
+        database.close()
+
+
+def test_exclusive_authority_is_bound_to_the_state_root(tmp_path: Path) -> None:
+    # the re-review's reproduction: a live hold of state root B's barrier is NOT authority for
+    # state root A — both the wrapper binding and the scan's token-identity check must refuse
+    (tmp_path / "rootA").mkdir()
+    (tmp_path / "rootB").mkdir()
+    database_a, barrier_a, spool_a = _control(tmp_path / "rootA")
+    database_b, barrier_b, _spool_b = _control(tmp_path / "rootB")
+    header, frames = _segment(batch_id="orphan-1")
+    _publish_orphan(spool_a, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames))
+    try:
+        # (1) the wrapper with database/spool A but barrier B fails the binding before mutation
+        with pytest.raises(SpoolError) as mismatched:
+            reconcile_module._reconcile_under_barrier(
+                database=database_a,
+                barrier=barrier_b,
+                spool_root=spool_a,
+                installation_id=_INSTALLATION_ID,
+            )
+        assert mismatched.value.code == "MH_SPOOL_STORE"
+        assert _count(database_a) == 0
+
+        # (2) a direct A scan with B's LIVE token fails the identity check before mutation
+        with barrier_b.exclusive() as foreign_live_hold:
+            assert foreign_live_hold.active
+            with pytest.raises(SpoolError) as foreign:
+                reconcile_module._Scan(database_a, spool_a, _INSTALLATION_ID).run(foreign_live_hold)
+            assert foreign.value.code == "MH_SPOOL_BARRIER"
+        assert _count(database_a) == 0
+        assert _count(database_a, "_segment_exporters") == 0
+
+        # (3) the correctly bound A wrapper still registers
+        report = reconcile_module._reconcile_under_barrier(
+            database=database_a,
+            barrier=barrier_a,
+            spool_root=spool_a,
+            installation_id=_INSTALLATION_ID,
+        )
+        assert report.registered == (OrphanRegistration("orphan-1", _DAY),)
+        assert _count(database_a) == 1
+    finally:
+        database_a.close()
+        database_b.close()
+
+
+def test_a_token_cannot_be_activated_by_attribute_assignment(tmp_path: Path) -> None:
+    from milhouse.state.barrier import ExclusiveHold
+
+    hold = ExclusiveHold(tmp_path / "control" / "commit.lock")
+    assert not hold.active
+    with pytest.raises(AttributeError):
+        hold._active = True  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        hold.__active = True  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        hold.active = True  # type: ignore[misc]
+    assert not hold.active  # the trust decision is not a publicly writable bit
+
+
+def test_the_anomaly_cap_stops_directory_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the cap bounds lock-hold WORK: once it fires, later directories are never opened
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    monkeypatch.setattr(reconcile_module, "_MAX_ANOMALIES", 1)
+    pending = spool_root / "pending"
+    pending.mkdir(mode=0o700)
+    os.chmod(pending, 0o700)
+    for junk in ("0000-junk-a", "0000-junk-b"):  # sort before the valid day; both invalid names
+        (pending / junk).mkdir(mode=0o700)
+    header, frames = _segment(batch_id="batch-1")
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
+    opened: list[Path] = []
+    real_names = reconcile_module._secure_dir_names
+
+    def _recording_names(path: Path):  # type: ignore[no-untyped-def]
+        opened.append(path)
+        return real_names(path)
+
+    monkeypatch.setattr(reconcile_module, "_secure_dir_names", _recording_names)
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.scanned == 0  # no entry was ever classified
+        assert opened == [pending]  # the valid day directory was never opened
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_the_anomaly_cap_stops_within_day_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the within-day analogue: entries after the cap are neither classified nor read
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    monkeypatch.setattr(reconcile_module, "_MAX_ANOMALIES", 1)
+    header, frames = _segment(batch_id="batch-1")
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
+    day_dir = spool_root / "pending" / _DAY
+    for junk in ("0-junk-a.txt", "0-junk-b.txt"):  # sort before batch-1.jsonl; foreign suffixes
+        (day_dir / junk).write_bytes(b"x")
+        os.chmod(day_dir / junk, 0o600)
+    reads: list[Path] = []
+    real_read = reconcile_module.read_trusted_segment
+
+    def _recording_read(path, **kwargs):  # type: ignore[no-untyped-def]
+        reads.append(path)
+        return real_read(path, **kwargs)
+
+    monkeypatch.setattr(reconcile_module, "read_trusted_segment", _recording_read)
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.scanned == 2  # the two junk entries only; batch-1 never advanced the count
+        assert reads == []  # the valid file was never opened or classified
+        assert _count(database) == 0
     finally:
         database.close()
 
@@ -1671,16 +1801,17 @@ def test_reconciliation_happens_inside_the_exclusive_barrier(tmp_path: Path) -> 
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     header, frames = _segment()
     _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
-    real_barrier = reconciler._barrier  # type: ignore[attr-defined]
 
-    class _AssertingBarrier:
+    class _AssertingBarrier(GlobalCommitBarrier):
         @contextlib.contextmanager
         def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
             assert _count(database) == 0  # not yet registered when the exclusive lock is taken
-            with real_barrier.exclusive(blocking=blocking) as hold:
+            with super().exclusive(blocking=blocking) as hold:
                 yield hold
 
-    reconciler._barrier = _AssertingBarrier()  # type: ignore[attr-defined]
+    reconciler._barrier = _AssertingBarrier(  # type: ignore[attr-defined]
+        tmp_path / "control" / "commit.lock"
+    )
     try:
         assert len(reconciler.reconcile().registered) == 1
         assert _count(database) == 1

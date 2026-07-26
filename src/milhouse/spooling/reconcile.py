@@ -216,6 +216,36 @@ def _secure_dir_names(
     return names, identity, None
 
 
+def _require_bound_state_root(
+    database: object, barrier: object, spool_root: str | Path, installation_id: str
+) -> Path:
+    """Require database, barrier, and spool root to share one canonical state root.
+
+    A barrier from a different state root is not authority for this database/spool pair, so the
+    binding is validated here (the wrapper) as well as at the public constructors, and the scan
+    additionally re-validates the live token's own barrier identity against the database.
+    """
+
+    if not isinstance(barrier, GlobalCommitBarrier):
+        _fail("MH_SPOOL_STORE", "a commit barrier is required")
+    database_path = getattr(database, "path", None)
+    if database_path is None:
+        _fail("MH_SPOOL_STORE", "a control database is required")
+    control_dir = lexical_absolute_path(database_path).parent
+    state_root = control_dir.parent
+    resolved_spool = lexical_absolute_path(spool_root)
+    if lexical_absolute_path(barrier.path) != control_dir / _BARRIER_NAME:
+        _fail("MH_SPOOL_STORE", "the barrier must be the control-plane commit lock")
+    if resolved_spool != state_root / _SPOOL:
+        _fail("MH_SPOOL_STORE", "the spool root must be <state_root>/spool")
+    if (
+        type(installation_id) is not str
+        or INSTALLATION_ID_PATTERN.fullmatch(installation_id) is None
+    ):
+        _fail("MH_SPOOL_IDENTITY", "a well-formed installation id is required")
+    return resolved_spool
+
+
 def _reconcile_under_barrier(
     *,
     database: ControlDatabase,
@@ -228,14 +258,17 @@ def _reconcile_under_barrier(
     """The only reconciliation entrypoint: acquires the exclusive barrier itself, then scans.
 
     There is no standalone callable that executes the scan without owning barrier authority: this
-    wrapper acquires the exclusive side and passes the live :class:`ExclusiveHold` token to
-    :meth:`_Scan.run`, which validates it before its first ledger read — so even a direct internal
-    call of the scan fails closed before any mutation. ``action`` (the commit path's
+    wrapper first validates that database, barrier, and spool root share one canonical state root,
+    then acquires the exclusive side and passes the live :class:`ExclusiveHold` token to
+    :meth:`_Scan.run`, which re-validates the token's barrier identity against the database before
+    its first ledger read — so even a direct internal call of the scan, or a live token issued by a
+    different state root's barrier, fails closed before any mutation. ``action`` (the commit path's
     publish+ledger callback) runs inside the same hold when the scan is complete, preserving the
     no-gap reconcile-to-commit handoff; ``observe`` receives the report inside the hold before the
     action runs, so a caller records it even when the action then fails.
     """
 
+    spool_root = _require_bound_state_root(database, barrier, spool_root, installation_id)
     report: ReconciliationReport | None = None
     barrier_failed = False
     try:
@@ -281,10 +314,27 @@ class _Scan:
         self._complete = True
 
     def run(self, authority: ExclusiveHold) -> ReconciliationReport:
-        if not isinstance(authority, ExclusiveHold) or not authority.active:
-            # Validated BEFORE the first ledger read: a direct call without a live exclusive hold
-            # fails closed with no mutation. Underscore convention is not enforcement; this is.
-            _fail("MH_SPOOL_BARRIER", "reconciliation requires a live exclusive barrier hold")
+        # Validated BEFORE the first ledger read: a direct call without a live exclusive hold of
+        # THIS control plane's own commit lock fails closed with no mutation. A live token from any
+        # other barrier is not authority for this database/spool pair — "some barrier is held" is
+        # exactly the bypass the gate review reproduced. Underscore convention is not enforcement;
+        # this identity comparison is.
+        database_path = getattr(self._database, "path", None)
+        expected_lock = (
+            lexical_absolute_path(database_path).parent / _BARRIER_NAME
+            if database_path is not None
+            else None
+        )
+        if (
+            not isinstance(authority, ExclusiveHold)
+            or not authority.active
+            or expected_lock is None
+            or lexical_absolute_path(authority.barrier_path) != expected_lock
+        ):
+            _fail(
+                "MH_SPOOL_BARRIER",
+                "reconciliation requires a live exclusive hold of this control plane's barrier",
+            )
         ledger, malformed = self._ledger_index()
         for batch_id in sorted(malformed):
             # the batch id came from a row that failed validation, so it may not be well formed
@@ -295,7 +345,7 @@ class _Scan:
         seen: set[str] = set()
         if self._complete:
             for day, batch_id, path, day_identity in candidates:
-                if self._stopped:
+                if self._capped():
                     break  # the anomaly cap fired: the rest of the pass is unproven
                 seen.add(batch_id)
                 if counts[batch_id] > 1:
@@ -310,7 +360,7 @@ class _Scan:
         # Missing-ledger-file classification is classification, so it runs BEFORE any mutation.
         if self._complete:
             for batch_id, record in ledger.items():
-                if self._stopped:
+                if self._capped():
                     break  # the cap fired (possibly during the candidate phase): stop classifying
                 if batch_id not in seen:
                     self._anomaly(batch_id, record.day, "missing_file", "absent")
@@ -318,7 +368,7 @@ class _Scan:
         # After every phase and again immediately before mutation: a fired anomaly cap voids the
         # pass even when it fired on the FINAL classified item (the re-review's reproduction, where
         # a top-of-loop check alone never runs again).
-        if self._stopped:
+        if self._capped():
             self._complete = False
         if self._complete:
             # Mutation happens only after complete, within-bounds classification proved every
@@ -343,6 +393,9 @@ class _Scan:
         elif not self._stopped:
             self._stopped = True
             self._anomalies.append(SegmentAnomaly("", "", "limit", "anomaly_limit"))
+
+    def _capped(self) -> bool:
+        return self._stopped
 
     def _ledger_index(self) -> tuple[dict[str, SegmentRecord], set[str]]:
         ledger: dict[str, SegmentRecord] = {}
@@ -380,6 +433,11 @@ class _Scan:
             return []
         candidates: list[tuple[str, str, Path, FileIdentity]] = []
         for day in day_names:
+            if self._capped():
+                # The anomaly cap bounds lock-hold WORK, not just report size: once it fires, no
+                # further directory is opened and no further entry is classified.
+                self._complete = False
+                return candidates
             if not _is_valid_day(day):
                 self._anomaly("", "", "foreign_name", "day")
                 continue
@@ -391,6 +449,9 @@ class _Scan:
                 continue
             assert entries is not None and day_identity is not None
             for name in entries:
+                if self._capped():
+                    self._complete = False
+                    return candidates
                 if self._scanned >= _MAX_TOTAL:
                     self._anomaly("", "", "limit", "scan_limit")
                     self._complete = False
@@ -399,8 +460,8 @@ class _Scan:
                 resolved = self._classify_name(pending / day / name, day, name)
                 if resolved is not None:
                     candidates.append((*resolved, day_identity))
-        if self._stopped:
-            self._complete = False  # the anomaly cap fired during inventory
+        if self._capped():
+            self._complete = False  # the anomaly cap fired on the final inventory item
         return candidates
 
     def _classify_name(self, path: Path, day: str, name: str) -> tuple[str, str, Path] | None:

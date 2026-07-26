@@ -553,17 +553,18 @@ def test_the_store_rejects_a_mismatched_barrier_or_spool_root(tmp_path: Path) ->
 
 def test_spool_directories_are_created_inside_the_barrier(tmp_path: Path) -> None:
     database, store, spool_root = _spool(tmp_path)
-    real_barrier = store._barrier  # type: ignore[attr-defined]
     pending = spool_root / "pending"
 
-    class _AssertingBarrier:
+    class _AssertingBarrier(GlobalCommitBarrier):
         @contextlib.contextmanager
         def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
             assert not pending.exists()  # no namespace mutation before the barrier is held
-            with real_barrier.exclusive(blocking=blocking) as hold:
+            with super().exclusive(blocking=blocking) as hold:
                 yield hold
 
-    store._barrier = _AssertingBarrier()  # type: ignore[attr-defined]
+    store._barrier = _AssertingBarrier(  # type: ignore[attr-defined]
+        tmp_path / "control" / "commit.lock"
+    )
     try:
         frames = _frames()
         store.commit_segment(_header(frames), frames, committed_at=_NOW)
@@ -612,6 +613,10 @@ def test_a_transaction_boundary_failure_after_publication_is_commit_uncertain(
     class _TxnFailDatabase:
         # reads (the pre-commit scan) succeed against the real connection; only the write-side
         # transaction boundary fails, exactly like a crash between publication and the insert
+        @property
+        def path(self) -> Path:
+            return database.path
+
         @property
         def connection(self) -> object:
             return database.connection
