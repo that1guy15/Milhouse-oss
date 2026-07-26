@@ -22,10 +22,16 @@ On a complete pass the scan also QUARANTINES, per plan section 3.4/4.3: corrupt 
 orphan files, every copy of a conflicted batch id (``conflict_divergent`` when contents differ — the
 plan's high-severity conflict — or ``conflict_duplicate`` when byte-identical, so directory order
 never chooses a durable history), and crashed writers' staged temporaries all move to
-``quarantine/<day>/`` via an identity-verified, no-replace, fsynced link+unlink under the same
-exclusive hold. Foreign-named entries are reported but left in place (they have no well-formed
-quarantine name). The scan never deletes; an incomplete pass moves nothing. Every failure is a
-fixed ``MH_SPOOL_*`` error raised outside any handler.
+``quarantine/<day>/`` under the same exclusive hold. Every quarantine subject is classified
+descriptor-relative with no-follow semantics and its exact leaf inode captured; only an owned,
+exact-0600, single-link, ACL-free regular file is ever queued or linked, so a staged symlink,
+directory, FIFO, device, or foreign shape can never import outside content. The move re-verifies
+the captured identity beneath the inventoried day descriptor, links without following symlinks,
+makes the target name durable BEFORE touching the source, verifies target-inode equality (rolling
+back on mismatch), and revalidates the source name immediately before its unlink — distinguishing
+pre-move blocked, completed, and commit-uncertain outcomes. Foreign-named entries are reported but
+left in place (they have no well-formed quarantine name). The scan never deletes; an incomplete
+pass moves nothing. Every failure is a fixed ``MH_SPOOL_*`` error raised outside any handler.
 """
 
 from __future__ import annotations
@@ -93,6 +99,9 @@ _MAX_DAYS = 100_000
 _MAX_ENTRIES = 1_000_000
 _MAX_TOTAL = 1_000_000
 _MAX_ANOMALIES = 100_000
+# Bounded quarantine-name attempts: `<name>`, `1.<name>`, ... — shared by the move and the
+# interrupted-move twin probe so both agree on which aliases can exist.
+_MAX_MOVE_ATTEMPTS = 100
 # A strict ASCII partition-day shape. `datetime.strptime(day, "%Y-%m-%d")` alone is not enough: its
 # `%d`/`%m` accept space-padded fields (e.g. "2026-07- 5"), which would then produce a committed_at
 # the schema's length-only CHECK admits but the ledger reader's stricter stamp regex rejects — a
@@ -118,9 +127,13 @@ class SegmentAnomaly:
     its row), ``corrupt_orphan`` (an unrecorded file that fails trusted validation or egress),
     ``conflict`` (a batch id at more than one path), ``foreign_name`` (an entry whose name is not a
     well-formed ``<batch-id>.jsonl`` under a valid day), ``stale_temp`` (a crashed writer's staged
-    temporary), ``quarantine_blocked`` (a staged quarantine move could not complete: the file
-    stays in pending and is re-reported every scan — reasons ``unreachable``, ``changed``,
-    ``collision``, ``io``), or ``limit`` (a scan bound was exceeded).
+    temporary), ``quarantine_blocked`` (a quarantine subject could not be safely moved: the file
+    stays in pending and is re-reported every scan — reasons ``unsafe`` (the subject is not an
+    owned, exact-0600, single-link, ACL-free regular file: a staged symlink, directory, FIFO,
+    device, or multi-link file is never queued, followed, or linked), ``unreachable``,
+    ``changed``, ``collision``, ``io``), ``quarantine_uncertain`` (the quarantine target is
+    durably named but the source state could not be confirmed; the next scan converges by
+    adopting the same-inode twin), or ``limit`` (a scan bound was exceeded).
     ``batch_id`` and ``day`` are validated identifiers or empty when the underlying name was
     invalid (untrusted names are omitted entirely, never echoed or fingerprinted); ``detail`` is a
     fixed reason or ``MH_SPOOL_*`` code — never a raw path.
@@ -228,21 +241,50 @@ def _raw_sha256(path: Path) -> str | None:
     return None if failed else digest.hexdigest()
 
 
+def _dir_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+
+
+def _fsync_dir(path: Path) -> bool:
+    descriptor: int | None = None
+    synced = False
+    try:
+        descriptor = os.open(path, _dir_flags())
+        os.fsync(descriptor)
+        synced = True
+    except OSError:
+        synced = False
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover - defensive close failure
+                synced = False
+    return synced
+
+
 def _ensure_private_dir(path: Path) -> bool:
-    """Create-if-absent and validate one owned, exact-0700, ACL-free quarantine directory."""
+    """Create-if-absent and validate one owned, exact-0700, ACL-free quarantine directory.
+
+    A freshly created directory entry is made durable by fsyncing its parent, so a crash after a
+    quarantine move cannot lose the directory that names the moved file.
+    """
 
     unsafe = False
+    created = False
     descriptor: int | None = None
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
     try:
         os.mkdir(path, _DIR_MODE)
+        created = True
     except FileExistsError:
         pass
     except OSError:
         unsafe = True
+    if not unsafe and created and not _fsync_dir(path.parent):
+        unsafe = True
     try:
         if not unsafe:
-            descriptor = os.open(path, flags)
+            descriptor = os.open(path, _dir_flags())
             info = os.fstat(descriptor)
             if (
                 not stat.S_ISDIR(info.st_mode)
@@ -261,6 +303,55 @@ def _ensure_private_dir(path: Path) -> bool:
             except OSError:  # pragma: no cover - defensive close failure
                 unsafe = True
     return not unsafe
+
+
+def _leaf_probe_flags() -> int:
+    """No-follow, non-blocking flags for opening a quarantine subject to inspect or move it.
+
+    ``O_NOFOLLOW`` refuses a symlink outright; ``O_NONBLOCK`` keeps the probe from hanging on a
+    hostile FIFO (a plain ``O_RDONLY`` open of a FIFO blocks until a writer appears) and from
+    triggering device side effects. Neither affects reads of a regular file.
+    """
+
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _permitted_quarantine_shape(info: os.stat_result) -> bool:
+    """Whether a quarantine subject is an owned, exact-0600, single-link REGULAR file.
+
+    Nothing else may be hard-linked into quarantine: a directory, FIFO, character or block device,
+    socket, foreign owner, loose or tightened mode, or multi-link file stays in pending with a
+    fixed anomaly instead.
+    """
+
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == _current_uid()
+        and stat.S_IMODE(info.st_mode) == 0o600
+        and info.st_nlink == 1
+    )
+
+
+def _interrupted_move_shape(info: os.stat_result) -> bool:
+    """The one extra admissible shape: exactly two links, otherwise the permitted shape.
+
+    A crash or failure after the quarantine link but before the pending unlink leaves the same
+    inode under both names, so the pending twin of an interrupted move has ``st_nlink == 2``. It
+    is admitted ONLY when :meth:`_Scan._has_quarantine_twin` proves the second name is our own
+    durable quarantine entry; any other multi-link file stays refused.
+    """
+
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == _current_uid()
+        and stat.S_IMODE(info.st_mode) == 0o600
+        and info.st_nlink == 2
+    )
 
 
 def _is_valid_day(day: str) -> bool:
@@ -427,8 +518,8 @@ class _Scan:
         self._installation_id = installation_id
         self._registered: list[OrphanRegistration] = []
         self._pending_registrations: list[tuple[ParsedSegment, str, str]] = []
-        # (day, name, day_identity, batch_id_or_empty, fixed detail) for files to move on success
-        self._pending_quarantines: list[tuple[str, str, FileIdentity, str, str]] = []
+        # (day, name, day_identity, leaf_identity, batch_id_or_empty, detail): moved on success
+        self._pending_quarantines: list[tuple[str, str, FileIdentity, FileIdentity, str, str]] = []
         self._quarantined: list[QuarantinedFile] = []
         self._move_failures: list[SegmentAnomaly] = []
         self._anomalies: list[SegmentAnomaly] = []
@@ -509,9 +600,7 @@ class _Scan:
                 for day, path, day_identity in copies:
                     if keeper is not None and (day, path, day_identity) == keeper:
                         continue
-                    self._pending_quarantines.append(
-                        (day, path.name, day_identity, batch_id, detail)
-                    )
+                    self._queue_quarantine(day, path.name, day_identity, batch_id, detail)
 
         # Missing-ledger-file classification is classification, so it runs BEFORE any mutation.
         if self._complete:
@@ -532,16 +621,30 @@ class _Scan:
             for parsed, batch_id, day in self._pending_registrations:
                 self._register(parsed, batch_id, day)
                 self._registered.append(OrphanRegistration(batch_id, day))
-            for day, name, day_identity, batch_id, detail in self._pending_quarantines:
-                blocked = self._move_to_quarantine(day, name, day_identity)
-                if blocked is None:
+            for (
+                day,
+                name,
+                day_identity,
+                leaf_identity,
+                batch_id,
+                detail,
+            ) in self._pending_quarantines:
+                outcome = self._move_to_quarantine(day, name, day_identity, leaf_identity)
+                if outcome is None:
                     self._quarantined.append(QuarantinedFile(batch_id, day, detail))
+                elif outcome == "uncertain":
+                    # the target is durably named but the source state could not be confirmed:
+                    # reported distinctly, never as completed and never as still-pending; the next
+                    # scan converges by adopting the same-inode twin
+                    self._move_failures.append(
+                        SegmentAnomaly(batch_id, day, "quarantine_uncertain", "io")
+                    )
                 else:
                     # A quarantine that cannot complete never aborts recovery or a commit: the file
                     # stays in pending, is re-reported every scan, and authority is unaffected —
                     # the review showed one un-quarantinable file must not wedge all commits.
                     self._move_failures.append(
-                        SegmentAnomaly(batch_id, day, "quarantine_blocked", blocked)
+                        SegmentAnomaly(batch_id, day, "quarantine_blocked", outcome)
                     )
         else:
             self._pending_registrations.clear()
@@ -628,9 +731,11 @@ class _Scan:
                 self._scanned += 1
                 if name.startswith(_STAGE_PREFIX):
                     # a crashed writer's staged temporary: never a committed artifact, so it is
-                    # quarantined by policy rather than recovered (replay regenerates the batch)
+                    # quarantined by policy rather than recovered (replay regenerates the batch).
+                    # The leaf is inspected no-follow like every quarantine subject: a staged
+                    # symlink/directory/FIFO/foreign shape is refused, never followed or moved.
                     self._anomaly("", day, "stale_temp", "staged_temporary")
-                    self._pending_quarantines.append((day, name, day_identity, "", "stale_temp"))
+                    self._queue_quarantine(day, name, day_identity, "", "stale_temp")
                     continue
                 resolved = self._classify_name(pending / day / name, day, name)
                 if resolved is not None:
@@ -661,12 +766,10 @@ class _Scan:
         if code is not None:
             self._anomaly(batch_id, day, "corrupt_file", code)
             if code not in _UNQUARANTINABLE:
-                self._pending_quarantines.append((day, path.name, day_identity, batch_id, code))
+                self._queue_quarantine(day, path.name, day_identity, batch_id, code)
         elif not _agrees(parsed, day, batch_id, record):
             self._anomaly(batch_id, day, "corrupt_file", "ledger_mismatch")
-            self._pending_quarantines.append(
-                (day, path.name, day_identity, batch_id, "ledger_mismatch")
-            )
+            self._queue_quarantine(day, path.name, day_identity, batch_id, "ledger_mismatch")
         else:
             self._healthy += 1
 
@@ -677,7 +780,7 @@ class _Scan:
         if code is not None:
             self._anomaly(batch_id, day, "corrupt_orphan", code)
             if code not in _UNQUARANTINABLE:
-                self._pending_quarantines.append((day, path.name, day_identity, batch_id, code))
+                self._queue_quarantine(day, path.name, day_identity, batch_id, code)
             return
         assert parsed is not None
         if parsed.header.batch_id != batch_id:
@@ -689,7 +792,7 @@ class _Scan:
             authorize_local_persistence(parsed.header.privacy_class)
         except SpoolError as denied:
             self._anomaly(batch_id, day, "corrupt_orphan", denied.code)
-            self._pending_quarantines.append((day, path.name, day_identity, batch_id, denied.code))
+            self._queue_quarantine(day, path.name, day_identity, batch_id, denied.code)
             return
         # registration is deferred: mutation begins only after the whole pass proves complete
         self._pending_registrations.append((parsed, batch_id, day))
@@ -721,18 +824,110 @@ class _Scan:
             return "conflict_divergent"  # the plan's high-severity duplicate-id conflict
         return "conflict_duplicate"
 
-    def _move_to_quarantine(self, day: str, name: str, day_identity: FileIdentity) -> str | None:
-        """Move one inventoried file to ``quarantine/<day>/`` with no replace and no unlink-first.
+    def _inspect_leaf(self, day: str, name: str, day_identity: FileIdentity) -> FileIdentity | None:
+        """Capture the exact leaf identity of a quarantine subject, no-follow, or refuse it.
 
-        The source directory is re-opened and its identity compared with the inventoried one, so a
-        replaced directory can never redirect the move (Finding C note: this binds the DIRECTORY
-        identity; the exclusive barrier plus owner-only spool is what excludes a same-name file
-        swap); the file is hard-linked into the quarantine day (retrying past name collisions with
-        a bounded counter prefix) and only then unlinked from pending, with both directories
-        fsynced, so content is preserved on every path. Returns ``None`` on success or a fixed
-        blocked reason (``unreachable``, ``changed``, ``collision``, ``io``): a move that cannot
-        complete never raises and never aborts recovery — the file stays in pending and is
-        re-reported every scan, because one un-quarantinable file must not wedge all commits.
+        Only the shape :func:`_permitted_quarantine_shape` admits (plus ACL-free) may be queued: a
+        symlink (rejected by the no-follow open), directory, FIFO or device (rejected by the shape
+        check; ``O_NONBLOCK`` keeps the probe open from hanging on a hostile FIFO or acting on a
+        device), foreign owner, unsafe mode, extra hard link, or ACL bearer stays unmoved — the
+        re-review demonstrated that linking an uninspected staged name imports arbitrary foreign
+        file content into quarantine.
+        """
+
+        identity: FileIdentity | None = None
+        day_fd: int | None = None
+        leaf_fd: int | None = None
+        try:
+            day_fd = os.open(self._spool_root / _PENDING / day, _dir_flags())
+            if FileIdentity.from_stat(os.fstat(day_fd)) != day_identity:
+                identity = None
+            else:
+                leaf_fd = os.open(name, _leaf_probe_flags(), dir_fd=day_fd)
+                info = os.fstat(leaf_fd)
+                acl_unsafe = False
+                try:
+                    require_no_extended_acl(leaf_fd)
+                except SecureFileError:
+                    acl_unsafe = True
+                if acl_unsafe:
+                    identity = None
+                elif _permitted_quarantine_shape(info):
+                    identity = FileIdentity.from_stat(info)
+                elif _interrupted_move_shape(info) and self._has_quarantine_twin(
+                    day, name, FileIdentity.from_stat(info)
+                ):
+                    # our own interrupted move: the second hard link IS the durable quarantine
+                    # twin, so the retry may adopt it and complete the pending unlink; any other
+                    # extra link stays refused
+                    identity = FileIdentity.from_stat(info)
+        except OSError:
+            identity = None
+        finally:
+            for descriptor in (leaf_fd, day_fd):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:  # pragma: no cover - defensive close failure
+                        identity = None
+        return identity
+
+    def _has_quarantine_twin(self, day: str, name: str, identity: FileIdentity) -> bool:
+        """Whether ``quarantine/<day>/`` already durably names this exact inode.
+
+        A crash between the quarantine link and the pending unlink leaves the same inode under
+        both names; the retry proves that by inode before the pending twin may be admitted.
+        """
+
+        twin = False
+        day_fd: int | None = None
+        try:
+            day_fd = os.open(self._spool_root / _QUARANTINE / day, _dir_flags())
+            for attempt in range(_MAX_MOVE_ATTEMPTS):
+                candidate = name if attempt == 0 else f"{attempt}.{name}"
+                try:
+                    info = os.stat(candidate, dir_fd=day_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if FileIdentity.from_stat(info) == identity:
+                    twin = True
+                    break
+        except OSError:
+            twin = False
+        finally:
+            if day_fd is not None:
+                try:
+                    os.close(day_fd)
+                except OSError:  # pragma: no cover - defensive close failure
+                    pass
+        return twin
+
+    def _queue_quarantine(
+        self, day: str, name: str, day_identity: FileIdentity, batch_id: str, detail: str
+    ) -> None:
+        leaf = self._inspect_leaf(day, name, day_identity)
+        if leaf is None:
+            # an unquarantinable subject shape: reported, never moved, never followed
+            self._anomaly(batch_id, day, "quarantine_blocked", "unsafe")
+            return
+        self._pending_quarantines.append((day, name, day_identity, leaf, batch_id, detail))
+
+    def _move_to_quarantine(
+        self, day: str, name: str, day_identity: FileIdentity, leaf_identity: FileIdentity
+    ) -> str | None:
+        """Move one inspected file to ``quarantine/<day>/`` bound to its exact leaf inode.
+
+        Ordering is crash-safe: the quarantine directories are made durable at creation, the source
+        is re-opened no-follow beneath the re-verified day directory and must match the inventoried
+        leaf identity, the hard link is created without following symlinks, the TARGET directory is
+        fsynced before the source is touched, the target inode is verified equal to the opened
+        source inode (rolling the link back on mismatch), the source NAME is revalidated
+        immediately before its unlink (a swapped-in replacement is never unlinked), and the source
+        directory is fsynced last. A pre-placed twin of the same inode converges (adopted, source
+        unlinked) instead of proliferating aliases. Returns ``None`` when the move completed,
+        ``"unreachable"``/``"changed"``/``"collision"``/``"io"`` when nothing was moved (the file
+        stays in pending), or ``"uncertain"`` when the target is durable but the source state could
+        not be confirmed — never a raised error, so one unmovable file cannot wedge recovery.
         """
 
         quarantine_day = self._spool_root / _QUARANTINE / day
@@ -741,41 +936,90 @@ class _Scan:
             and _ensure_private_dir(quarantine_day)
         ):
             return "unreachable"
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
-        blocked: str | None = None
+        source_dir_fd: int | None = None
         source_fd: int | None = None
         target_fd: int | None = None
+        outcome: str | None = "io"
         try:
-            source_fd = os.open(self._spool_root / _PENDING / day, flags)
-            if FileIdentity.from_stat(os.fstat(source_fd)) != day_identity:
-                blocked = "changed"  # the pending day directory changed since it was inventoried
-            else:
-                target_fd = os.open(quarantine_day, flags)
-                linked_name: str | None = None
-                for attempt in range(100):
-                    candidate = name if attempt == 0 else f"{attempt}.{name}"
+            source_dir_fd = os.open(self._spool_root / _PENDING / day, _dir_flags())
+            if FileIdentity.from_stat(os.fstat(source_dir_fd)) != day_identity:
+                return "changed"
+            try:
+                source_fd = os.open(name, _leaf_probe_flags(), dir_fd=source_dir_fd)
+            except OSError:
+                return "changed"  # vanished, or a symlink swapped in (rejected by no-follow)
+            source_identity = FileIdentity.from_stat(os.fstat(source_fd))
+            if source_identity != leaf_identity:
+                return "changed"  # the classified object was replaced after inspection
+            target_fd = os.open(quarantine_day, _dir_flags())
+            linked: str | None = None
+            converged = False
+            for attempt in range(_MAX_MOVE_ATTEMPTS):
+                candidate = name if attempt == 0 else f"{attempt}.{name}"
+                try:
+                    os.link(
+                        name,
+                        candidate,
+                        src_dir_fd=source_dir_fd,
+                        dst_dir_fd=target_fd,
+                        follow_symlinks=False,
+                    )
+                    linked = candidate
+                    break
+                except FileExistsError:
                     try:
-                        os.link(name, candidate, src_dir_fd=source_fd, dst_dir_fd=target_fd)
-                        linked_name = candidate
-                        break
-                    except FileExistsError:
+                        existing = os.stat(candidate, dir_fd=target_fd, follow_symlinks=False)
+                    except OSError:
                         continue
-                if linked_name is None:
-                    blocked = "collision"
-                else:
-                    os.unlink(name, dir_fd=source_fd)
-                    os.fsync(target_fd)
-                    os.fsync(source_fd)
+                    if FileIdentity.from_stat(existing) == source_identity:
+                        linked = candidate  # our own earlier interrupted move: adopt, don't alias
+                        converged = True
+                        break
+                    continue
+            if linked is None:
+                return "collision"
+            # make the target name durable BEFORE the source is touched
+            try:
+                os.fsync(target_fd)
+            except OSError:
+                if not converged:
+                    self._rollback_link(target_fd, linked)
+                return "io"
+            checked = os.stat(linked, dir_fd=target_fd, follow_symlinks=False)
+            if FileIdentity.from_stat(checked) != source_identity:
+                if not converged:
+                    self._rollback_link(target_fd, linked)
+                return "changed"
+            # the classified bytes are durably named in quarantine; from here failures are
+            # commit-uncertain, never silently misreported as "still pending"
+            outcome = "uncertain"
+            try:
+                current = os.stat(name, dir_fd=source_dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None  # the source name is already gone; the move is complete
+            if FileIdentity.from_stat(current) != source_identity:
+                # a replacement was swapped in after linking: never unlink the unclassified
+                # object — the classified one is safely in quarantine, the newcomer is scanned next
+                return None
+            os.unlink(name, dir_fd=source_dir_fd)
+            os.fsync(source_dir_fd)
+            return None
         except OSError:
-            blocked = "io"
+            return outcome
         finally:
-            for descriptor in (target_fd, source_fd):
+            for descriptor in (target_fd, source_fd, source_dir_fd):
                 if descriptor is not None:
                     try:
                         os.close(descriptor)
                     except OSError:  # pragma: no cover - defensive close failure
-                        blocked = blocked or "io"
-        return blocked
+                        pass
+
+    def _rollback_link(self, target_fd: int, linked: str) -> None:
+        try:
+            os.unlink(linked, dir_fd=target_fd)
+            os.fsync(target_fd)
+        except OSError:  # pragma: no cover - best-effort rollback of an undurable link
+            pass
 
     def _register(self, parsed: ParsedSegment, batch_id: str, day: str) -> None:
         if (

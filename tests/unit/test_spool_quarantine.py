@@ -335,12 +335,13 @@ def test_a_replaced_day_directory_blocks_the_move(tmp_path: Path) -> None:
         scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
         day_dir = spool_root / "pending" / _DAY
         captured = reconcile_module.FileIdentity.from_stat(os.stat(day_dir))
+        leaf = reconcile_module.FileIdentity.from_stat(os.lstat(day_dir / "batch-1.jsonl"))
         os.rename(day_dir, spool_root / "pending" / "displaced")
         replacement = spool_root / "pending" / _DAY
         replacement.mkdir(mode=0o700)
         os.chmod(replacement, 0o700)
         (replacement / "batch-1.jsonl").write_bytes(b"impostor")
-        assert scan._move_to_quarantine(_DAY, "batch-1.jsonl", captured) == "changed"
+        assert scan._move_to_quarantine(_DAY, "batch-1.jsonl", captured, leaf) == "changed"
         assert (replacement / "batch-1.jsonl").exists()  # the impostor was not moved
     finally:
         database.close()
@@ -616,5 +617,480 @@ def test_a_conflict_with_a_corrupt_ledger_day_copy_quarantines_all(tmp_path: Pat
         # the ledger row survives as evidence and the next scan reports its file missing
         second = reconciler.reconcile()
         assert second.anomalies == (SegmentAnomaly("batch-1", _DAY, "missing_file", "absent"),)
+    finally:
+        database.close()
+
+
+# --- P0 regressions: no-follow leaf classification -----------------------------------------------
+
+
+_CANARY = b"synthetic-private-canary"
+
+
+def _assert_no_canary_beneath_quarantine(spool_root: Path, canary: Path) -> None:
+    # the reviewer's exact demand: no foreign inode and no canary byte is ever present beneath
+    # quarantine, however the scan misbehaved
+    assert os.lstat(canary).st_nlink == 1  # never hard-linked anywhere
+    quarantine = spool_root / "quarantine"
+    if not quarantine.exists():
+        return
+    for path in quarantine.rglob("*"):
+        info = os.lstat(path)
+        assert info.st_ino != os.lstat(canary).st_ino
+        if stat.S_ISREG(info.st_mode):
+            assert path.read_bytes() != _CANARY
+
+
+def test_a_staged_symlink_to_an_external_canary_is_never_quarantined(tmp_path: Path) -> None:
+    # the re-review's P0 reproduction: a symlink named like a staged temporary must never be
+    # followed, moved, or unlinked — linking it imported arbitrary foreign file content
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    try:
+        canary = tmp_path / "private-canary"
+        canary.write_bytes(_CANARY)
+        os.chmod(canary, 0o600)
+        header, frames = _segment(batch_id="batch-1")
+        _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
+        evil = spool_root / "pending" / _DAY / ".milhouse-stage-link"
+        os.symlink(canary, evil)
+
+        report = reconciler.reconcile()
+
+        assert len(report.registered) == 1  # the valid orphan still registers
+        assert report.quarantined == ()  # the symlink produced NO quarantine entry
+        assert SegmentAnomaly("", _DAY, "stale_temp", "staged_temporary") in report.anomalies
+        assert SegmentAnomaly("", _DAY, "quarantine_blocked", "unsafe") in report.anomalies
+        assert os.path.islink(evil)  # left exactly in place, never unlinked
+        assert canary.read_bytes() == _CANARY
+        assert not (spool_root / "quarantine").exists()  # nothing was moved at all
+        _assert_no_canary_beneath_quarantine(spool_root, canary)
+    finally:
+        database.close()
+
+
+def test_staged_directory_fifo_hardlink_and_loose_mode_shapes_are_refused(tmp_path: Path) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    try:
+        pending = spool_root / "pending"
+        pending.mkdir(mode=0o700)
+        os.chmod(pending, 0o700)
+        day_dir = pending / _DAY
+        day_dir.mkdir(mode=0o700)
+        os.chmod(day_dir, 0o700)
+        (day_dir / ".milhouse-stage-dir").mkdir(mode=0o700)
+        os.mkfifo(day_dir / ".milhouse-stage-fifo", 0o600)
+        hard = day_dir / ".milhouse-stage-hard"
+        hard.write_bytes(b"two names")
+        os.chmod(hard, 0o600)
+        os.link(hard, tmp_path / "second-name")  # nlink == 2 with no quarantine twin
+        loose = day_dir / ".milhouse-stage-mode"
+        loose.write_bytes(b"loose")
+        os.chmod(loose, 0o644)
+        # an EXISTING empty quarantine day exercises the twin probe's full candidate sweep
+        quarantine_day = spool_root / "quarantine" / _DAY
+        quarantine_day.mkdir(mode=0o700, parents=True)
+        os.chmod(spool_root / "quarantine", 0o700)
+        os.chmod(quarantine_day, 0o700)
+
+        report = reconciler.reconcile()
+
+        assert report.complete
+        assert report.quarantined == ()
+        blocked = [a for a in report.anomalies if a.kind == "quarantine_blocked"]
+        assert blocked == [SegmentAnomaly("", _DAY, "quarantine_blocked", "unsafe")] * 4
+        assert (day_dir / ".milhouse-stage-dir").is_dir()
+        assert stat.S_ISFIFO(os.lstat(day_dir / ".milhouse-stage-fifo").st_mode)
+        assert hard.read_bytes() == b"two names"
+        assert loose.read_bytes() == b"loose"
+        assert list(quarantine_day.iterdir()) == []  # nothing was ever linked in
+    finally:
+        database.close()
+
+
+def test_device_and_socket_shapes_are_never_permitted() -> None:
+    # device nodes cannot be created unprivileged, so the fixed shape predicate is proven directly
+    uid = os.getuid()
+
+    def _info(mode: int, *, nlink: int = 1, owner: int = uid) -> os.stat_result:
+        return os.stat_result((mode, 1, 2, nlink, owner, 0, 0, 0, 0, 0))
+
+    assert reconcile_module._permitted_quarantine_shape(_info(stat.S_IFREG | 0o600))
+    for refused in (
+        stat.S_IFCHR | 0o600,  # character device
+        stat.S_IFBLK | 0o600,  # block device
+        stat.S_IFSOCK | 0o600,  # socket
+        stat.S_IFIFO | 0o600,  # FIFO
+        stat.S_IFDIR | 0o700,  # directory
+        stat.S_IFLNK | 0o777,  # symlink (also refused earlier by the no-follow open)
+        stat.S_IFREG | 0o644,  # loose mode
+        stat.S_IFREG | 0o400,  # tightened mode
+    ):
+        assert not reconcile_module._permitted_quarantine_shape(_info(refused))
+    assert not reconcile_module._permitted_quarantine_shape(_info(stat.S_IFREG | 0o600, nlink=2))
+    assert not reconcile_module._permitted_quarantine_shape(
+        _info(stat.S_IFREG | 0o600, owner=uid + 1)
+    )
+    # the interrupted-move twin shape admits exactly-two links and nothing else unusual
+    assert reconcile_module._interrupted_move_shape(_info(stat.S_IFREG | 0o600, nlink=2))
+    assert not reconcile_module._interrupted_move_shape(_info(stat.S_IFREG | 0o600))
+    assert not reconcile_module._interrupted_move_shape(_info(stat.S_IFCHR | 0o600, nlink=2))
+    assert not reconcile_module._interrupted_move_shape(
+        _info(stat.S_IFREG | 0o600, nlink=2, owner=uid + 1)
+    )
+
+
+def test_an_acl_bearing_leaf_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    real_check = reconcile_module.require_no_extended_acl
+
+    def _acl_on_files(descriptor: int) -> None:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise SecureFileError(SecureFileErrorKind.ACCESS_CONTROL_UNSAFE)
+        real_check(descriptor)
+
+    try:
+        stage = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+        os.rename(stage, stage.with_name(".milhouse-stage-acl"))
+        monkeypatch.setattr(reconcile_module, "require_no_extended_acl", _acl_on_files)
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("", _DAY, "quarantine_blocked", "unsafe") in report.anomalies
+        assert (spool_root / "pending" / _DAY / ".milhouse-stage-acl").exists()
+    finally:
+        database.close()
+
+
+def test_a_regular_replacement_swapped_in_before_link_is_never_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the re-review's deterministic race: replace the classified file with a DIFFERENT regular
+    # file immediately before the hard link — zero moves, zero unlinks, both objects preserved
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    aside = tmp_path / "displaced-original"
+    real_link = os.link
+    swapped: list[bool] = []
+
+    def _swapping_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):  # type: ignore[no-untyped-def]
+        if not swapped:
+            swapped.append(True)
+            os.rename(path, aside)
+            path.write_bytes(b"replacement-not-classified")
+            os.chmod(path, 0o600)
+        return real_link(
+            src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks
+        )
+
+    monkeypatch.setattr(os, "link", _swapping_link)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_blocked", "changed") in report.anomalies
+        assert path.read_bytes() == b"replacement-not-classified"  # never unlinked
+        assert aside.read_bytes() == b"junk\n"  # the classified original is preserved
+        quarantine_day = spool_root / "quarantine" / _DAY
+        assert list(quarantine_day.iterdir()) == []  # the mismatched link was rolled back
+    finally:
+        database.close()
+
+
+def test_a_symlink_replacement_swapped_in_before_link_is_never_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    canary = tmp_path / "private-canary"
+    canary.write_bytes(_CANARY)
+    os.chmod(canary, 0o600)
+    path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    aside = tmp_path / "displaced-original"
+    real_link = os.link
+    swapped: list[bool] = []
+
+    def _swapping_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):  # type: ignore[no-untyped-def]
+        if not swapped:
+            swapped.append(True)
+            os.rename(path, aside)
+            os.symlink(canary, path)
+        return real_link(
+            src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks
+        )
+
+    monkeypatch.setattr(os, "link", _swapping_link)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_blocked", "changed") in report.anomalies
+        assert os.path.islink(path)  # the swapped-in symlink was never unlinked
+        assert aside.read_bytes() == b"junk\n"
+        assert canary.read_bytes() == _CANARY
+        assert list((spool_root / "quarantine" / _DAY).iterdir()) == []
+        _assert_no_canary_beneath_quarantine(spool_root, canary)
+    finally:
+        database.close()
+
+
+# --- P1 regressions: durable ordering and outcome taxonomy ---------------------------------------
+
+
+def _dir_ident(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def test_the_move_orders_target_fsync_before_source_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the re-review's P1: the target name must be durable BEFORE the source is touched, and the
+    # freshly created quarantine directories must be made durable by fsyncing their parents
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = spool_root / "pending" / _DAY
+    quarantine_root = spool_root / "quarantine"
+    quarantine_day = quarantine_root / _DAY
+    log: list[tuple[str, object]] = []
+    real_link, real_fsync, real_unlink = os.link, os.fsync, os.unlink
+
+    def _labelled(fd: int) -> object:
+        ident = (os.fstat(fd).st_dev, os.fstat(fd).st_ino)
+        for label, target in (
+            ("spool-root", spool_root),
+            ("quarantine-root", quarantine_root),
+            ("quarantine-day", quarantine_day),
+            ("pending-day", pending_day),
+        ):
+            if _dir_ident(target) == ident:
+                return label
+        return "other"
+
+    def _logging_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):  # type: ignore[no-untyped-def]
+        log.append(("link", follow_symlinks))
+        return real_link(
+            src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks
+        )
+
+    def _logging_fsync(fd: int) -> None:
+        log.append(("fsync", _labelled(fd)))
+        real_fsync(fd)
+
+    def _logging_unlink(name, *, dir_fd=None):  # type: ignore[no-untyped-def]
+        label = "other" if dir_fd is None else _labelled(dir_fd)
+        log.append(("unlink", label))
+        real_unlink(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "link", _logging_link)
+    monkeypatch.setattr(os, "fsync", _logging_fsync)
+    monkeypatch.setattr(os, "unlink", _logging_unlink)
+    try:
+        report = reconciler.reconcile()
+        assert len(report.quarantined) == 1
+        assert [entry for entry in log if entry[0] == "link"] == [("link", False)]  # no-follow
+        link_at = log.index(("link", False))
+        # each freshly created quarantine directory was made durable by fsyncing its parent,
+        # BEFORE anything was linked into it
+        assert log.index(("fsync", "spool-root")) < link_at
+        assert log.index(("fsync", "quarantine-root")) < link_at
+        # the target directory is durable before the source is touched; the source directory
+        # is flushed last
+        assert [entry for entry in log if entry == ("unlink", "pending-day")] == [
+            ("unlink", "pending-day")
+        ]
+        assert (
+            link_at
+            < log.index(("fsync", "quarantine-day"))
+            < log.index(("unlink", "pending-day"))
+            < log.index(("fsync", "pending-day"))
+        )
+        assert not path.exists()
+        assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_a_target_fsync_failure_blocks_cleanly_with_the_source_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the re-review's planted failure: with the first target-directory fsync failing, the move
+    # must report blocked AND the file must actually still be in pending — state and report agree
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_fsync = os.fsync
+    fail = [True]
+
+    def _failing_fsync(fd: int) -> None:
+        info = os.fstat(fd)
+        if fail and _dir_ident(quarantine_day) == (info.st_dev, info.st_ino):
+            fail.clear()
+            raise OSError(5, "planted target fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _failing_fsync)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_blocked", "io") in report.anomalies
+        assert path.read_bytes() == b"junk\n"  # blocked really does mean: still in pending
+        assert list(quarantine_day.iterdir()) == []  # the undurable link was rolled back
+        # the retry converges: one durable name, no aliases
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert not path.exists()
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+    finally:
+        database.close()
+
+
+def test_a_link_failure_blocks_cleanly_with_the_source_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    real_link = os.link
+    fail = [True]
+
+    def _failing_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):  # type: ignore[no-untyped-def]
+        if fail:
+            fail.clear()
+            raise OSError(5, "planted link failure")
+        return real_link(
+            src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks
+        )
+
+    monkeypatch.setattr(os, "link", _failing_link)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_blocked", "io") in report.anomalies
+        assert path.read_bytes() == b"junk\n"
+        assert list((spool_root / "quarantine" / _DAY).iterdir()) == []
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert not path.exists()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("target_parts", [("quarantine",), ("quarantine", _DAY)])
+def test_a_blocked_quarantine_directory_mkdir_reports_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_parts: tuple[str, ...]
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    blocked_path = spool_root.joinpath(*target_parts)
+    real_mkdir = os.mkdir
+    fail = [True]
+
+    def _failing_mkdir(target, mode=0o777, *, dir_fd=None):  # type: ignore[no-untyped-def]
+        if fail and Path(target) == blocked_path:
+            raise OSError(13, "planted mkdir failure")
+        return real_mkdir(target, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", _failing_mkdir)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_blocked", "unreachable") in (
+            report.anomalies
+        )
+        assert path.read_bytes() == b"junk\n"
+        fail.clear()
+        second = reconciler.reconcile()  # the retry converges once the directory can be created
+        assert len(second.quarantined) == 1
+        assert not path.exists()
+    finally:
+        database.close()
+
+
+def test_an_undurable_directory_creation_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a directory whose creating parent fsync fails is not durably named: the move must not
+    # proceed into it
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    monkeypatch.setattr(reconcile_module, "_fsync_dir", lambda _path: False)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_blocked", "unreachable") in (
+            report.anomalies
+        )
+        assert path.read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_a_source_unlink_failure_reports_commit_uncertain_and_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # after the target is durable, an unlink failure is COMMIT-UNCERTAIN: never reported as
+    # completed, never as still-pending — and the next scan adopts the same-inode twin
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = spool_root / "pending" / _DAY
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_unlink = os.unlink
+    fail = [True]
+
+    def _failing_unlink(name, *, dir_fd=None):  # type: ignore[no-untyped-def]
+        if fail and dir_fd is not None:
+            info = os.fstat(dir_fd)
+            if _dir_ident(pending_day) == (info.st_dev, info.st_ino):
+                fail.clear()
+                raise OSError(5, "planted unlink failure")
+        return real_unlink(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", _failing_unlink)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        # the durable target and the pending twin are the SAME inode under two names
+        assert os.stat(path).st_ino == os.stat(quarantine_day / "batch-1.jsonl").st_ino
+        # the retry converges by adopting the twin: one durable name, no aliases
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert not path.exists()
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+        assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+        third = reconciler.reconcile()  # and the scan after that is clean
+        assert third.quarantined == ()
+        assert third.anomalies == ()
+    finally:
+        database.close()
+
+
+def test_a_source_fsync_failure_after_unlink_reports_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = spool_root / "pending" / _DAY
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_fsync = os.fsync
+    fail = [True]
+
+    def _failing_fsync(fd: int) -> None:
+        info = os.fstat(fd)
+        if fail and _dir_ident(pending_day) == (info.st_dev, info.st_ino):
+            fail.clear()
+            raise OSError(5, "planted source fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _failing_fsync)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        # the durable quarantine name survives; the source name is already gone
+        assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+        assert not path.exists()
+        second = reconciler.reconcile()  # nothing is left to converge: the next scan is clean
+        assert second.quarantined == ()
+        assert second.anomalies == ()
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
     finally:
         database.close()
