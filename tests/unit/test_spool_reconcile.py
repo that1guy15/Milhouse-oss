@@ -154,7 +154,7 @@ def test_reconciling_an_empty_spool_reports_nothing(tmp_path: Path) -> None:
     database, _store, _spool_root, reconciler = _reconciler(tmp_path)
     try:
         report = reconciler.reconcile()
-        assert report == reconcile_module.ReconciliationReport((), (), 0, 0, complete=True)
+        assert report == reconcile_module.ReconciliationReport((), (), (), 0, 0, complete=True)
     finally:
         database.close()
 
@@ -495,6 +495,7 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "ExporterDelivery",
         "OrphanRegistration",
         "ParsedSegment",
+        "QuarantinedFile",
         "ReconciliationReport",
         "SegmentAnomaly",
         "SegmentHeaderV1",

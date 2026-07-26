@@ -33,7 +33,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from milhouse.config.filesystem import lexical_absolute_path
+from milhouse.config.filesystem import (
+    SecureFileError,
+    lexical_absolute_path,
+    require_no_extended_acl,
+)
 from milhouse.core.clock import TimeError, format_timestamp
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
@@ -93,19 +97,37 @@ def _committed_stamp(committed_at: datetime) -> str:
 
 
 def _require_private_dir(path: Path, subject: str) -> None:
-    info: os.stat_result | None
+    """Require an owned, exact-0700, ACL-free directory, validated on an opened descriptor.
+
+    The descriptor-based check closes the gap the earlier lstat version left: mode bits alone do
+    not prove the access envelope, so the same extended-ACL probe the secure file primitives use
+    runs against the opened directory itself.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    unsafe = False
+    descriptor: int | None = None
     try:
-        info = os.lstat(path)
-    except OSError:
-        info = None
-    if (
-        info is None
-        or stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != _current_uid()
-        or stat.S_IMODE(info.st_mode) != _DIR_MODE
-    ):
-        _fail("MH_SPOOL_DIR", f"the {subject} must be an owned 0o700 directory")
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != _current_uid()
+            or stat.S_IMODE(info.st_mode) != _DIR_MODE
+        ):
+            unsafe = True
+        else:
+            require_no_extended_acl(descriptor)
+    except (OSError, SecureFileError):
+        unsafe = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover - defensive: close failure on a valid descriptor
+                unsafe = True
+    if unsafe:
+        _fail("MH_SPOOL_DIR", f"the {subject} must be an owned, ACL-free 0o700 directory")
 
 
 def _secure_child_dir(parent: Path, name: str) -> Path:

@@ -18,14 +18,20 @@ enumeration and then, comparing against the fully validated ``_segments`` ledger
   them), and every foreign entry — carrying only validated identifiers and fixed reasons; an
   invalid name is omitted entirely, so no raw or derived untrusted name reaches a report surface.
 
-The scan never deletes, quarantines, or moves a file; it registers valid orphans and returns a
-:class:`ReconciliationReport`. Every failure is a fixed ``MH_SPOOL_*`` error raised outside any
-handler.
+On a complete pass the scan also QUARANTINES, per plan section 3.4/4.3: corrupt committed and
+orphan files, every copy of a conflicted batch id (``conflict_divergent`` when contents differ — the
+plan's high-severity conflict — or ``conflict_duplicate`` when byte-identical, so directory order
+never chooses a durable history), and crashed writers' staged temporaries all move to
+``quarantine/<day>/`` via an identity-verified, no-replace, fsynced link+unlink under the same
+exclusive hold. Foreign-named entries are reported but left in place (they have no well-formed
+quarantine name). The scan never deletes; an incomplete pass moves nothing. Every failure is a
+fixed ``MH_SPOOL_*`` error raised outside any handler.
 """
 
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import re
 import sqlite3
@@ -37,7 +43,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
-from milhouse.config.filesystem import FileIdentity, lexical_absolute_path
+from milhouse.config.filesystem import (
+    FileIdentity,
+    SecureFileError,
+    lexical_absolute_path,
+    require_no_extended_acl,
+)
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
     ORIGIN_RECONCILED,
@@ -51,6 +62,7 @@ from milhouse.spooling.ledger import (
 )
 from milhouse.spooling.reader import (
     INSTALLATION_ID_PATTERN,
+    MAX_SEGMENT_FILE_BYTES,
     ParsedSegment,
     read_trusted_segment,
 )
@@ -65,6 +77,12 @@ from milhouse.state.errors import StateError
 
 _SPOOL = "spool"
 _PENDING = "pending"
+_QUARANTINE = "quarantine"
+_STAGE_PREFIX = ".milhouse-stage-"
+# Codes whose subject cannot be moved: the directory changed since inventory (the classified
+# object is not the present one), the file vanished, or it is not a regular file (hard-linking
+# a symlink or directory is unsafe). These stay report-only.
+_UNQUARANTINABLE = frozenset({"MH_SPOOL_CHANGED", "MH_SPOOL_NOT_FOUND", "MH_SPOOL_NOT_REGULAR"})
 _BARRIER_NAME = "commit.lock"
 _SEGMENT_SUFFIX = ".jsonl"
 _DIR_MODE = 0o700
@@ -99,7 +117,10 @@ class SegmentAnomaly:
     ledger row), ``corrupt_file`` (a committed file that fails trusted validation or disagrees with
     its row), ``corrupt_orphan`` (an unrecorded file that fails trusted validation or egress),
     ``conflict`` (a batch id at more than one path), ``foreign_name`` (an entry whose name is not a
-    well-formed ``<batch-id>.jsonl`` under a valid day), or ``limit`` (a scan bound was exceeded).
+    well-formed ``<batch-id>.jsonl`` under a valid day), ``stale_temp`` (a crashed writer's staged
+    temporary), ``quarantine_blocked`` (a staged quarantine move could not complete: the file
+    stays in pending and is re-reported every scan — reasons ``unreachable``, ``changed``,
+    ``collision``, ``io``), or ``limit`` (a scan bound was exceeded).
     ``batch_id`` and ``day`` are validated identifiers or empty when the underlying name was
     invalid (untrusted names are omitted entirely, never echoed or fingerprinted); ``detail`` is a
     fixed reason or ``MH_SPOOL_*`` code — never a raw path.
@@ -108,6 +129,22 @@ class SegmentAnomaly:
     batch_id: str
     day: str
     kind: str
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantinedFile:
+    """One file reconciliation moved to ``quarantine/<day>/`` with its fixed reason.
+
+    ``batch_id`` is a validated identifier or empty (stale staged temporaries have no batch).
+    ``detail`` is the fixed reason: an ``MH_SPOOL_*`` code for a corrupt file,
+    ``conflict_divergent`` (duplicate batch ids with differing content — the plan's high-severity
+    conflict), ``conflict_duplicate`` (byte-identical duplicates, quarantined without choosing a
+    path), or ``stale_temp`` (a crashed writer's staged temporary).
+    """
+
+    batch_id: str
+    day: str
     detail: str
 
 
@@ -122,6 +159,7 @@ class ReconciliationReport:
     """
 
     registered: tuple[OrphanRegistration, ...]
+    quarantined: tuple[QuarantinedFile, ...]
     anomalies: tuple[SegmentAnomaly, ...]
     healthy: int
     scanned: int
@@ -150,6 +188,79 @@ def _safe_id(batch_id: str) -> str:
     """
 
     return batch_id if BATCH_ID_PATTERN.fullmatch(batch_id) is not None else ""
+
+
+def _raw_sha256(path: Path) -> str | None:
+    """Hash a file's raw bytes without parsing: no-follow, regular-only, size-bounded.
+
+    Returns ``None`` on any failure (missing, non-regular, oversized, unreadable) so a conflicted
+    copy that cannot be read classifies fail-safe as divergent.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    digest = hashlib.sha256()
+    descriptor: int | None = None
+    failed = False
+    try:
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SEGMENT_FILE_BYTES:
+            failed = True
+        else:
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_SEGMENT_FILE_BYTES:
+                    failed = True
+                    break
+                digest.update(chunk)
+    except OSError:
+        failed = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover - defensive close failure
+                failed = True
+    return None if failed else digest.hexdigest()
+
+
+def _ensure_private_dir(path: Path) -> bool:
+    """Create-if-absent and validate one owned, exact-0700, ACL-free quarantine directory."""
+
+    unsafe = False
+    descriptor: int | None = None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    try:
+        os.mkdir(path, _DIR_MODE)
+    except FileExistsError:
+        pass
+    except OSError:
+        unsafe = True
+    try:
+        if not unsafe:
+            descriptor = os.open(path, flags)
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != _current_uid()
+                or stat.S_IMODE(info.st_mode) != _DIR_MODE
+            ):
+                unsafe = True
+            else:
+                require_no_extended_acl(descriptor)
+    except (OSError, SecureFileError):
+        unsafe = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover - defensive close failure
+                unsafe = True
+    return not unsafe
 
 
 def _is_valid_day(day: str) -> bool:
@@ -188,8 +299,14 @@ def _secure_dir_names(
     try:
         info = os.fstat(descriptor)
         identity = FileIdentity.from_stat(info)
+        acl_unsafe = False
+        try:
+            require_no_extended_acl(descriptor)
+        except SecureFileError:
+            acl_unsafe = True
         if (
-            not stat.S_ISDIR(info.st_mode)
+            acl_unsafe
+            or not stat.S_ISDIR(info.st_mode)
             or info.st_uid != _current_uid()
             or stat.S_IMODE(info.st_mode) != _DIR_MODE
         ):
@@ -294,7 +411,10 @@ class _Scan:
         "_database",
         "_healthy",
         "_installation_id",
+        "_move_failures",
+        "_pending_quarantines",
         "_pending_registrations",
+        "_quarantined",
         "_registered",
         "_scanned",
         "_spool_root",
@@ -307,6 +427,10 @@ class _Scan:
         self._installation_id = installation_id
         self._registered: list[OrphanRegistration] = []
         self._pending_registrations: list[tuple[ParsedSegment, str, str]] = []
+        # (day, name, day_identity, batch_id_or_empty, fixed detail) for files to move on success
+        self._pending_quarantines: list[tuple[str, str, FileIdentity, str, str]] = []
+        self._quarantined: list[QuarantinedFile] = []
+        self._move_failures: list[SegmentAnomaly] = []
         self._anomalies: list[SegmentAnomaly] = []
         self._healthy = 0
         self._scanned = 0
@@ -343,6 +467,7 @@ class _Scan:
         candidates = self._inventory()
         counts = Counter(batch_id for _day, batch_id, _path, _identity in candidates)
         seen: set[str] = set()
+        conflicted: dict[str, list[tuple[str, Path, FileIdentity]]] = {}
         if self._complete:
             for day, batch_id, path, day_identity in candidates:
                 if self._capped():
@@ -350,12 +475,43 @@ class _Scan:
                 seen.add(batch_id)
                 if counts[batch_id] > 1:
                     self._anomaly(batch_id, day, "conflict", "duplicate_batch_id")
+                    conflicted.setdefault(batch_id, []).append((day, path, day_identity))
                 elif batch_id in malformed:
                     continue  # the malformed-row anomaly already covers this batch
                 elif batch_id in ledger:
                     self._verify_committed(path, day, batch_id, ledger[batch_id], day_identity)
                 else:
                     self._reconcile_orphan(path, day, batch_id, day_identity)
+
+        # Conflict content comparison is classification (bounded raw reads, no parsing). Every
+        # copy of a conflicted batch is staged for quarantine EXCEPT one that agrees with an
+        # existing healthy ledger row: the ledger already unambiguously designates that copy, so
+        # keeping it is not directory order choosing a history — and quarantining it would demote
+        # an acknowledged committed segment to a dangling ledger row (the review's reproduction via
+        # an ordinary same-batch retry). Differing contents mark the plan's high-severity
+        # divergent conflict.
+        if self._complete and not self._capped():
+            for batch_id, copies in sorted(conflicted.items()):
+                if self._capped():
+                    break
+                keeper: tuple[str, Path, FileIdentity] | None = None
+                record = ledger.get(batch_id)
+                if record is not None:
+                    for day, path, day_identity in copies:
+                        if day != record.day:
+                            continue  # only the ledger's own day can agree (day is compared)
+                        parsed, code = self._trusted_read(path, day_identity)
+                        if code is None and _agrees(parsed, day, batch_id, record):
+                            keeper = (day, path, day_identity)
+                            self._healthy += 1
+                        break
+                detail = self._conflict_detail(copies)
+                for day, path, day_identity in copies:
+                    if keeper is not None and (day, path, day_identity) == keeper:
+                        continue
+                    self._pending_quarantines.append(
+                        (day, path.name, day_identity, batch_id, detail)
+                    )
 
         # Missing-ledger-file classification is classification, so it runs BEFORE any mutation.
         if self._complete:
@@ -376,12 +532,25 @@ class _Scan:
             for parsed, batch_id, day in self._pending_registrations:
                 self._register(parsed, batch_id, day)
                 self._registered.append(OrphanRegistration(batch_id, day))
+            for day, name, day_identity, batch_id, detail in self._pending_quarantines:
+                blocked = self._move_to_quarantine(day, name, day_identity)
+                if blocked is None:
+                    self._quarantined.append(QuarantinedFile(batch_id, day, detail))
+                else:
+                    # A quarantine that cannot complete never aborts recovery or a commit: the file
+                    # stays in pending, is re-reported every scan, and authority is unaffected —
+                    # the review showed one un-quarantinable file must not wedge all commits.
+                    self._move_failures.append(
+                        SegmentAnomaly(batch_id, day, "quarantine_blocked", blocked)
+                    )
         else:
             self._pending_registrations.clear()
+            self._pending_quarantines.clear()
 
         return ReconciliationReport(
             registered=tuple(self._registered),
-            anomalies=tuple(self._anomalies),
+            quarantined=tuple(self._quarantined),
+            anomalies=tuple(self._anomalies) + tuple(self._move_failures),
             healthy=self._healthy if self._complete else 0,
             scanned=self._scanned,
             complete=self._complete,
@@ -457,6 +626,12 @@ class _Scan:
                     self._complete = False
                     return candidates
                 self._scanned += 1
+                if name.startswith(_STAGE_PREFIX):
+                    # a crashed writer's staged temporary: never a committed artifact, so it is
+                    # quarantined by policy rather than recovered (replay regenerates the batch)
+                    self._anomaly("", day, "stale_temp", "staged_temporary")
+                    self._pending_quarantines.append((day, name, day_identity, "", "stale_temp"))
+                    continue
                 resolved = self._classify_name(pending / day / name, day, name)
                 if resolved is not None:
                     candidates.append((*resolved, day_identity))
@@ -485,8 +660,13 @@ class _Scan:
         parsed, code = self._trusted_read(path, day_identity)
         if code is not None:
             self._anomaly(batch_id, day, "corrupt_file", code)
+            if code not in _UNQUARANTINABLE:
+                self._pending_quarantines.append((day, path.name, day_identity, batch_id, code))
         elif not _agrees(parsed, day, batch_id, record):
             self._anomaly(batch_id, day, "corrupt_file", "ledger_mismatch")
+            self._pending_quarantines.append(
+                (day, path.name, day_identity, batch_id, "ledger_mismatch")
+            )
         else:
             self._healthy += 1
 
@@ -496,15 +676,20 @@ class _Scan:
         parsed, code = self._trusted_read(path, day_identity)
         if code is not None:
             self._anomaly(batch_id, day, "corrupt_orphan", code)
+            if code not in _UNQUARANTINABLE:
+                self._pending_quarantines.append((day, path.name, day_identity, batch_id, code))
             return
         assert parsed is not None
         if parsed.header.batch_id != batch_id:
+            # a valid segment under the wrong name: reported but left in place, like other
+            # foreign-named entries (it has no trustworthy quarantine name)
             self._anomaly(batch_id, day, "foreign_name", "header_batch_id")
             return
         try:
             authorize_local_persistence(parsed.header.privacy_class)
         except SpoolError as denied:
             self._anomaly(batch_id, day, "corrupt_orphan", denied.code)
+            self._pending_quarantines.append((day, path.name, day_identity, batch_id, denied.code))
             return
         # registration is deferred: mutation begins only after the whole pass proves complete
         self._pending_registrations.append((parsed, batch_id, day))
@@ -523,6 +708,74 @@ class _Scan:
         except SpoolError as error:
             code = error.code
         return parsed, code
+
+    def _conflict_detail(self, copies: list[tuple[str, Path, FileIdentity]]) -> str:
+        """Classify a conflicted batch: byte-identical duplicates or a divergent durable history.
+
+        An unreadable copy is treated as divergent (fail-safe severity). The raw bounded hash never
+        parses content, so a corrupt conflicted copy still classifies deterministically.
+        """
+
+        digests: set[str | None] = {_raw_sha256(path) for _day, path, _identity in copies}
+        if None in digests or len(digests) > 1:
+            return "conflict_divergent"  # the plan's high-severity duplicate-id conflict
+        return "conflict_duplicate"
+
+    def _move_to_quarantine(self, day: str, name: str, day_identity: FileIdentity) -> str | None:
+        """Move one inventoried file to ``quarantine/<day>/`` with no replace and no unlink-first.
+
+        The source directory is re-opened and its identity compared with the inventoried one, so a
+        replaced directory can never redirect the move (Finding C note: this binds the DIRECTORY
+        identity; the exclusive barrier plus owner-only spool is what excludes a same-name file
+        swap); the file is hard-linked into the quarantine day (retrying past name collisions with
+        a bounded counter prefix) and only then unlinked from pending, with both directories
+        fsynced, so content is preserved on every path. Returns ``None`` on success or a fixed
+        blocked reason (``unreachable``, ``changed``, ``collision``, ``io``): a move that cannot
+        complete never raises and never aborts recovery — the file stays in pending and is
+        re-reported every scan, because one un-quarantinable file must not wedge all commits.
+        """
+
+        quarantine_day = self._spool_root / _QUARANTINE / day
+        if not (
+            _ensure_private_dir(self._spool_root / _QUARANTINE)
+            and _ensure_private_dir(quarantine_day)
+        ):
+            return "unreachable"
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+        blocked: str | None = None
+        source_fd: int | None = None
+        target_fd: int | None = None
+        try:
+            source_fd = os.open(self._spool_root / _PENDING / day, flags)
+            if FileIdentity.from_stat(os.fstat(source_fd)) != day_identity:
+                blocked = "changed"  # the pending day directory changed since it was inventoried
+            else:
+                target_fd = os.open(quarantine_day, flags)
+                linked_name: str | None = None
+                for attempt in range(100):
+                    candidate = name if attempt == 0 else f"{attempt}.{name}"
+                    try:
+                        os.link(name, candidate, src_dir_fd=source_fd, dst_dir_fd=target_fd)
+                        linked_name = candidate
+                        break
+                    except FileExistsError:
+                        continue
+                if linked_name is None:
+                    blocked = "collision"
+                else:
+                    os.unlink(name, dir_fd=source_fd)
+                    os.fsync(target_fd)
+                    os.fsync(source_fd)
+        except OSError:
+            blocked = "io"
+        finally:
+            for descriptor in (target_fd, source_fd):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:  # pragma: no cover - defensive close failure
+                        blocked = blocked or "io"
+        return blocked
 
     def _register(self, parsed: ParsedSegment, batch_id: str, day: str) -> None:
         if (
