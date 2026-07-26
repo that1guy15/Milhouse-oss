@@ -331,6 +331,18 @@ def _require_no_extended_acl(descriptor: int) -> None:
         raise SecureFileError(SecureFileErrorKind.ACCESS_CONTROL_UNSAFE)
 
 
+def require_no_extended_acl(descriptor: int) -> None:
+    """Fail closed when an opened descriptor's mode bits are supplemented by an extended ACL.
+
+    Public so directory-securing callers (the spool writer and reconciliation enumerator) enforce
+    the same access-control envelope as the secure file primitives, instead of trusting mode bits
+    alone. Raises :class:`SecureFileError` with ``ACCESS_CONTROL_UNSAFE`` (or
+    ``SECURITY_UNSUPPORTED`` on hosts without an ACL probe).
+    """
+
+    _require_no_extended_acl(descriptor)
+
+
 def _require_private_parent(descriptor: int, metadata: os.stat_result) -> None:
     """Require the key namespace to be owned and accessible only by the current user."""
 
@@ -794,5 +806,6 @@ __all__ = [
     "inspect_regular_file_no_follow",
     "lexical_absolute_path",
     "open_regular_file_no_follow",
+    "require_no_extended_acl",
     "sync_parent_directory_no_follow",
 ]
