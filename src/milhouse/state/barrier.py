@@ -20,6 +20,7 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -135,36 +136,33 @@ def _close(descriptor: int) -> None:
 class ExclusiveHold:
     """An authority token proving a live exclusive hold of ONE specific barrier.
 
-    Only :meth:`GlobalCommitBarrier.exclusive` activates a hold, and it deactivates the token when
-    the context exits, so code requiring exclusive authority validates both ``hold.active`` and
-    ``hold.barrier_path`` — the canonical lock the token was issued for — at runtime instead of
-    trusting a docstring precondition. A live token is authority ONLY for its own barrier: a
-    consumer must compare ``barrier_path`` against the lock protecting the state it is about to
-    mutate. A directly constructed token is never active, a token captured from a completed hold is
-    stale and inactive, and the active bit is not assignable (name-mangled slot behind a read-only
-    property), so a token cannot be activated by attribute assignment.
+    A hold is live only while :meth:`GlobalCommitBarrier.exclusive` has it registered in the
+    barrier module's private live-hold registry; the registry entry is added after the flock is
+    genuinely held and discarded when the context exits. The token itself carries NO activation
+    capability whatsoever — no method, attribute, or assignment on the token can make it active,
+    so a directly constructed token stays inactive no matter which of its callables are exercised,
+    and a token captured from a completed hold is stale. A live token is authority ONLY for its own
+    barrier: a consumer must compare ``barrier_path`` against the lock protecting the state it is
+    about to mutate.
     """
 
-    __slots__ = ("__active", "__barrier_path")
+    __slots__ = ("__barrier_path", "__weakref__")
 
     def __init__(self, barrier_path: Path) -> None:
         self.__barrier_path = lexical_absolute_path(barrier_path)
-        self.__active = False
 
     @property
     def active(self) -> bool:
-        return self.__active
+        return self in _LIVE_HOLDS
 
     @property
     def barrier_path(self) -> Path:
         return self.__barrier_path
 
-    def _issue(self) -> None:
-        # Called only by GlobalCommitBarrier.exclusive once the lock is genuinely held.
-        self.__active = True
 
-    def _revoke(self) -> None:
-        self.__active = False
+# The live-hold registry: issuance and revocation state lives HERE, in the barrier implementation,
+# never on the token. Weak references keep an abandoned (garbage-collected) hold from lingering.
+_LIVE_HOLDS: weakref.WeakSet[ExclusiveHold] = weakref.WeakSet()
 
 
 class GlobalCommitBarrier:
@@ -227,10 +225,10 @@ class GlobalCommitBarrier:
             gate_held = True
             _acquire(main_fd, fcntl.LOCK_EX, blocking=blocking)
             main_held = True
-            hold._issue()
+            _LIVE_HOLDS.add(hold)
             yield hold
         finally:
-            hold._revoke()
+            _LIVE_HOLDS.discard(hold)
             if main_held:
                 _release(main_fd)
             if gate_held and gate_fd is not None:

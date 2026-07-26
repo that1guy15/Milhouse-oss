@@ -587,9 +587,12 @@ def test_a_direct_unheld_scan_call_fails_before_any_mutation(tmp_path: Path) -> 
         with pytest.raises(SpoolError) as stale:
             reconcile_module._Scan(database, spool_root, _INSTALLATION_ID).run(hold)
         assert stale.value.code == "MH_SPOOL_BARRIER"
-        # nothing mutated: the orphan remains unregistered and both tables are unchanged
+        # nothing mutated: the orphan remains unregistered, both tables are unchanged, and the
+        # filesystem is untouched (no quarantine directory was ever created)
         assert _count(database) == 0
         assert _count(database, "_segment_exporters") == 0
+        assert (spool_root / "pending" / _DAY / "orphan-1.jsonl").exists()
+        assert not (spool_root / "quarantine").exists()
     finally:
         database.close()
 
@@ -638,18 +641,39 @@ def test_exclusive_authority_is_bound_to_the_state_root(tmp_path: Path) -> None:
         database_b.close()
 
 
-def test_a_token_cannot_be_activated_by_attribute_assignment(tmp_path: Path) -> None:
+def test_a_token_carries_no_activation_capability(tmp_path: Path) -> None:
+    # the re-review forged a hold via its _issue() method; issuance now lives only in the barrier's
+    # private live-hold registry — the token exposes NO callable, method, or assignable state that
+    # can activate it
     from milhouse.state.barrier import ExclusiveHold
 
     hold = ExclusiveHold(tmp_path / "control" / "commit.lock")
     assert not hold.active
+    callables = [
+        name
+        for name in dir(ExclusiveHold)
+        if not name.startswith("__") and callable(getattr(ExclusiveHold, name, None))
+    ]
+    assert callables == []  # no token method exists, activating or otherwise
+    assert not hasattr(hold, "_issue")
+    assert not hasattr(hold, "_revoke")
     with pytest.raises(AttributeError):
         hold._active = True  # type: ignore[attr-defined]
     with pytest.raises(AttributeError):
         hold.__active = True  # type: ignore[attr-defined]
     with pytest.raises(AttributeError):
         hold.active = True  # type: ignore[misc]
-    assert not hold.active  # the trust decision is not a publicly writable bit
+    assert not hold.active  # the trust decision is not reachable from the token at all
+
+
+def test_a_context_issued_token_is_live_exactly_during_its_hold(tmp_path: Path) -> None:
+    _database, barrier, _spool_root = _control(tmp_path)
+    try:
+        with barrier.exclusive() as hold:
+            assert hold.active
+        assert not hold.active  # revoked the moment the context exits
+    finally:
+        _database.close()
 
 
 def test_the_anomaly_cap_stops_directory_enumeration(
