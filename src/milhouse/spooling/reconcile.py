@@ -261,65 +261,65 @@ def _dir_flags() -> int:
     return os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
 
 
-def _fsync_dir(path: Path) -> bool:
-    descriptor: int | None = None
-    synced = False
+def _fsync_descriptor(descriptor: int) -> bool:
     try:
-        descriptor = os.open(path, _dir_flags())
         os.fsync(descriptor)
-        synced = True
+        return True
     except OSError:
-        synced = False
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:  # pragma: no cover - defensive close failure
-                synced = False
-    return synced
+        return False
 
 
-def _ensure_private_dir(path: Path) -> bool:
-    """Create-if-absent, durably name, and validate one owned, exact-0700, ACL-free directory.
-
-    The parent directory is fsynced on EVERY acceptance, not only when this call created the
-    entry: the re-review planted a parent-fsync failure after creation and showed the retry
-    trusting the still-visible directory without ever re-proving its entry durable — so a crash
-    after a later move could lose the directory that names the moved file. A directory is
-    accepted only once its parent entry has been fsynced successfully in this pass.
-    """
+def _validated_dir_descriptor(descriptor: int) -> FileIdentity | None:
+    """Validate an opened directory descriptor (owned, 0700, ACL-free); return its identity."""
 
     unsafe = False
-    descriptor: int | None = None
+    identity: FileIdentity | None = None
     try:
-        os.mkdir(path, _DIR_MODE)
-    except FileExistsError:
-        pass
-    except OSError:
-        unsafe = True
-    if not unsafe and not _fsync_dir(path.parent):
-        unsafe = True
-    try:
-        if not unsafe:
-            descriptor = os.open(path, _dir_flags())
-            info = os.fstat(descriptor)
-            if (
-                not stat.S_ISDIR(info.st_mode)
-                or info.st_uid != _current_uid()
-                or stat.S_IMODE(info.st_mode) != _DIR_MODE
-            ):
-                unsafe = True
-            else:
-                require_no_extended_acl(descriptor)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != _current_uid()
+            or stat.S_IMODE(info.st_mode) != _DIR_MODE
+        ):
+            unsafe = True
+        else:
+            require_no_extended_acl(descriptor)
+            identity = FileIdentity.from_stat(info)
     except (OSError, SecureFileError):
         unsafe = True
-    finally:
+    return None if unsafe else identity
+
+
+def _ensure_private_dir_at(parent_fd: int, name: str) -> tuple[int, FileIdentity] | None:
+    """Create-if-absent, durably name, validate, and OPEN one directory beneath a held parent.
+
+    Everything is descriptor-relative to the already-validated parent, so no path re-walk can be
+    redirected. The parent is fsynced on EVERY acceptance, not only when this call created the
+    entry — a directory that survived an earlier failed parent fsync is never implicitly trusted
+    (round-2 P1). Returns the OPEN no-follow descriptor plus its exact identity, or None; the
+    caller owns the descriptor.
+    """
+
+    descriptor: int | None = None
+    identity: FileIdentity | None = None
+    try:
+        try:
+            os.mkdir(name, _DIR_MODE, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        if _fsync_descriptor(parent_fd):
+            descriptor = os.open(name, _dir_flags(), dir_fd=parent_fd)
+            identity = _validated_dir_descriptor(descriptor)
+    except OSError:
+        identity = None
+    if identity is None or descriptor is None:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:  # pragma: no cover - defensive close failure
-                unsafe = True
-    return not unsafe
+                pass
+        return None
+    return descriptor, identity
 
 
 def _leaf_probe_flags() -> int:
@@ -920,6 +920,75 @@ class _Scan:
             (day, name, day_identity, snapshot, digest, batch_id, detail)
         )
 
+    def _open_quarantine_chain(
+        self, day: str
+    ) -> tuple[int, tuple[FileIdentity, FileIdentity, FileIdentity]] | None:
+        """Open spool-root -> quarantine -> day as a validated descriptor chain.
+
+        Every level is opened no-follow relative to its already-validated parent and its exact
+        identity captured, so a path re-walk can never be redirected mid-chain. Returns the OPEN
+        day descriptor plus the (root, quarantine, day) identities, or None.
+        """
+
+        root_fd: int | None = None
+        quarantine_fd: int | None = None
+        result: tuple[int, tuple[FileIdentity, FileIdentity, FileIdentity]] | None = None
+        try:
+            root_fd = os.open(self._spool_root, _dir_flags())
+            root_identity = _validated_dir_descriptor(root_fd)
+            if root_identity is not None:
+                quarantine = _ensure_private_dir_at(root_fd, _QUARANTINE)
+                if quarantine is not None:
+                    quarantine_fd, quarantine_identity = quarantine
+                    day_pair = _ensure_private_dir_at(quarantine_fd, day)
+                    if day_pair is not None:
+                        day_fd, day_identity = day_pair
+                        result = (day_fd, (root_identity, quarantine_identity, day_identity))
+        except OSError:
+            result = None
+        finally:
+            for descriptor in (quarantine_fd, root_fd):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:  # pragma: no cover - defensive close failure
+                        pass
+        return result
+
+    def _quarantine_binding_holds(
+        self, day: str, identities: tuple[FileIdentity, FileIdentity, FileIdentity]
+    ) -> bool:
+        """Re-walk spool-root -> quarantine -> day and require the EXACT captured identities.
+
+        The round-3 review displaced the held day descriptor with a rename after validation, so
+        the copy landed outside ``spool/quarantine`` while the source was unlinked. Publication
+        and the source unlink each re-prove that the live pathname still resolves to the exact
+        directories the chain validated; any swap refuses the mutation.
+        """
+
+        root_identity, quarantine_identity, day_identity = identities
+        opened: list[int] = []
+        holds = False
+        try:
+            root_fd = os.open(self._spool_root, _dir_flags())
+            opened.append(root_fd)
+            if FileIdentity.from_stat(os.fstat(root_fd)) == root_identity:
+                quarantine_fd = os.open(_QUARANTINE, _dir_flags(), dir_fd=root_fd)
+                opened.append(quarantine_fd)
+                if FileIdentity.from_stat(os.fstat(quarantine_fd)) == quarantine_identity:
+                    day_fd = os.open(day, _dir_flags(), dir_fd=quarantine_fd)
+                    opened.append(day_fd)
+                    holds = FileIdentity.from_stat(os.fstat(day_fd)) == day_identity
+        except OSError:
+            holds = False
+        finally:
+            for descriptor in opened:
+                try:
+                    os.close(descriptor)
+                except OSError:  # pragma: no cover - defensive close failure
+                    pass
+        return holds
+
     def _move_to_quarantine(
         self,
         day: str,
@@ -931,37 +1000,37 @@ class _Scan:
         """Move one classified file to ``quarantine/<day>/`` as a digest-verified COPY.
 
         A hard link cannot freeze content — both names remain the same writable inode — so the
-        move copies (the re-review reproduced an in-place rewrite being certified as the
-        classified file). The source is re-opened no-follow beneath the re-verified day
+        move copies (the round-2 review reproduced an in-place rewrite being certified as the
+        classified file). The source is re-opened no-follow beneath the re-verified pending day
         descriptor and must match the classification-time snapshot exactly; its bytes are read
         FROM THAT DESCRIPTOR, must hash to the classified digest, and the snapshot is
         re-verified after the read — so no name swap or in-place mutation can substitute bytes.
-        The copy is staged and no-replace-published inside the quarantine day (the candidate
-        name is only ever absent or complete), fsynced file-then-directory BEFORE the source is
-        touched. A pre-existing candidate holding the exact classified digest is ADOPTED (an
-        earlier interrupted move), never aliased; any other occupant advances the bounded
-        counter. The source NAME is then revalidated immediately before its unlink, refusing
-        any replacement or mutation the re-stat can observe (POSIX offers no compare-and-unlink,
-        so the stat-to-unlink window narrows to one syscall; the exclusive hold and owner-only
-        pending directory exclude cooperating writers from it), and the source directory is
-        fsynced last.
-        Returns ``None`` when the classified bytes are durably quarantined,
-        ``"unreachable"``/``"changed"``/``"collision"``/``"io"`` when verifiably nothing of this
-        subject's moved (the file stays in pending), or ``"uncertain"`` when a copy of the
-        classified bytes may exist — freshly published or as an unexaminable pre-existing
-        occupant — but could not be proven or disproven; never a raised error, so one unmovable
-        file cannot wedge recovery.
+        The quarantine target directory is reached ONLY through a validated descriptor chain
+        (spool root -> quarantine -> day, each opened no-follow relative to its parent, each
+        identity captured), and that exact live binding is re-proven immediately before
+        publication and again before the source unlink — a displaced directory refuses the
+        mutation (round-3 P1). The copy is staged and no-replace-published (a candidate name is
+        only ever absent or complete), fsynced file then directory BEFORE the source is touched.
+        A pre-existing candidate is adopted ONLY when it passes the full subject envelope
+        (owned, exact-0600, single-link, ACL-free, snapshot-stable) AND holds the exact
+        classified digest; any foreign or multi-link occupant advances the bounded counter
+        (round-3 P1). The certified target's identity and the source name are both revalidated
+        immediately before the unlink, refusing whatever the re-stat can observe (POSIX offers
+        no compare-and-unlink; the exclusive hold and owner-only directories exclude cooperating
+        writers from the one-syscall window). Returns ``None`` when the classified bytes are
+        durably quarantined under the live namespace, ``"unreachable"``/``"changed"``/
+        ``"collision"``/``"io"`` when verifiably nothing of this subject's moved (the file stays
+        in pending), or ``"uncertain"`` when a copy may exist — or its namespace binding could
+        not be re-proven — but the state could not be decided; never a raised error, so one
+        unmovable file cannot wedge recovery.
         """
 
-        quarantine_day = self._spool_root / _QUARANTINE / day
-        if not (
-            _ensure_private_dir(self._spool_root / _QUARANTINE)
-            and _ensure_private_dir(quarantine_day)
-        ):
+        chain = self._open_quarantine_chain(day)
+        if chain is None:
             return "unreachable"
+        target_fd, identities = chain
         source_dir_fd: int | None = None
         source_fd: int | None = None
-        target_fd: int | None = None
         outcome: str | None = "io"
         try:
             source_dir_fd = os.open(self._spool_root / _PENDING / day, _dir_flags())
@@ -978,8 +1047,9 @@ class _Scan:
                 return "changed"  # the bytes are not the classified bytes
             if FileSnapshot.from_stat(os.fstat(source_fd)) != snapshot:
                 return "changed"  # mutated during the read (ctime/mtime backstop)
-            target_fd = os.open(quarantine_day, _dir_flags())
-            placed = False
+            if not self._quarantine_binding_holds(day, identities):
+                return "changed"  # the quarantine namespace was displaced after validation
+            placed_snapshot: FileSnapshot | None = None
             for attempt in range(_MAX_MOVE_ATTEMPTS):
                 candidate = name if attempt == 0 else f"{attempt}.{name}"
                 if candidate == _QUARANTINE_STAGE:
@@ -990,12 +1060,14 @@ class _Scan:
                     continue
                 published = self._publish_copy(target_fd, candidate, content)
                 if published == "placed":
-                    placed = True
+                    placed_snapshot = self._certify_target(target_fd, candidate, digest)
+                    if placed_snapshot is None:
+                        return "uncertain"  # the fresh copy could not be certified in place
                     break
                 if published == "exists":
-                    verdict = self._adopt_existing(target_fd, candidate, digest)
+                    verdict, adopted_snapshot = self._adopt_existing(target_fd, candidate, digest)
                     if verdict == "adopted":
-                        placed = True  # our own earlier interrupted move: adopt, don't alias
+                        placed_snapshot = adopted_snapshot  # an earlier interrupted move: ours
                         break
                     if verdict in ("different", "absent"):
                         continue  # a foreign occupant: advance the bounded counter
@@ -1004,19 +1076,24 @@ class _Scan:
                     # ambiguity honestly — the next scan converges once it can be examined
                     return "uncertain"
                 # published == "failed": VERIFY whether the durable name appeared anyway —
-                # the re-review showed a clean blocked code masking an unproven two-name state
-                verdict = self._adopt_existing(target_fd, candidate, digest)
+                # the round-2 review showed a clean blocked code masking an unproven state
+                verdict, adopted_snapshot = self._adopt_existing(target_fd, candidate, digest)
                 if verdict == "adopted":
-                    placed = True  # the copy landed and is now proven durable
+                    placed_snapshot = adopted_snapshot  # the copy landed and is proven durable
                     break
                 if verdict in ("different", "absent"):
                     return "io"  # verified: no classified copy exists; the source is untouched
                 return "uncertain"  # a copy may exist but could not be proven or disproven
-            if not placed:
+            if placed_snapshot is None:
                 return "collision"
             # the classified bytes are durably named in quarantine; from here failures are
             # commit-uncertain, never silently misreported as "still pending"
             outcome = "uncertain"
+            if not self._quarantine_binding_holds(day, identities):
+                return "uncertain"  # the namespace moved AFTER publication: never unlink
+            certified = self._certify_target(target_fd, candidate, digest)
+            if certified is None or certified != placed_snapshot:
+                return "uncertain"  # the certified copy is no longer provably in place
             try:
                 current = os.stat(name, dir_fd=source_dir_fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -1038,6 +1115,37 @@ class _Scan:
                         os.close(descriptor)
                     except OSError:  # pragma: no cover - defensive close failure
                         pass
+
+    def _certify_target(self, target_fd: int, candidate: str, digest: str) -> FileSnapshot | None:
+        """Prove the candidate is a stable, enveloped copy of the classified bytes right now."""
+
+        descriptor: int | None = None
+        certified: FileSnapshot | None = None
+        try:
+            descriptor = os.open(candidate, _leaf_probe_flags(), dir_fd=target_fd)
+            info = os.fstat(descriptor)
+            acl_unsafe = False
+            try:
+                require_no_extended_acl(descriptor)
+            except SecureFileError:
+                acl_unsafe = True
+            if not acl_unsafe and _permitted_quarantine_shape(info):
+                existing = _read_descriptor(descriptor, info.st_size)
+                if (
+                    existing is not None
+                    and hashlib.sha256(existing).hexdigest() == digest
+                    and FileSnapshot.from_stat(os.fstat(descriptor)) == FileSnapshot.from_stat(info)
+                ):
+                    certified = FileSnapshot.from_stat(info)
+        except OSError:
+            certified = None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:  # pragma: no cover - defensive close failure
+                    certified = None
+        return certified
 
     def _publish_copy(self, target_fd: int, candidate: str, content: bytes) -> str:
         """Stage and no-replace-publish one quarantine copy beneath the held day descriptor.
@@ -1103,39 +1211,64 @@ class _Scan:
                 except OSError:  # pragma: no cover - debris cleanup is best-effort
                     pass
 
-    def _adopt_existing(self, target_fd: int, candidate: str, digest: str) -> str:
-        """Examine an existing candidate: adopt it only if it IS the classified bytes, durably.
+    def _adopt_existing(
+        self, target_fd: int, candidate: str, digest: str
+    ) -> tuple[str, FileSnapshot | None]:
+        """Examine an existing candidate: adopt it only as a stable, ENVELOPED classified copy.
 
-        Returns ``"adopted"`` (the exact classified digest, re-fsynced file and directory),
-        ``"different"`` (some other content — never replaced, never adopted), ``"absent"``, or
-        ``"unknown"`` (could not be examined or made durable — the caller must not claim a
-        clean outcome).
+        The round-3 review pre-placed a same-digest foreign HARD LINK at the candidate name: a
+        digest match alone certified a copy that stayed mutable through its outside alias while
+        the source was deleted. Adoption therefore requires the full subject envelope — owned,
+        exact-0600, single-link, ACL-free regular file within the size bound — plus a stable
+        before/after ``FileSnapshot`` around the digest read; a foreign, multi-link, loose, or
+        mutating occupant is ``"different"`` (a collision that advances the counter), never an
+        interrupted move. Returns ``("adopted", snapshot)`` with the copy re-fsynced (file and
+        directory) and its exact certified identity, ``("different", None)``,
+        ``("absent", None)``, or ``("unknown", None)`` (could not be examined or made durable —
+        the caller must not claim a clean outcome).
         """
 
         descriptor: int | None = None
         verdict = "unknown"
+        snapshot: FileSnapshot | None = None
         try:
             try:
                 descriptor = os.open(candidate, _leaf_probe_flags(), dir_fd=target_fd)
             except FileNotFoundError:
-                return "absent"
+                return ("absent", None)
             except OSError as error:
                 if error.errno == errno.ELOOP:
-                    return "different"  # a symlink is never our copy — and is never followed
+                    return ("different", None)  # a symlink is never our copy — never followed
                 raise
             info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SEGMENT_FILE_BYTES:
-                return "different"
+            acl_unsafe = False
+            try:
+                require_no_extended_acl(descriptor)
+            except SecureFileError:
+                acl_unsafe = True
+            if (
+                acl_unsafe
+                or not _permitted_quarantine_shape(info)
+                or info.st_size > MAX_SEGMENT_FILE_BYTES
+            ):
+                return ("different", None)  # outside the envelope: never ours, never adopted
+            before = FileSnapshot.from_stat(info)
             existing = _read_descriptor(descriptor, info.st_size)
             if existing is None:
-                return "unknown"
+                return ("unknown", None)
             if hashlib.sha256(existing).hexdigest() != digest:
-                return "different"
+                return ("different", None)
+            if FileSnapshot.from_stat(os.fstat(descriptor)) != before:
+                return ("unknown", None)  # mutated during adoption: never certified
             os.fsync(descriptor)
             os.fsync(target_fd)
-            return "adopted"
+            if FileSnapshot.from_stat(os.fstat(descriptor)) != before:
+                return ("unknown", None)  # mutated while being made durable
+            verdict = "adopted"
+            snapshot = before
+            return (verdict, snapshot)
         except OSError:
-            return verdict
+            return (verdict, None)
         finally:
             if descriptor is not None:
                 try:
