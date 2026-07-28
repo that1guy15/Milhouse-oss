@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Record owner-approved amendment A06, making the installation-account filesystem-containment
+  trust boundary explicit while retaining traversal, symlink, other-user, cooperating-process, and
+  namespace-drift defenses and tests.
 - Approve the authoritative Milhouse OSS 1.0 implementation plan and W00-W18 gate model.
 - Establish the public/private source boundary, file-level donor provenance, and pre-alpha status.
 - Ratify locked architecture and engineering-process decisions through ADRs 0001-0015.

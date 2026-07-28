@@ -7,7 +7,10 @@
 1. No classified raw value reaches persistence or egress.
 2. No acknowledged unexpired record is lost in tested crash/outage scenarios.
 3. Untrusted telemetry cannot become code, SQL, a command, URL fetch, filesystem target, or agent instruction.
-4. Milhouse cannot write outside approved state roots or configured `.milhouse/` directories.
+4. Milhouse cannot write outside approved state roots or configured `.milhouse/` directories
+   through untrusted input, path traversal, symlinks, other local users, or cooperating Milhouse
+   processes. The operating-system account running Milhouse and the host administrator are trusted
+   for filesystem containment.
 5. External listeners, storage, notifications, issues, services, plugins, and MCP writes require explicit enablement.
 6. Private donor material and supply-chain compromise cannot enter release artifacts unnoticed.
 
@@ -59,6 +62,11 @@ Every asset has an accountable owner, classification, location/egress rule, and 
 - An exact metadata match is an authorization precondition, not a signature, provenance guarantee,
   sandbox, or safety verdict; operators remain responsible for what they install and allowlist.
 - Local administrators and compromised user accounts can read local data/keys unless host controls prevent it.
+- POSIX cannot atomically bind an ancestor-pathname proof to a later descriptor-relative mutation.
+  A hostile process already running as the Milhouse operating-system account can therefore displace
+  a write or unlink in the adjacent syscall window. Hostile same-UID interference is a documented
+  residual, not a defended threat; operators should use a dedicated service account and run no
+  untrusted code under that identity.
 - Pattern redaction cannot safely preserve arbitrary free text; allowlists and restricted fail-closed handling remain necessary.
 - Filesystem unlink is not guaranteed forensic erasure on modern media.
 - Hosted providers and notifications have their own retention/security behavior after explicitly allowed egress.
