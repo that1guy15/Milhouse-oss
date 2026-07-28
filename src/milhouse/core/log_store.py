@@ -60,6 +60,7 @@ import hashlib
 import json
 import os
 import stat
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -166,6 +167,35 @@ def _open_logs_dir(logs_dir: Path) -> int:
     return descriptor
 
 
+def _require_live_directory(directory_fd: int, logs_dir: Path, code: str) -> None:
+    """Require the configured logs path to still name the held directory descriptor.
+
+    A directory swap after open would otherwise silently redirect every descriptor-relative
+    write outside ``[paths].logs`` while the API reports success — the held descriptor follows
+    the renamed directory. Every mutation and maintenance operation re-proves the live binding
+    under the log lock before touching anything (POSIX offers no bind-and-operate, so the
+    one-syscall residual window is closed to cooperating processes by that lock).
+    """
+
+    bound = False
+    probe: int | None = None
+    try:
+        probe = os.open(logs_dir, os.O_RDONLY | _NOFOLLOW | _DIRECTORY | _CLOEXEC)
+        held = os.fstat(directory_fd)
+        live = os.fstat(probe)
+        bound = (held.st_dev, held.st_ino) == (live.st_dev, live.st_ino)
+    except OSError:
+        bound = False
+    finally:
+        if probe is not None:
+            try:
+                os.close(probe)
+            except OSError:  # pragma: no cover - defensive close failure
+                bound = False
+    if not bound:
+        _fail(code, "the configured logs directory no longer names the held descriptor")
+
+
 def _open_regular_at(directory_fd: int, name: str, *, flags: int) -> int:
     """Open a name beneath the held directory descriptor, no-follow and close-on-exec."""
 
@@ -223,13 +253,20 @@ def _examine_active_envelope(descriptor: int) -> os.stat_result:
 
 
 class _LogLock:
-    """The ``structured-log.lock`` flock, waited on injected monotonic time (five seconds)."""
+    """The ``structured-log.lock`` flock: five seconds on injected monotonic time, polled with
+    an injected sleeper so contention never busy-spins a core."""
 
-    __slots__ = ("_directory_fd", "_monotonic")
+    __slots__ = ("_directory_fd", "_monotonic", "_sleeper")
 
-    def __init__(self, directory_fd: int, monotonic: Callable[[], float]) -> None:
+    def __init__(
+        self,
+        directory_fd: int,
+        monotonic: Callable[[], float],
+        sleeper: Callable[[float], None],
+    ) -> None:
         self._directory_fd = directory_fd
         self._monotonic = monotonic
+        self._sleeper = sleeper
 
     def acquire(self) -> int:
         failed = False
@@ -249,6 +286,7 @@ class _LogLock:
                     if self._monotonic() >= deadline:
                         timed_out = True
                         break
+                    self._sleeper(_LOCK_POLL_SECONDS)
         except LoggingError:
             # _require_private_file is the only LoggingError source, so the descriptor is open
             assert descriptor is not None
@@ -494,6 +532,7 @@ class StructuredLogStore:
         retention_days: int,
         monotonic: Callable[[], float],
         opened_at: datetime,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         _require_platform()
         if type(retention_days) is not int or not 1 <= retention_days <= 3_650:
@@ -502,7 +541,7 @@ class StructuredLogStore:
         self._retention_days = retention_days
         self._closed = False
         self._directory_fd = _open_logs_dir(self._logs_dir)
-        self._lock = _LogLock(self._directory_fd, monotonic)
+        self._lock = _LogLock(self._directory_fd, monotonic, sleeper)
         lock_fd = self._lock.acquire()
         try:
             self._open_active(opened_at)
@@ -633,17 +672,20 @@ class StructuredLogStore:
             descriptor = _open_regular_at(
                 self._directory_fd, _STAGING_NAME, flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL
             )
-            os.write(descriptor, header_line)
+            if os.write(descriptor, header_line) != len(header_line):
+                # a short header write must never be published as a successful segment
+                failed = True
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = None
-            os.rename(
-                _STAGING_NAME,
-                _CURRENT_NAME,
-                src_dir_fd=self._directory_fd,
-                dst_dir_fd=self._directory_fd,
-            )
-            os.fsync(self._directory_fd)
+            if not failed:
+                os.rename(
+                    _STAGING_NAME,
+                    _CURRENT_NAME,
+                    src_dir_fd=self._directory_fd,
+                    dst_dir_fd=self._directory_fd,
+                )
+                os.fsync(self._directory_fd)
         except OSError:
             failed = True
         finally:
@@ -702,6 +744,7 @@ class StructuredLogStore:
         never corrupted.
         """
 
+        _require_live_directory(self._directory_fd, self._logs_dir, "MH_LOG_CONFLICT")
         conflicted = False
         try:
             cached = os.fstat(self._descriptor)
@@ -805,6 +848,10 @@ class StructuredLogStore:
                     src_dir_fd=self._directory_fd,
                     dst_dir_fd=self._directory_fd,
                 )
+                # the rotated name is durable BEFORE current is removed, so no crash point
+                # loses the only filesystem name for the closed segment (the recovery helper
+                # already used this order; the live path now matches it)
+                os.fsync(self._directory_fd)
                 os.unlink(_CURRENT_NAME, dir_fd=self._directory_fd)
                 os.fsync(self._directory_fd)
         except OSError:
@@ -896,6 +943,7 @@ def recover_structured_logs(
     logs_dir: str | Path,
     hold: ExclusiveHold,
     monotonic: Callable[[], float],
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> LogRecoveryReport:
     """Repair crash artifacts under exclusive maintenance authority.
 
@@ -917,9 +965,10 @@ def recover_structured_logs(
     resolved = _resolve_logs_dir(logs_dir)
     _validate_hold(hold, resolved)
     directory_fd = _open_logs_dir(resolved)
-    lock = _LogLock(directory_fd, monotonic)
+    lock = _LogLock(directory_fd, monotonic, sleeper)
     lock_fd = lock.acquire()
     try:
+        _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
         truncated, completed = _repair_active(directory_fd)
         removed = _remove_staging(directory_fd)
         return LogRecoveryReport(
@@ -1144,6 +1193,7 @@ def retention_preview(
     monotonic: Callable[[], float],
     retention_days: int,
     now: datetime,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> RetentionReport:
     """List closed rotations with their effective deadlines; mutates nothing.
 
@@ -1157,10 +1207,12 @@ def retention_preview(
     resolved = _resolve_logs_dir(logs_dir)
     _validate_hold(hold, resolved)
     directory_fd = _open_logs_dir(resolved)
-    lock = _LogLock(directory_fd, monotonic)
+    lock = _LogLock(directory_fd, monotonic, sleeper)
     lock_fd = lock.acquire()
     try:
-        return _preview_locked(directory_fd, retention_days, now)
+        _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+        report, _validated = _preview_locked(directory_fd, retention_days, now)
+        return report
     finally:
         lock.release(lock_fd)
         try:
@@ -1169,23 +1221,30 @@ def retention_preview(
             pass
 
 
-def _preview_locked(directory_fd: int, retention_days: int, now: datetime) -> RetentionReport:
+def _preview_locked(
+    directory_fd: int, retention_days: int, now: datetime
+) -> tuple[RetentionReport, dict[int, tuple[int, int, int, int, int]]]:
     if type(retention_days) is not int or not 1 <= retention_days <= 3_650:
         _fail("MH_LOG_RETENTION", "a bounded positive retention is required")
     rotated = _list_rotated(directory_fd)
     segments: list[RetainedSegment] = []
     refused: list[RefusedSegment] = []
+    validated: dict[int, tuple[int, int, int, int, int]] = {}
     for sequence in sorted(rotated):
         code: str | None = None
         header: StructuredLogHeaderV1 | None = None
         trailer: StructuredLogTrailerV1 | None = None
+        identity: tuple[int, int, int, int, int] | None = None
         try:
-            header, trailer = _read_closed_segment(directory_fd, rotated[sequence], sequence)
+            header, trailer, identity = _read_closed_segment(
+                directory_fd, rotated[sequence], sequence
+            )
         except LoggingError as error:
             code = error.code  # a fixed MH_LOG_* code, value-safe by construction
-        if code is not None or header is None or trailer is None:
+        if code is not None or header is None or trailer is None or identity is None:
             refused.append(RefusedSegment(sequence=sequence, code=code or "MH_LOG_RETENTION"))
             continue
+        validated[sequence] = identity
         policy_deadline = header.opened_at + timedelta(days=retention_days)
         effective = min(trailer.expires_at, policy_deadline)
         segments.append(
@@ -1196,19 +1255,27 @@ def _preview_locked(directory_fd: int, retention_days: int, now: datetime) -> Re
                 expired=effective <= now,
             )
         )
-    return RetentionReport(segments=tuple(segments), refused=tuple(refused))
+    return RetentionReport(segments=tuple(segments), refused=tuple(refused)), validated
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    """The identity retention carries from validation to unlink: device, inode, size, times."""
+
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def _read_closed_segment(
     directory_fd: int, name: str, sequence: int
-) -> tuple[StructuredLogHeaderV1, StructuredLogTrailerV1]:
+) -> tuple[StructuredLogHeaderV1, StructuredLogTrailerV1, tuple[int, int, int, int, int]]:
     failed = False
     descriptor: int | None = None
     content = b""
+    identity: tuple[int, int, int, int, int] | None = None
     try:
         descriptor = _open_regular_at(directory_fd, name, flags=os.O_RDONLY)
         _require_private_file(descriptor)
         content = _read_bounded(descriptor, MAX_SEGMENT_BYTES, "MH_LOG_RETENTION")
+        identity = _file_identity(os.fstat(descriptor))
     except LoggingError:
         raise
     except OSError:
@@ -1219,7 +1286,7 @@ def _read_closed_segment(
                 os.close(descriptor)
             except OSError:  # pragma: no cover - defensive close failure
                 failed = True
-    if failed or not content.endswith(_LF):
+    if failed or identity is None or not content.endswith(_LF):
         _fail("MH_LOG_RETENTION", "a closed segment could not be read")
     parts = content.split(_LF)[:-1]
     if len(parts) < 2 or any(part == b"" for part in parts):
@@ -1228,7 +1295,7 @@ def _read_closed_segment(
     trailer = _parse_trailer_line(parts[-1] + _LF, header, [part + _LF for part in parts[1:-1]])
     if header.sequence != sequence or trailer.sequence != sequence:
         _fail("MH_LOG_RETENTION", "a closed segment's sequence disagrees with its name")
-    return header, trailer
+    return header, trailer, identity
 
 
 def _parse_trailer_line(
@@ -1276,6 +1343,20 @@ def _parse_trailer_line(
         _fail("MH_LOG_RETENTION", "the trailer line is not canonical")
     if trailer.event_count != len(event_lines) or trailer.content_sha256 != digest.hexdigest():
         _fail("MH_LOG_RETENTION", "the trailer disagrees with the segment bytes")
+    # A05 fixes the captured deadline as EXACTLY opened_at + retention_days: the trailer is
+    # outside content_sha256, so a one-field corruption could otherwise shorten the deadline
+    # and erase valid history early — the deadline must re-derive from the header, bounded
+    deadline_invalid = False
+    expected_deadline: datetime | None = None
+    try:
+        expected_deadline = header.opened_at + timedelta(days=header.retention_days)
+        format_timestamp(expected_deadline)
+    except (OverflowError, TimeError):
+        deadline_invalid = True
+    if deadline_invalid or expected_deadline is None:
+        _fail("MH_LOG_RETENTION", "the captured deadline is out of range")
+    if trailer.expires_at != expected_deadline:
+        _fail("MH_LOG_RETENTION", "the trailer deadline disagrees with the header")
     return trailer
 
 
@@ -1286,6 +1367,7 @@ def retention_apply(
     monotonic: Callable[[], float],
     retention_days: int,
     now: datetime,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> RetentionReport:
     """Delete expired, fully validated closed rotations; return exactly what was removed.
 
@@ -1300,14 +1382,26 @@ def retention_apply(
     resolved = _resolve_logs_dir(logs_dir)
     _validate_hold(hold, resolved)
     directory_fd = _open_logs_dir(resolved)
-    lock = _LogLock(directory_fd, monotonic)
+    lock = _LogLock(directory_fd, monotonic, sleeper)
     lock_fd = lock.acquire()
     try:
-        preview = _preview_locked(directory_fd, retention_days, now)
-        expired = [segment for segment in preview.segments if segment.expired]
-        for segment in expired:
-            _unlink_rotated(directory_fd, _rotated_name(segment.sequence))
-        return RetentionReport(segments=tuple(expired), refused=preview.refused)
+        _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+        preview, validated = _preview_locked(directory_fd, retention_days, now)
+        removed: list[RetainedSegment] = []
+        refused = list(preview.refused)
+        for segment in preview.segments:
+            if not segment.expired:
+                continue
+            if _unlink_verified(
+                directory_fd, _rotated_name(segment.sequence), validated[segment.sequence]
+            ):
+                removed.append(segment)
+            else:
+                # the name no longer resolves to the exact object whose expiry was proven: the
+                # replacement is left byte-for-byte intact and the sequence is NOT claimed
+                # removed — reported refused instead
+                refused.append(RefusedSegment(sequence=segment.sequence, code="MH_LOG_RETENTION"))
+        return RetentionReport(segments=tuple(removed), refused=tuple(refused))
     finally:
         lock.release(lock_fd)
         try:
@@ -1316,7 +1410,35 @@ def retention_apply(
             pass
 
 
-def _unlink_rotated(directory_fd: int, name: str) -> None:
+def _unlink_verified(
+    directory_fd: int, name: str, identity: tuple[int, int, int, int, int]
+) -> bool:
+    """Delete one expired rotation ONLY if the name still resolves to the validated object.
+
+    The name is re-opened no-follow and its full identity (device, inode, size, mtime, ctime)
+    plus the private-file envelope compared against what validation certified; any drift —
+    replacement, rewrite, extra link, mode or ACL change — returns False and the occupant is
+    left untouched (POSIX offers no compare-and-unlink, so the one-syscall window that remains
+    is closed to cooperating processes by the log lock held across preview and apply). A
+    verified unlink that then fails raises the fixed retention code.
+    """
+
+    descriptor: int | None = None
+    verified = False
+    try:
+        descriptor = _open_regular_at(directory_fd, name, flags=os.O_RDONLY)
+        _require_private_file(descriptor)
+        verified = _file_identity(os.fstat(descriptor)) == identity
+    except (LoggingError, OSError):
+        verified = False
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover - defensive close failure
+                verified = False
+    if not verified:
+        return False
     failed = False
     try:
         os.unlink(name, dir_fd=directory_fd)
@@ -1325,6 +1447,7 @@ def _unlink_rotated(directory_fd: int, name: str) -> None:
         failed = True
     if failed:
         _fail("MH_LOG_RETENTION", "an expired segment could not be removed")
+    return True
 
 
 __all__ = [
