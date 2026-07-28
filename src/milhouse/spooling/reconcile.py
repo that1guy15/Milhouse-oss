@@ -96,7 +96,7 @@ from milhouse.spooling.segment import (
     FRAME_VERSION,
     SCHEMA_VERSION,
 )
-from milhouse.state.barrier import ExclusiveHold, GlobalCommitBarrier
+from milhouse.state.barrier import GlobalCommitBarrier
 from milhouse.state.database import ControlDatabase
 from milhouse.state.errors import StateError
 
@@ -513,10 +513,10 @@ def _require_bound_state_root(
 
     A barrier from a different state root is not authority for this database/spool pair, so the
     binding is validated here (the wrapper) as well as at the public constructors, and the scan
-    additionally re-validates the live token's own barrier identity against the database.
+    additionally binds the concrete barrier object to the database before any lock acquisition.
     """
 
-    if not isinstance(barrier, GlobalCommitBarrier):
+    if type(barrier) is not GlobalCommitBarrier:
         _fail("MH_SPOOL_STORE", "a commit barrier is required")
     database_path = getattr(database, "path", None)
     if database_path is None:
@@ -524,7 +524,7 @@ def _require_bound_state_root(
     control_dir = lexical_absolute_path(database_path).parent
     state_root = control_dir.parent
     resolved_spool = lexical_absolute_path(spool_root)
-    if lexical_absolute_path(barrier.path) != control_dir / _BARRIER_NAME:
+    if object.__getattribute__(barrier, "_path") != control_dir / _BARRIER_NAME:
         _fail("MH_SPOOL_STORE", "the barrier must be the control-plane commit lock")
     if resolved_spool != state_root / _SPOOL:
         _fail("MH_SPOOL_STORE", "the spool root must be <state_root>/spool")
@@ -545,36 +545,19 @@ def _reconcile_under_barrier(
     action: Callable[[], None] | None = None,
     observe: Callable[[ReconciliationReport], None] | None = None,
 ) -> ReconciliationReport:
-    """The only reconciliation entrypoint: acquires the exclusive barrier itself, then scans.
+    """The only reconciliation entrypoint: the scan owns its exact exclusive barrier context.
 
-    There is no standalone callable that executes the scan without owning barrier authority: this
-    wrapper first validates that database, barrier, and spool root share one canonical state root,
-    then acquires the exclusive side and passes the live :class:`ExclusiveHold` token to
-    :meth:`_Scan.run`, which re-validates the token's barrier identity against the database before
-    its first ledger read — so even a direct internal call of the scan, or a live token issued by a
-    different state root's barrier, fails closed before any mutation. ``action`` (the commit path's
-    publish+ledger callback) runs inside the same hold when the scan is complete, preserving the
-    no-gap reconcile-to-commit handoff; ``observe`` receives the report inside the hold before the
-    action runs, so a caller records it even when the action then fails.
+    This wrapper first validates that database, barrier, and spool root share one canonical state
+    root. :meth:`_Scan.run` then acquires and retains that concrete barrier across classification,
+    mutation, observation, and the optional commit action. There is no caller-mintable authority
+    token and no unlock gap between recovery and commit. ``observe`` receives the report inside the
+    hold before ``action`` runs, so a caller records it even when the action then fails.
     """
 
     spool_root = _require_bound_state_root(database, barrier, spool_root, installation_id)
-    report: ReconciliationReport | None = None
-    barrier_failed = False
-    try:
-        with barrier.exclusive() as hold:
-            report = _Scan(database, lexical_absolute_path(spool_root), installation_id).run(hold)
-            if observe is not None:
-                observe(report)
-            if action is not None and report.complete:
-                action()
-    except StateError:
-        # The scan and ledger paths remap their own StateErrors; this only catches a
-        # barrier-acquisition failure so callers never surface a non-MH_SPOOL_* error.
-        barrier_failed = True
-    if barrier_failed or report is None:
-        _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
-    return report
+    return _Scan(database, lexical_absolute_path(spool_root), installation_id).run(
+        barrier, action=action, observe=observe
+    )
 
 
 class _Scan:
@@ -612,12 +595,18 @@ class _Scan:
         self._stopped = False
         self._complete = True
 
-    def run(self, authority: ExclusiveHold) -> ReconciliationReport:
-        # Validated BEFORE the first ledger read: a direct call without a live exclusive hold of
-        # THIS control plane's own commit lock fails closed with no mutation. A live token from any
-        # other barrier is not authority for this database/spool pair — "some barrier is held" is
-        # exactly the bypass the gate review reproduced. Underscore convention is not enforcement;
-        # this identity comparison is.
+    def run(
+        self,
+        barrier: GlobalCommitBarrier,
+        *,
+        action: Callable[[], None] | None = None,
+        observe: Callable[[ReconciliationReport], None] | None = None,
+    ) -> ReconciliationReport:
+        """Acquire the bound barrier and retain it through scan, observation, and action."""
+
+        # Validate the concrete barrier BEFORE the first ledger read. The scan acquires the lock
+        # itself, so a direct call cannot substitute a forged token or rely on a caller's claim that
+        # some lock is held.
         database_path = getattr(self._database, "path", None)
         expected_lock = (
             lexical_absolute_path(database_path).parent / _BARRIER_NAME
@@ -625,125 +614,155 @@ class _Scan:
             else None
         )
         if (
-            not isinstance(authority, ExclusiveHold)
-            or not authority.active
+            type(barrier) is not GlobalCommitBarrier
             or expected_lock is None
-            or lexical_absolute_path(authority.barrier_path) != expected_lock
+            or object.__getattribute__(barrier, "_path") != expected_lock
         ):
             _fail(
                 "MH_SPOOL_BARRIER",
-                "reconciliation requires a live exclusive hold of this control plane's barrier",
+                "reconciliation requires this control plane's exclusive commit barrier",
             )
-        ledger, malformed = self._ledger_index()
-        for batch_id in sorted(malformed):
-            # the batch id came from a row that failed validation, so it may not be well formed
-            self._anomaly(_safe_id(batch_id), "", "corrupt_ledger", "unreadable_row")
+        report: ReconciliationReport | None = None
+        barrier_failed = False
+        barrier_acquired = False
+        try:
+            with barrier.exclusive():
+                barrier_acquired = True
+                ledger, malformed = self._ledger_index()
+                for batch_id in sorted(malformed):
+                    # The batch id came from a row that failed validation, so it may not be well
+                    # formed.
+                    self._anomaly(_safe_id(batch_id), "", "corrupt_ledger", "unreadable_row")
 
-        candidates = self._inventory()
-        counts = Counter(batch_id for _day, batch_id, _path, _identity in candidates)
-        seen: set[str] = set()
-        conflicted: dict[str, list[tuple[str, Path, FileIdentity]]] = {}
-        if self._complete:
-            for day, batch_id, path, day_identity in candidates:
+                candidates = self._inventory()
+                counts = Counter(batch_id for _day, batch_id, _path, _identity in candidates)
+                seen: set[str] = set()
+                conflicted: dict[str, list[tuple[str, Path, FileIdentity]]] = {}
+                if self._complete:
+                    for day, batch_id, path, day_identity in candidates:
+                        if self._capped():
+                            break  # the anomaly cap fired: the rest of the pass is unproven
+                        seen.add(batch_id)
+                        if counts[batch_id] > 1:
+                            self._anomaly(batch_id, day, "conflict", "duplicate_batch_id")
+                            conflicted.setdefault(batch_id, []).append((day, path, day_identity))
+                        elif batch_id in malformed:
+                            continue  # the malformed-row anomaly already covers this batch
+                        elif batch_id in ledger:
+                            self._verify_committed(
+                                path, day, batch_id, ledger[batch_id], day_identity
+                            )
+                        else:
+                            self._reconcile_orphan(path, day, batch_id, day_identity)
+
+                # Conflict content comparison is classification (bounded raw reads, no parsing).
+                # Every copy of a conflicted batch is staged for quarantine EXCEPT one that agrees
+                # with an existing healthy ledger row: the ledger already unambiguously designates
+                # that copy, so keeping it is not directory order choosing a history — and
+                # quarantining it would demote an acknowledged committed segment to a dangling
+                # ledger row (the review's reproduction via an ordinary same-batch retry).
+                # Differing contents mark the plan's high-severity divergent conflict.
+                if self._complete and not self._capped():
+                    for batch_id, copies in sorted(conflicted.items()):
+                        if self._capped():
+                            break
+                        keeper: tuple[str, Path, FileIdentity] | None = None
+                        record = ledger.get(batch_id)
+                        if record is not None:
+                            for day, path, day_identity in copies:
+                                if day != record.day:
+                                    # Only the ledger's own day can agree (day is compared).
+                                    continue
+                                parsed, code = self._trusted_read(path, day_identity)
+                                if code is None and _agrees(parsed, day, batch_id, record):
+                                    keeper = (day, path, day_identity)
+                                    self._healthy += 1
+                                break
+                        detail = self._conflict_detail(copies)
+                        for day, path, day_identity in copies:
+                            if keeper is not None and (day, path, day_identity) == keeper:
+                                continue
+                            self._queue_quarantine(day, path.name, day_identity, batch_id, detail)
+
+                # Missing-ledger-file classification is classification, so it runs BEFORE any
+                # mutation.
+                if self._complete:
+                    for batch_id, record in ledger.items():
+                        if self._capped():
+                            # The cap fired (possibly during the candidate phase): stop classifying.
+                            break
+                        if batch_id not in seen:
+                            self._anomaly(batch_id, record.day, "missing_file", "absent")
+
+                # After every phase and again immediately before mutation: a fired anomaly cap
+                # voids the pass even when it fired on the FINAL classified item (the re-review's
+                # reproduction, where a top-of-loop check alone never runs again).
                 if self._capped():
-                    break  # the anomaly cap fired: the rest of the pass is unproven
-                seen.add(batch_id)
-                if counts[batch_id] > 1:
-                    self._anomaly(batch_id, day, "conflict", "duplicate_batch_id")
-                    conflicted.setdefault(batch_id, []).append((day, path, day_identity))
-                elif batch_id in malformed:
-                    continue  # the malformed-row anomaly already covers this batch
-                elif batch_id in ledger:
-                    self._verify_committed(path, day, batch_id, ledger[batch_id], day_identity)
+                    self._complete = False
+                if self._complete:
+                    # Mutation happens only after complete, within-bounds classification proved
+                    # every candidate batch id globally unique and the anomaly budget was never
+                    # exhausted.
+                    for parsed, batch_id, day in self._pending_registrations:
+                        self._register(parsed, batch_id, day)
+                        self._registered.append(OrphanRegistration(batch_id, day))
+                    for (
+                        day,
+                        name,
+                        day_identity,
+                        snapshot,
+                        digest,
+                        batch_id,
+                        detail,
+                    ) in self._pending_quarantines:
+                        outcome = self._move_to_quarantine(
+                            day, name, day_identity, snapshot, digest
+                        )
+                        if outcome is None:
+                            self._quarantined.append(QuarantinedFile(batch_id, day, detail))
+                        elif outcome == "uncertain":
+                            # The target is durably named but the source state could not be
+                            # confirmed: reported distinctly, never as completed; the public source
+                            # may remain or be recoverably retired in pending, and the next scan
+                            # converges through the live certified copy or a fresh live copy.
+                            self._move_failures.append(
+                                SegmentAnomaly(batch_id, day, "quarantine_uncertain", "io")
+                            )
+                        else:
+                            # A quarantine that cannot complete never aborts recovery or a commit:
+                            # the file stays in pending, is re-reported every scan, and authority is
+                            # unaffected — the review showed one un-quarantinable file must not
+                            # wedge all commits.
+                            self._move_failures.append(
+                                SegmentAnomaly(batch_id, day, "quarantine_blocked", outcome)
+                            )
                 else:
-                    self._reconcile_orphan(path, day, batch_id, day_identity)
+                    self._pending_registrations.clear()
+                    self._pending_quarantines.clear()
 
-        # Conflict content comparison is classification (bounded raw reads, no parsing). Every
-        # copy of a conflicted batch is staged for quarantine EXCEPT one that agrees with an
-        # existing healthy ledger row: the ledger already unambiguously designates that copy, so
-        # keeping it is not directory order choosing a history — and quarantining it would demote
-        # an acknowledged committed segment to a dangling ledger row (the review's reproduction via
-        # an ordinary same-batch retry). Differing contents mark the plan's high-severity
-        # divergent conflict.
-        if self._complete and not self._capped():
-            for batch_id, copies in sorted(conflicted.items()):
-                if self._capped():
-                    break
-                keeper: tuple[str, Path, FileIdentity] | None = None
-                record = ledger.get(batch_id)
-                if record is not None:
-                    for day, path, day_identity in copies:
-                        if day != record.day:
-                            continue  # only the ledger's own day can agree (day is compared)
-                        parsed, code = self._trusted_read(path, day_identity)
-                        if code is None and _agrees(parsed, day, batch_id, record):
-                            keeper = (day, path, day_identity)
-                            self._healthy += 1
-                        break
-                detail = self._conflict_detail(copies)
-                for day, path, day_identity in copies:
-                    if keeper is not None and (day, path, day_identity) == keeper:
-                        continue
-                    self._queue_quarantine(day, path.name, day_identity, batch_id, detail)
-
-        # Missing-ledger-file classification is classification, so it runs BEFORE any mutation.
-        if self._complete:
-            for batch_id, record in ledger.items():
-                if self._capped():
-                    break  # the cap fired (possibly during the candidate phase): stop classifying
-                if batch_id not in seen:
-                    self._anomaly(batch_id, record.day, "missing_file", "absent")
-
-        # After every phase and again immediately before mutation: a fired anomaly cap voids the
-        # pass even when it fired on the FINAL classified item (the re-review's reproduction, where
-        # a top-of-loop check alone never runs again).
-        if self._capped():
-            self._complete = False
-        if self._complete:
-            # Mutation happens only after complete, within-bounds classification proved every
-            # candidate batch id globally unique and the anomaly budget was never exhausted.
-            for parsed, batch_id, day in self._pending_registrations:
-                self._register(parsed, batch_id, day)
-                self._registered.append(OrphanRegistration(batch_id, day))
-            for (
-                day,
-                name,
-                day_identity,
-                snapshot,
-                digest,
-                batch_id,
-                detail,
-            ) in self._pending_quarantines:
-                outcome = self._move_to_quarantine(day, name, day_identity, snapshot, digest)
-                if outcome is None:
-                    self._quarantined.append(QuarantinedFile(batch_id, day, detail))
-                elif outcome == "uncertain":
-                    # the target is durably named but the source state could not be confirmed:
-                    # reported distinctly, never as completed; the public source may remain or be
-                    # recoverably retired in pending, and the next scan converges through the live
-                    # certified copy or a fresh live copy
-                    self._move_failures.append(
-                        SegmentAnomaly(batch_id, day, "quarantine_uncertain", "io")
-                    )
-                else:
-                    # A quarantine that cannot complete never aborts recovery or a commit: the file
-                    # stays in pending, is re-reported every scan, and authority is unaffected —
-                    # the review showed one un-quarantinable file must not wedge all commits.
-                    self._move_failures.append(
-                        SegmentAnomaly(batch_id, day, "quarantine_blocked", outcome)
-                    )
-        else:
-            self._pending_registrations.clear()
-            self._pending_quarantines.clear()
-
-        return ReconciliationReport(
-            registered=tuple(self._registered),
-            quarantined=tuple(self._quarantined),
-            anomalies=tuple(self._anomalies) + tuple(self._move_failures),
-            healthy=self._healthy if self._complete else 0,
-            scanned=self._scanned,
-            complete=self._complete,
-        )
+                report = ReconciliationReport(
+                    registered=tuple(self._registered),
+                    quarantined=tuple(self._quarantined),
+                    anomalies=tuple(self._anomalies) + tuple(self._move_failures),
+                    healthy=self._healthy if self._complete else 0,
+                    scanned=self._scanned,
+                    complete=self._complete,
+                )
+                if observe is not None:
+                    observe(report)
+                if action is not None and report.complete:
+                    action()
+        except StateError:
+            if barrier_acquired:
+                # Scan/ledger paths normalize their own failures. Preserve a StateError raised by
+                # an observer or commit action instead of falsely reporting acquisition failure.
+                raise
+            # Normalize only failure to enter the barrier context; assign outside the handler so
+            # the public SpoolError has no leaked exception context.
+            barrier_failed = True
+        if barrier_failed or report is None:
+            _fail("MH_SPOOL_BARRIER", "the commit barrier could not be acquired")
+        return report
 
     def _anomaly(self, batch_id: str, day: str, kind: str, detail: str) -> None:
         if len(self._anomalies) < _MAX_ANOMALIES:

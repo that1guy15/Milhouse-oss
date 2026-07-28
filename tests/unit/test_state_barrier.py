@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from milhouse.config.filesystem import SecureFileError, SecureFileErrorKind
 from milhouse.state import GlobalCommitBarrier, StateError
+from milhouse.state import barrier as barrier_module
 
 _HOLD = r"""
 import sys, time
@@ -193,3 +195,104 @@ def test_a_loose_mode_lock_file_is_rejected(tmp_path: Path) -> None:
         with GlobalCommitBarrier(lock).shared(blocking=False):
             pass
     assert captured.value.code == "MH_STATE_BARRIER_UNSAFE"
+
+
+def test_a_concurrent_lock_creator_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = _lock_path(tmp_path)
+    real_create = barrier_module.create_regular_file_no_follow
+
+    def _win_race_then_report_existing(*args: object, **kwargs: object) -> None:
+        real_create(*args, **kwargs)  # type: ignore[arg-type]
+        raise SecureFileError(SecureFileErrorKind.ALREADY_EXISTS)
+
+    monkeypatch.setattr(
+        barrier_module, "create_regular_file_no_follow", _win_race_then_report_existing
+    )
+    with GlobalCommitBarrier(lock).exclusive(blocking=False):
+        pass
+
+
+def test_a_lock_creation_error_is_normalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _fail_create(*_args: object, **_kwargs: object) -> None:
+        raise SecureFileError(SecureFileErrorKind.PERMISSION_FAILED)
+
+    monkeypatch.setattr(barrier_module, "create_regular_file_no_follow", _fail_create)
+    with pytest.raises(StateError) as captured:
+        with GlobalCommitBarrier(_lock_path(tmp_path)).shared():
+            pass
+    assert captured.value.code == "MH_STATE_BARRIER"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_a_lock_still_missing_after_creation_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _still_missing(*_args: object, **_kwargs: object) -> None:
+        raise SecureFileError(SecureFileErrorKind.NOT_FOUND)
+
+    def _pretend_create(*_args: object, **_kwargs: object) -> None:
+        pass
+
+    monkeypatch.setattr(barrier_module, "open_regular_file_no_follow", _still_missing)
+    monkeypatch.setattr(barrier_module, "create_regular_file_no_follow", _pretend_create)
+    with pytest.raises(StateError) as captured:
+        with GlobalCommitBarrier(_lock_path(tmp_path)).exclusive():
+            pass
+    assert captured.value.code == "MH_STATE_BARRIER"
+
+
+@pytest.mark.parametrize("side", ["shared", "exclusive"])
+def test_a_gate_open_failure_closes_the_main_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, side: str
+) -> None:
+    lock = _lock_path(tmp_path)
+    barrier = GlobalCommitBarrier(lock)
+    real_open = barrier_module.open_regular_file_no_follow
+    main_descriptors: list[int] = []
+
+    def _fail_gate(path: Path, **kwargs: object):  # type: ignore[no-untyped-def]
+        if Path(path).name.endswith(".gate"):
+            raise SecureFileError(SecureFileErrorKind.PERMISSION_FAILED)
+        opened = real_open(path, **kwargs)  # type: ignore[arg-type]
+        main_descriptors.append(opened.descriptor)
+        return opened
+
+    monkeypatch.setattr(barrier_module, "open_regular_file_no_follow", _fail_gate)
+    with pytest.raises(StateError) as captured:
+        with getattr(barrier, side)():
+            pass
+    assert captured.value.code == "MH_STATE_BARRIER"
+    assert len(main_descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(main_descriptors[0])
+
+
+def test_a_shared_main_acquisition_failure_releases_the_held_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    barrier = GlobalCommitBarrier(_lock_path(tmp_path))
+    real_acquire = barrier_module._acquire
+    calls = 0
+
+    def _fail_second_acquire(descriptor: int, operation: int, *, blocking: bool) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise StateError("MH_STATE_BARRIER", "planted main-lock acquisition failure")
+        real_acquire(descriptor, operation, blocking=blocking)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(barrier_module, "_acquire", _fail_second_acquire)
+        with pytest.raises(StateError) as captured:
+            with barrier.shared():
+                pass
+        assert captured.value.code == "MH_STATE_BARRIER"
+
+    # A fresh exclusive acquisition proves the shared path released its already-held gate.
+    with barrier.exclusive(blocking=False):
+        pass

@@ -30,6 +30,7 @@ CRITICAL_COVERAGE_FILES = {
     "src/milhouse/privacy/redact.py",
     "src/milhouse/privacy/render.py",
     "src/milhouse/privacy/sanitize.py",
+    "src/milhouse/state/barrier.py",
     "src/milhouse/spooling/reconcile.py",
     "scripts/check_artifacts.py",
     "scripts/check_coverage.py",

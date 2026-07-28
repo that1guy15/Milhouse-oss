@@ -5,7 +5,6 @@ import hashlib
 import os
 import sqlite3
 import stat
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -551,20 +550,20 @@ def test_the_store_rejects_a_mismatched_barrier_or_spool_root(tmp_path: Path) ->
         database.close()
 
 
-def test_spool_directories_are_created_inside_the_barrier(tmp_path: Path) -> None:
+def test_spool_directories_are_created_inside_the_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     database, store, spool_root = _spool(tmp_path)
     pending = spool_root / "pending"
+    real_exclusive = GlobalCommitBarrier.exclusive
 
-    class _AssertingBarrier(GlobalCommitBarrier):
-        @contextlib.contextmanager
-        def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
-            assert not pending.exists()  # no namespace mutation before the barrier is held
-            with super().exclusive(blocking=blocking) as hold:
-                yield hold
+    @contextlib.contextmanager
+    def _asserting_exclusive(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        assert not pending.exists()  # no namespace mutation before the barrier is held
+        with real_exclusive(self, blocking=blocking):
+            yield
 
-    store._barrier = _AssertingBarrier(  # type: ignore[attr-defined]
-        tmp_path / "control" / "commit.lock"
-    )
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive", _asserting_exclusive)
     try:
         frames = _frames()
         store.commit_segment(_header(frames), frames, committed_at=_NOW)

@@ -202,9 +202,9 @@ class DurableSpool:
     def _reconcile_exclusively(self, action: Callable[[], None] | None) -> ReconciliationReport:
         """Run mandatory reconciliation and an optional commit action in one exclusive hold.
 
-        The barrier-owning wrapper in the reconcile module acquires the exclusive side itself and
-        passes its live authority token to the scan, so there is no unlock window between recovery
-        and the action and no call path that can scan without owning the barrier.
+        The scan in the reconcile module acquires and retains the exact exclusive barrier across
+        recovery and this action, so there is no unlock window and no caller-mintable authority
+        token that can bypass acquisition.
         """
 
         # Imported here to keep the reconcile module's dependency on the ledger one-directional.

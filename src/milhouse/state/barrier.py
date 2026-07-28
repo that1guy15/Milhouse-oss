@@ -20,7 +20,6 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
-import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -133,38 +132,6 @@ def _close(descriptor: int) -> None:
         pass
 
 
-class ExclusiveHold:
-    """An authority token proving a live exclusive hold of ONE specific barrier.
-
-    A hold is live only while :meth:`GlobalCommitBarrier.exclusive` has it registered in the
-    barrier module's private live-hold registry; the registry entry is added after the flock is
-    genuinely held and discarded when the context exits. The token itself carries NO activation
-    capability whatsoever — no method, attribute, or assignment on the token can make it active,
-    so a directly constructed token stays inactive no matter which of its callables are exercised,
-    and a token captured from a completed hold is stale. A live token is authority ONLY for its own
-    barrier: a consumer must compare ``barrier_path`` against the lock protecting the state it is
-    about to mutate.
-    """
-
-    __slots__ = ("__barrier_path", "__weakref__")
-
-    def __init__(self, barrier_path: Path) -> None:
-        self.__barrier_path = lexical_absolute_path(barrier_path)
-
-    @property
-    def active(self) -> bool:
-        return self in _LIVE_HOLDS
-
-    @property
-    def barrier_path(self) -> Path:
-        return self.__barrier_path
-
-
-# The live-hold registry: issuance and revocation state lives HERE, in the barrier implementation,
-# never on the token. Weak references keep an abandoned (garbage-collected) hold from lingering.
-_LIVE_HOLDS: weakref.WeakSet[ExclusiveHold] = weakref.WeakSet()
-
-
 class GlobalCommitBarrier:
     """A cross-process, writer-preferring readers-writer commit barrier over one lock file pair."""
 
@@ -207,28 +174,21 @@ class GlobalCommitBarrier:
             _close(main_fd)
 
     @contextmanager
-    def exclusive(self, *, blocking: bool = True) -> Iterator[ExclusiveHold]:
-        """Hold the exclusive side; block new shared entrants and drain existing ones.
-
-        Yields an :class:`ExclusiveHold` authority token that is active only for the lifetime of
-        the hold, so exclusive-only operations can validate their authority at runtime.
-        """
+    def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
+        """Hold the exclusive side; block new shared entrants and drain existing ones."""
 
         main_fd = _secure_lock_descriptor(self._path)
         gate_fd: int | None = None
         gate_held = False
         main_held = False
-        hold = ExclusiveHold(self._path)
         try:
             gate_fd = _secure_lock_descriptor(self._gate_path)
             _acquire(gate_fd, fcntl.LOCK_EX, blocking=blocking)
             gate_held = True
             _acquire(main_fd, fcntl.LOCK_EX, blocking=blocking)
             main_held = True
-            _LIVE_HOLDS.add(hold)
-            yield hold
+            yield
         finally:
-            _LIVE_HOLDS.discard(hold)
             if main_held:
                 _release(main_fd)
             if gate_held and gate_fd is not None:

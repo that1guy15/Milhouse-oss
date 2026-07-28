@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -450,36 +449,40 @@ def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) ->
 
 
 def test_the_no_gap_lock_protocol_holds_exclusive_across_reconcile_and_commit(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # pin the no-gap protocol: acquisition reconciles under ONE exclusive hold, and every commit
     # runs reconcile+publish+insert under ONE exclusive hold — never a shared publish, never an
     # unlock window between reconciliation and publication
-    database, _barrier, spool_root = _control(tmp_path)
+    database, barrier, spool_root = _control(tmp_path)
     calls: list[str] = []
     held_through_publish: list[bool] = []
     pending = spool_root / "pending"
+    real_exclusive = GlobalCommitBarrier.exclusive
+    real_shared = GlobalCommitBarrier.shared
 
-    class _SpyBarrier(GlobalCommitBarrier):
-        @contextlib.contextmanager
-        def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
-            calls.append("exclusive")
-            before = pending.exists()
-            with super().exclusive(blocking=blocking) as hold:
-                yield hold
-            # if publication happened during THIS single hold, pending appears while it was held
-            held_through_publish.append(not before and pending.exists())
+    @contextlib.contextmanager
+    def _spy_exclusive(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        calls.append("exclusive")
+        before = pending.exists()
+        with real_exclusive(self, blocking=blocking):
+            yield
+        # if publication happened during THIS single hold, pending appears while it was held
+        held_through_publish.append(not before and pending.exists())
 
-        @contextlib.contextmanager
-        def shared(self, *, blocking: bool = True) -> Iterator[None]:
-            calls.append("shared")
-            with super().shared(blocking=blocking):
-                yield
+    @contextlib.contextmanager
+    def _spy_shared(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        calls.append("shared")
+        with real_shared(self, blocking=blocking):
+            yield
+
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive", _spy_exclusive)
+    monkeypatch.setattr(GlobalCommitBarrier, "shared", _spy_shared)
 
     try:
         store = DurableSpool(
             database=database,
-            barrier=_SpyBarrier(tmp_path / "control" / "commit.lock"),
+            barrier=barrier,
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
         )
@@ -573,25 +576,24 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
 def test_every_reconciliation_entrypoint_holds_exclusive_before_mutating(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # spy on the scan body itself: whenever any supported entrypoint reaches it, the exclusive
-    # barrier must already be held (a probe acquisition from a second descriptor fails BUSY) and the
-    # authority token passed to it must be live
+    # Spy on the first ledger read: every supported entrypoint must already be inside the scan's
+    # lexical exclusive context, so a probe acquisition from another descriptor fails BUSY.
     database, barrier, spool_root = _control(tmp_path)
     probe = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")
-    real_run = reconcile_module._Scan.run
-    held_checks: list[tuple[bool, bool]] = []
+    real_ledger_index = reconcile_module._Scan._ledger_index
+    held_checks: list[bool] = []
 
-    def _asserting_run(self, authority):  # type: ignore[no-untyped-def]
+    def _asserting_ledger_index(self):  # type: ignore[no-untyped-def]
         blocked = False
         try:
             with probe.exclusive(blocking=False):
                 pass
         except StateError:
             blocked = True
-        held_checks.append((blocked, bool(getattr(authority, "active", False))))
-        return real_run(self, authority)
+        held_checks.append(blocked)
+        return real_ledger_index(self)
 
-    monkeypatch.setattr(reconcile_module._Scan, "run", _asserting_run)
+    monkeypatch.setattr(reconcile_module._Scan, "_ledger_index", _asserting_ledger_index)
     try:
         store = DurableSpool(  # entrypoint 1: writer acquisition
             database=database,
@@ -608,35 +610,31 @@ def test_every_reconciliation_entrypoint_holds_exclusive_before_mutating(
             installation_id=_INSTALLATION_ID,
         )
         reconciler.reconcile()  # entrypoint 3: the explicit startup pass
-        # exclusive was held and the authority token live at every scan invocation
-        assert held_checks == [(True, True), (True, True), (True, True)]
+        assert held_checks == [True, True, True]
     finally:
         database.close()
 
 
 def test_a_direct_unheld_scan_call_fails_before_any_mutation(tmp_path: Path) -> None:
-    # the re-review's reproduction: the raw scan body must be impossible to run without owning
-    # barrier authority — a direct internal call with no live hold fails before touching the ledger
-    from milhouse.state.barrier import ExclusiveHold
-
-    database, barrier, spool_root = _control(tmp_path)
+    database, _barrier, spool_root = _control(tmp_path)
     header, frames = _segment(batch_id="orphan-1")
     _publish_orphan(spool_root, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames))
     try:
         assert not hasattr(reconcile_module, "_run_reconciliation_scan")  # the old bypass is gone
         own_lock = tmp_path / "control" / "commit.lock"
-        for bogus_authority in (None, object(), ExclusiveHold(own_lock)):  # absent/foreign/inactive
+
+        class ForgedBarrier(GlobalCommitBarrier):
+            pass
+
+        for bogus_authority in (
+            None,
+            object(),
+            ForgedBarrier(own_lock),
+        ):
             scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
             with pytest.raises(SpoolError) as captured:
                 scan.run(bogus_authority)  # type: ignore[arg-type]
             assert captured.value.code == "MH_SPOOL_BARRIER"
-        # a STALE token captured from a completed hold is inactive and equally refused
-        with barrier.exclusive() as hold:
-            pass
-        assert not hold.active
-        with pytest.raises(SpoolError) as stale:
-            reconcile_module._Scan(database, spool_root, _INSTALLATION_ID).run(hold)
-        assert stale.value.code == "MH_SPOOL_BARRIER"
         # nothing mutated: the orphan remains unregistered, both tables are unchanged, and the
         # filesystem is untouched (no quarantine directory was ever created)
         assert _count(database) == 0
@@ -668,12 +666,10 @@ def test_exclusive_authority_is_bound_to_the_state_root(tmp_path: Path) -> None:
         assert mismatched.value.code == "MH_SPOOL_STORE"
         assert _count(database_a) == 0
 
-        # (2) a direct A scan with B's LIVE token fails the identity check before mutation
-        with barrier_b.exclusive() as foreign_live_hold:
-            assert foreign_live_hold.active
-            with pytest.raises(SpoolError) as foreign:
-                reconcile_module._Scan(database_a, spool_a, _INSTALLATION_ID).run(foreign_live_hold)
-            assert foreign.value.code == "MH_SPOOL_BARRIER"
+        # (2) a direct A scan with B's barrier fails binding before acquisition or mutation
+        with pytest.raises(SpoolError) as foreign:
+            reconcile_module._Scan(database_a, spool_a, _INSTALLATION_ID).run(barrier_b)
+        assert foreign.value.code == "MH_SPOOL_BARRIER"
         assert _count(database_a) == 0
         assert _count(database_a, "_segment_exporters") == 0
 
@@ -689,41 +685,6 @@ def test_exclusive_authority_is_bound_to_the_state_root(tmp_path: Path) -> None:
     finally:
         database_a.close()
         database_b.close()
-
-
-def test_a_token_carries_no_activation_capability(tmp_path: Path) -> None:
-    # the re-review forged a hold via its _issue() method; issuance now lives only in the barrier's
-    # private live-hold registry — the token exposes NO callable, method, or assignable state that
-    # can activate it
-    from milhouse.state.barrier import ExclusiveHold
-
-    hold = ExclusiveHold(tmp_path / "control" / "commit.lock")
-    assert not hold.active
-    callables = [
-        name
-        for name in dir(ExclusiveHold)
-        if not name.startswith("__") and callable(getattr(ExclusiveHold, name, None))
-    ]
-    assert callables == []  # no token method exists, activating or otherwise
-    assert not hasattr(hold, "_issue")
-    assert not hasattr(hold, "_revoke")
-    with pytest.raises(AttributeError):
-        hold._active = True  # type: ignore[attr-defined]
-    with pytest.raises(AttributeError):
-        hold.__active = True  # type: ignore[attr-defined]
-    with pytest.raises(AttributeError):
-        hold.active = True  # type: ignore[misc]
-    assert not hold.active  # the trust decision is not reachable from the token at all
-
-
-def test_a_context_issued_token_is_live_exactly_during_its_hold(tmp_path: Path) -> None:
-    _database, barrier, _spool_root = _control(tmp_path)
-    try:
-        with barrier.exclusive() as hold:
-            assert hold.active
-        assert not hold.active  # revoked the moment the context exits
-    finally:
-        _database.close()
 
 
 def test_the_anomaly_cap_stops_directory_enumeration(
@@ -1886,21 +1847,22 @@ def test_the_reconciler_rejects_a_bad_binding_or_installation(tmp_path: Path) ->
         database.close()
 
 
-def test_reconciliation_happens_inside_the_exclusive_barrier(tmp_path: Path) -> None:
+def test_reconciliation_happens_inside_the_exclusive_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     header, frames = _segment()
     _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
 
-    class _AssertingBarrier(GlobalCommitBarrier):
-        @contextlib.contextmanager
-        def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
-            assert _count(database) == 0  # not yet registered when the exclusive lock is taken
-            with super().exclusive(blocking=blocking) as hold:
-                yield hold
+    real_exclusive = GlobalCommitBarrier.exclusive
 
-    reconciler._barrier = _AssertingBarrier(  # type: ignore[attr-defined]
-        tmp_path / "control" / "commit.lock"
-    )
+    @contextlib.contextmanager
+    def _asserting_exclusive(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        assert _count(database) == 0  # not yet registered when the exclusive lock is taken
+        with real_exclusive(self, blocking=blocking):
+            yield
+
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive", _asserting_exclusive)
     try:
         assert len(reconciler.reconcile().registered) == 1
         assert _count(database) == 1
@@ -1921,6 +1883,27 @@ def test_a_barrier_acquisition_failure_surfaces_a_spool_error(tmp_path: Path) ->
         assert captured.value.__context__ is None
     finally:
         os.chmod(tmp_path / "control" / "commit.lock", 0o600)
+        database.close()
+
+
+@pytest.mark.parametrize("callback_name", ["observe", "action"])
+def test_a_callback_state_error_is_not_mislabeled_as_barrier_failure(
+    tmp_path: Path, callback_name: str
+) -> None:
+    database, barrier, spool_root = _control(tmp_path)
+
+    def _fail(*_args: object) -> None:
+        raise StateError("MH_STATE_TXN", "planted callback failure")
+
+    try:
+        scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
+        with pytest.raises(StateError) as captured:
+            scan.run(barrier, **{callback_name: _fail})
+        assert captured.value.code == "MH_STATE_TXN"
+        # The failed callback unwound the context and released both lock files.
+        with barrier.exclusive(blocking=False):
+            pass
+    finally:
         database.close()
 
 
