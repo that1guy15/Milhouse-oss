@@ -151,3 +151,25 @@ def test_invalid_ttl_and_identifiers_fail_closed(tmp_path: Path) -> None:
         assert holder.value.code == "MH_STATE_LEASE_HOLDER"
     finally:
         database.close()
+
+
+def test_sqlite_failures_are_normalized_for_every_lease_operation(tmp_path: Path) -> None:
+    database = _migrated(tmp_path)
+    try:
+        lease = acquire_lease(database, "scheduler", "worker-a", now=_T0, ttl_seconds=60)
+        database.connection.execute("DROP TABLE _leases")
+
+        operations = (
+            lambda: acquire_lease(database, "scheduler", "worker-a", now=_T0, ttl_seconds=60),
+            lambda: renew_lease(database, "scheduler", "worker-a", now=_T0, ttl_seconds=60),
+            lambda: release_lease(database, "scheduler", "worker-a"),
+            lambda: require_current_lease(database.connection, lease),
+        )
+        for operation in operations:
+            with pytest.raises(StateError) as captured:
+                operation()
+            assert captured.value.code == "MH_STATE_LEASE"
+            assert captured.value.__cause__ is None
+            assert captured.value.__context__ is None
+    finally:
+        database.close()

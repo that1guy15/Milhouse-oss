@@ -13,6 +13,7 @@ from milhouse.spooling.reader import (
 )
 from milhouse.spooling.reconcile import (
     OrphanRegistration,
+    QuarantinedFile,
     ReconciliationReport,
     SegmentAnomaly,
     SpoolReconciler,
@@ -35,6 +36,7 @@ __all__ = [
     "ExporterDelivery",
     "OrphanRegistration",
     "ParsedSegment",
+    "QuarantinedFile",
     "ReconciliationReport",
     "SegmentAnomaly",
     "SegmentHeaderV1",

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+import milhouse.spooling.segment as segment_module
+import milhouse.spooling.writer as writer_module
 from milhouse.domain.records import (
     CollectorDescriptorV1,
     EventDataV1,
@@ -22,6 +24,7 @@ from milhouse.spooling import (
     SegmentHeaderV1,
     SpoolError,
     SpoolFrameV1,
+    build_segment_bytes,
     spool_content_sha256,
     spool_frame_line,
     spool_segment_header_line,
@@ -175,6 +178,12 @@ def test_content_sha256_hostile_iterable_fails_closed() -> None:
     assert captured.value.__context__ is None
 
 
+def test_content_sha256_rejects_a_non_bytes_line() -> None:
+    with pytest.raises(SpoolError) as captured:
+        spool_content_sha256([b"valid\n", bytearray(b"not-bytes\n")])  # type: ignore[list-item]
+    assert captured.value.code == "MH_SPOOL_DIGEST"
+
+
 # --- validation ---------------------------------------------------------------------------------
 
 
@@ -219,6 +228,31 @@ def test_header_rejects_invalid_fields(field: str, value: object, code: str) -> 
     with pytest.raises(SpoolError) as captured:
         _header([_frame(1)], **{field: value})
     assert captured.value.code == code
+
+
+@pytest.mark.parametrize(
+    "required_exporters",
+    [
+        ["clickhouse"],
+        ("",),
+    ],
+)
+def test_header_rejects_a_non_tuple_or_invalid_exporter_ids(
+    required_exporters: object,
+) -> None:
+    with pytest.raises(SpoolError) as captured:
+        _header([_frame(1)], required_exporters=required_exporters)
+    assert captured.value.code == "MH_SPOOL_EXPORTERS"
+
+
+def test_wire_projectors_reject_the_wrong_model_type() -> None:
+    with pytest.raises(SpoolError) as frame:
+        spool_frame_line(object())  # type: ignore[arg-type]
+    assert frame.value.code == "MH_SPOOL_FRAME"
+
+    with pytest.raises(SpoolError) as header:
+        spool_segment_header_line(object())  # type: ignore[arg-type]
+    assert header.value.code == "MH_SPOOL_HEADER"
 
 
 def test_installation_scope_forbids_a_target_id() -> None:
@@ -269,6 +303,7 @@ def test_write_refuses_to_overwrite_an_existing_segment(tmp_path: Path) -> None:
         ({"record_count": 5}, "MH_SPOOL_COUNT"),
         ({"batch_id": "other"}, "MH_SPOOL_BATCH_ID"),
         ({"scope": "installation", "target_id": None}, "MH_SPOOL_SCOPE"),
+        ({"target_id": "other-target"}, "MH_SPOOL_TARGET"),
         ({"privacy_class": "public"}, "MH_SPOOL_PRIVACY"),
         ({"content_sha256": "b" * 64}, "MH_SPOOL_DIGEST"),
     ],
@@ -291,6 +326,80 @@ def test_write_rejects_a_noncontiguous_sequence(tmp_path: Path) -> None:
     with pytest.raises(SpoolError) as captured:
         write_spool_segment(directory / "batch-1.jsonl", header, frames)
     assert captured.value.code == "MH_SPOOL_SEQUENCE"
+
+
+def test_writer_rejects_wrong_header_frames_and_frame_members() -> None:
+    frame = _frame(1)
+    header = _header([frame])
+
+    with pytest.raises(SpoolError) as wrong_header:
+        build_segment_bytes(object(), [frame])  # type: ignore[arg-type]
+    assert wrong_header.value.code == "MH_SPOOL_HEADER"
+
+    with pytest.raises(SpoolError) as wrong_frames:
+        build_segment_bytes(header, iter([frame]))  # type: ignore[arg-type]
+    assert wrong_frames.value.code == "MH_SPOOL_FRAMES"
+
+    with pytest.raises(SpoolError) as wrong_member:
+        build_segment_bytes(header, [object()])  # type: ignore[list-item]
+    assert wrong_member.value.code == "MH_SPOOL_FRAME"
+
+
+def test_writer_uses_the_central_segment_caps() -> None:
+    assert writer_module.MAX_SEGMENT_FRAMES == segment_module.MAX_SEGMENT_FRAMES
+    assert writer_module.MAX_SEGMENT_FILE_BYTES == segment_module.MAX_SEGMENT_FILE_BYTES
+
+
+def test_writer_frame_cap_accepts_exactly_the_cap_and_refuses_cap_plus_one_before_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _frame(1)
+    second = _frame(2, source_event_id="event-2")
+    one_header = _header([first])
+    two_header = _header([first, second])
+    published: list[bytes] = []
+
+    monkeypatch.setattr(writer_module, "MAX_SEGMENT_FRAMES", 1)
+    monkeypatch.setattr(
+        writer_module,
+        "publish_segment_bytes",
+        lambda _path, content: published.append(content),
+    )
+
+    writer_module.write_spool_segment("unused", one_header, [first])
+    assert published == [build_segment_bytes(one_header, [first])]
+
+    published.clear()
+    with pytest.raises(SpoolError) as captured:
+        writer_module.write_spool_segment("unused", two_header, [first, second])
+    assert captured.value.code == "MH_SPOOL_COUNT"
+    assert published == []
+
+
+def test_writer_byte_cap_accepts_exactly_the_cap_and_refuses_cap_plus_one_before_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = _frame(1)
+    header = _header([frame])
+    expected = spool_segment_header_line(header) + spool_frame_line(frame)
+    published: list[bytes] = []
+
+    monkeypatch.setattr(writer_module, "MAX_SEGMENT_FILE_BYTES", len(expected))
+    monkeypatch.setattr(
+        writer_module,
+        "publish_segment_bytes",
+        lambda _path, content: published.append(content),
+    )
+
+    writer_module.write_spool_segment("unused", header, [frame])
+    assert published == [expected]
+
+    published.clear()
+    monkeypatch.setattr(writer_module, "MAX_SEGMENT_FILE_BYTES", len(expected) - 1)
+    with pytest.raises(SpoolError) as captured:
+        writer_module.write_spool_segment("unused", header, [frame])
+    assert captured.value.code == "MH_SPOOL_SIZE"
+    assert published == []
 
 
 def test_write_fails_closed_when_the_parent_is_not_private(tmp_path: Path) -> None:
