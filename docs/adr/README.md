@@ -9,14 +9,16 @@ an owner-approved process adaptation dated 2026-07-19; it changes no public API,
 stored schema, privacy promise, or product scope. ADRs 0016 and 0017 record
 owner-approved amendments A02 and A03 dated 2026-07-22: ADR 0016 ratifies the
 persisted local structured-log contract and amends ADR 0007, and ADR 0017 records
-the bounded D01 historical DCO disposition.
+the bounded D01 historical DCO disposition. The ADR 0004 addendum ratifies
+owner-approved amendment A06 dated 2026-07-28 and makes the installation-account
+filesystem-containment boundary explicit.
 
 | ADR | Ratified decision |
 |---|---|
 | [0001](0001-product-scope-naming-and-license.md) | Product, 1.0 scope, supported environments, naming, and license |
 | [0002](0002-configuration-paths-and-secrets.md) | Configuration, paths, runtime home, and secrets |
 | [0003](0003-records-identity-and-metrics.md) | Canonical records, deterministic identity, and metric semantics |
-| [0004](0004-spool-sqlite-commit-and-recovery.md) | Durable spool, SQLite control state, commit, replay, and recovery |
+| [0004](0004-spool-sqlite-commit-and-recovery.md) | Durable spool, SQLite control state, commit, replay, recovery, and the A06 installation-account filesystem-containment boundary |
 | [0005](0005-clickhouse-analytical-storage.md) | ClickHouse analytical storage, migrations, and recovery |
 | [0006](0006-alert-incident-and-feedback-state.md) | Alert, incident, and verified-feedback state machines |
 | [0007](0007-privacy-identity-egress-and-retention.md) | Trust, privacy, installation identity, egress, retention, and purge |
