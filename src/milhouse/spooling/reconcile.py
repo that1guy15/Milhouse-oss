@@ -43,7 +43,10 @@ a staged temporary for deterministic retry. POSIX has no rename/unlink primitive
 ancestor pathname still naming an opened directory, so the exclusive hold and owner-only 0700
 directories exclude cooperating writers from the adjacent-proof syscall window; an uncooperative
 same-UID process is outside that documented model. Outcomes distinguish pre-move blocked,
-completed, and commit-uncertain, with every claim verified, never assumed.
+completed, and commit-uncertain, with every claim verified, never assumed. Inventory completeness
+and recovery/action authority are reported separately: an inventory-incomplete pass is mutation-
+free, while uncertainty after a bounded prior-recovery cleanup blocks all subsequent ledger/file
+mutations and writer handoff without falsely claiming the inventory was truncated.
 Foreign-named entries are reported but
 left in place (they have no well-formed quarantine name). The scan never deletes SPOOL DATA: the
 only unlinks are a retired source after its verified copy and both namespaces are re-proven, the
@@ -159,9 +162,9 @@ class SegmentAnomaly:
     owned, exact-0600, single-link, ACL-free regular file: a staged symlink, directory, FIFO,
     device, or multi-link file is never queued, followed, or linked), ``unreachable``,
     ``changed``, ``collision``, ``io``), ``quarantine_uncertain`` (a durable quarantine copy was
-    created, exists, or could not be ruled out, but the pending source's state or live target
-    binding could not be confirmed; the next scan converges by adopting a live same-digest copy or
-    producing a fresh live copy), or
+    created, exists, or could not be ruled out, but the pending source's state, prior-recovery
+    cleanup, or live target binding could not be confirmed; the next scan converges by adopting a
+    live same-digest copy or producing a fresh live copy), or
     ``limit`` (a scan bound was exceeded).
     ``batch_id`` and ``day`` are validated identifiers or empty when the underlying name was
     invalid (untrusted names are omitted entirely, never echoed or fingerprinted); ``detail`` is a
@@ -197,7 +200,10 @@ class ReconciliationReport:
     ``complete`` is False when any enumeration bound or unreadable/unsafe directory truncated the
     inventory. An incomplete scan is certification- and mutation-free: it registers nothing,
     certifies nothing healthy, and asserts no missing files, because a truncated inventory cannot
-    prove global batch uniqueness or absence.
+    prove global batch uniqueness or absence. ``recovery_safe`` is False when the complete
+    inventory found prior-pass recovery debris but its bounded cleanup could not be verified. Such
+    a pass may already have durably removed an exact empty reservation; it performs no subsequent
+    registration, quarantine, or writer action and reports the uncertainty distinctly.
     """
 
     registered: tuple[OrphanRegistration, ...]
@@ -206,6 +212,7 @@ class ReconciliationReport:
     healthy: int
     scanned: int
     complete: bool
+    recovery_safe: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,7 +260,7 @@ def _raw_sha256(path: Path) -> str | None:
     copy that cannot be read classifies fail-safe as divergent.
     """
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = _leaf_probe_flags()
     digest = hashlib.sha256()
     descriptor: int | None = None
     failed = False
@@ -353,10 +360,35 @@ def _ensure_private_dir_at(parent_fd: int, name: str) -> tuple[int, FileIdentity
             os.mkdir(name, _DIR_MODE, dir_fd=parent_fd)
         except FileExistsError:
             pass
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        mode = stat.S_IMODE(info.st_mode)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != _current_uid() or mode & ~_DIR_MODE:
+            return None
+        expected_identity = FileIdentity.from_stat(info)
+        hardened = mode != _DIR_MODE
+        if hardened:
+            # mkdir mode is filtered by umask. A crash can therefore leave a reserved child with
+            # a stricter owner-only mode that cannot be opened. The validated 0700 parent excludes
+            # other users, so repair only an owned directory with no group/other/special bits,
+            # then require the exact no-follow identity plus complete ACL envelope. Linux builds
+            # without no-follow chmod support use the same owner-only boundary and still reject a
+            # replacement at the subsequent no-follow open/identity proof.
+            if os.chmod in os.supports_follow_symlinks:
+                os.chmod(
+                    name,
+                    _DIR_MODE,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            else:
+                os.chmod(name, _DIR_MODE, dir_fd=parent_fd)
         if _fsync_descriptor(parent_fd):
             descriptor = os.open(name, _dir_flags(), dir_fd=parent_fd)
-            identity = _validated_dir_descriptor(descriptor)
-    except OSError:
+            if not hardened or _fsync_descriptor(descriptor):
+                identity = _validated_dir_descriptor(descriptor)
+                if identity != expected_identity:
+                    identity = None
+    except (NotImplementedError, OSError, ValueError):
         identity = None
     if identity is None or descriptor is None:
         if descriptor is not None:
@@ -438,19 +470,56 @@ def _is_valid_day(day: str) -> bool:
     return valid
 
 
+def _retirement_parts(name: str) -> tuple[FileIdentity, str] | None:
+    """Parse the source identity and quarantine candidate encoded in a retirement name."""
+
+    if not name.startswith(_RETIRE_PREFIX):
+        return None
+    encoded, separator, candidate = name[len(_RETIRE_PREFIX) :].partition("--")
+    device, identity_separator, inode = encoded.partition("-")
+    if (
+        separator != "--"
+        or identity_separator != "-"
+        or not candidate
+        or re.fullmatch(r"[0-9a-f]+", device, flags=re.ASCII) is None
+        or re.fullmatch(r"[0-9a-f]+", inode, flags=re.ASCII) is None
+    ):
+        return None
+    return FileIdentity(device=int(device, 16), inode=int(inode, 16)), candidate
+
+
 def _retirement_candidate(name: str, snapshot: FileSnapshot) -> str | None:
-    """Recover the exact quarantine candidate encoded in one retirement name.
+    """Recover the exact quarantine candidate encoded in one live retirement name.
 
     Device and inode bind the private name to the staged object. A planted name that merely uses
     the reserved prefix is therefore handled as an ordinary staged temporary, never as recovery
     authority for an unrelated quarantine candidate.
     """
 
-    marker = f"{_RETIRE_PREFIX}{snapshot.device:x}-{snapshot.inode:x}--"
-    if not name.startswith(marker):
+    parts = _retirement_parts(name)
+    if parts is None:
         return None
-    candidate = name[len(marker) :]
-    return candidate or None
+    identity, candidate = parts
+    return candidate if identity == FileIdentity(snapshot.device, snapshot.inode) else None
+
+
+def _failed_reservation_snapshot(name: str, info: os.stat_result) -> FileSnapshot | None:
+    """Recognize only an empty pass-reservation inode left at an encoded retirement name."""
+
+    parts = _retirement_parts(name)
+    identity = FileIdentity.from_stat(info)
+    if (
+        parts is None
+        or parts[0] == identity
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != _current_uid()
+        or info.st_nlink != 1
+        or info.st_size != 0
+        or stat.S_IMODE(info.st_mode) == 0o600
+        or stat.S_IMODE(info.st_mode) & ~0o600
+    ):
+        return None
+    return FileSnapshot.from_stat(info)
 
 
 def _retirement_name(snapshot: FileSnapshot, candidate: str) -> str:
@@ -578,7 +647,9 @@ class _Scan:
         "_move_failures",
         "_pending_quarantines",
         "_pending_registrations",
+        "_pending_reservation_cleanups",
         "_quarantined",
+        "_recovery_safe",
         "_registered",
         "_scanned",
         "_spool_root",
@@ -595,6 +666,8 @@ class _Scan:
         self._pending_quarantines: list[
             tuple[str, str, FileIdentity, FileSnapshot, str, str, str]
         ] = []
+        # (day, name, day_identity, exact empty-reservation snapshot)
+        self._pending_reservation_cleanups: list[tuple[str, str, FileIdentity, FileSnapshot]] = []
         self._quarantined: list[QuarantinedFile] = []
         self._move_failures: list[SegmentAnomaly] = []
         self._anomalies: list[SegmentAnomaly] = []
@@ -602,6 +675,7 @@ class _Scan:
         self._scanned = 0
         self._stopped = False
         self._complete = True
+        self._recovery_safe = True
 
     def run(
         self,
@@ -716,54 +790,69 @@ class _Scan:
                     # Mutation happens only after complete, within-bounds classification proved
                     # every candidate batch id globally unique and the anomaly budget was never
                     # exhausted.
-                    for parsed, batch_id, day in self._pending_registrations:
-                        self._register(parsed, batch_id, day)
-                        self._registered.append(OrphanRegistration(batch_id, day))
-                    for (
-                        day,
-                        name,
-                        day_identity,
-                        snapshot,
-                        digest,
-                        batch_id,
-                        detail,
-                    ) in self._pending_quarantines:
-                        outcome = self._move_to_quarantine(
-                            day, name, day_identity, snapshot, digest
-                        )
-                        if outcome is None:
-                            self._quarantined.append(QuarantinedFile(batch_id, day, detail))
-                        elif outcome == "uncertain":
-                            # The target is durably named but the source state could not be
-                            # confirmed: reported distinctly, never as completed; the public source
-                            # may remain or be recoverably retired in pending, and the next scan
-                            # converges through the live certified copy or a fresh live copy.
+                    for day, name, day_identity, snapshot in self._pending_reservation_cleanups:
+                        outcome = self._cleanup_stale_reservation(day, name, day_identity, snapshot)
+                        if outcome is not None:
                             self._move_failures.append(
-                                SegmentAnomaly(batch_id, day, "quarantine_uncertain", "io")
+                                SegmentAnomaly("", day, "quarantine_uncertain", "io")
                             )
-                        else:
-                            # A quarantine that cannot complete never aborts recovery or a commit:
-                            # the file stays in pending, is re-reported every scan, and authority is
-                            # unaffected — the review showed one un-quarantinable file must not
-                            # wedge all commits.
-                            self._move_failures.append(
-                                SegmentAnomaly(batch_id, day, "quarantine_blocked", outcome)
+                            # Reservation cleanup is recovery of a prior incomplete mutation. Any
+                            # uncertainty can imply pending root/day drift, so no ledger or file
+                            # mutation classified against this inventory may follow it.
+                            self._recovery_safe = False
+                            break
+                    if self._recovery_safe:
+                        for parsed, batch_id, day in self._pending_registrations:
+                            self._register(parsed, batch_id, day)
+                            self._registered.append(OrphanRegistration(batch_id, day))
+                        for (
+                            day,
+                            name,
+                            day_identity,
+                            snapshot,
+                            digest,
+                            batch_id,
+                            detail,
+                        ) in self._pending_quarantines:
+                            outcome = self._move_to_quarantine(
+                                day, name, day_identity, snapshot, digest
                             )
-                else:
+                            if outcome is None:
+                                self._quarantined.append(QuarantinedFile(batch_id, day, detail))
+                            elif outcome == "uncertain":
+                                # The target is durably named but the source state could not be
+                                # confirmed: reported distinctly, never as completed; the public
+                                # source may remain or be recoverably retired in pending, and the
+                                # next scan converges through the live certified copy or a fresh
+                                # live copy.
+                                self._move_failures.append(
+                                    SegmentAnomaly(batch_id, day, "quarantine_uncertain", "io")
+                                )
+                            else:
+                                # A quarantine that cannot complete never aborts recovery or a
+                                # commit: the file stays in pending, is re-reported every scan, and
+                                # authority is unaffected — the review showed one un-quarantinable
+                                # file must not wedge all commits.
+                                self._move_failures.append(
+                                    SegmentAnomaly(batch_id, day, "quarantine_blocked", outcome)
+                                )
+                if not self._complete or not self._recovery_safe:
                     self._pending_registrations.clear()
                     self._pending_quarantines.clear()
+                    self._pending_reservation_cleanups.clear()
 
                 report = ReconciliationReport(
                     registered=tuple(self._registered),
                     quarantined=tuple(self._quarantined),
                     anomalies=tuple(self._anomalies) + tuple(self._move_failures),
-                    healthy=self._healthy if self._complete else 0,
+                    healthy=self._healthy if self._complete and self._recovery_safe else 0,
                     scanned=self._scanned,
                     complete=self._complete,
+                    recovery_safe=self._recovery_safe,
                 )
                 if observe is not None:
                     observe(report)
-                if action is not None and report.complete:
+                if action is not None and report.complete and report.recovery_safe:
                     if transition is None:  # pragma: no cover - context selection is local above
                         _fail("MH_SPOOL_BARRIER", "the writer barrier transition is unavailable")
                     # Normalize only a failed lock-mode transition as a barrier failure. Once the
@@ -934,9 +1023,24 @@ class _Scan:
                 self._scanned += 1
                 if name.startswith(_STAGE_PREFIX):
                     # A crashed writer's staged temporary is never committed. Its leaf is still
-                    # inspected no-follow before quarantine is queued.
+                    # inspected no-follow before quarantine is queued. A zero-byte retirement
+                    # reservation whose inode does not match the source identity encoded in its
+                    # name is safe cleanup debris, including when a restrictive umask plus a crash
+                    # left it unreadable before fchmod. Defer all mutation until inventory
+                    # completes.
                     self._anomaly("", day, "stale_temp", "staged_temporary")
-                    self._queue_quarantine(day, name, day_identity, "", "stale_temp")
+                    reservation_snapshot: FileSnapshot | None = None
+                    try:
+                        reservation_info = os.stat(name, dir_fd=day_fd, follow_symlinks=False)
+                        reservation_snapshot = _failed_reservation_snapshot(name, reservation_info)
+                    except OSError:
+                        pass
+                    if reservation_snapshot is not None:
+                        self._pending_reservation_cleanups.append(
+                            (day, name, day_identity, reservation_snapshot)
+                        )
+                    else:
+                        self._queue_quarantine(day, name, day_identity, "", "stale_temp")
                     continue
                 resolved = self._classify_name(pending / day / name, day, name)
                 if resolved is not None:
@@ -1459,12 +1563,15 @@ class _Scan:
             name if already_retired else _retirement_name(source_snapshot, placed.candidate)
         )
         reservation_fd: int | None = None
-        reservation_snapshot: FileSnapshot | None = None
+        reservation_identity: FileIdentity | None = None
         try:
             try:
                 initial = os.stat(name, dir_fd=final_source_fd, follow_symlinks=False)
             except FileNotFoundError:
-                initial = None
+                # This exact name was inventoried, opened, snapshot-matched, and reread earlier in
+                # this pass. Its absence is detected namespace drift even when it is an encoded
+                # retirement name; a prior-pass absence could never have entered this finalizer.
+                return "uncertain"
             if (
                 self._certify_live_target(day, placed.target_identities, placed.candidate, digest)
                 != placed.snapshot
@@ -1475,11 +1582,10 @@ class _Scan:
             try:
                 current = os.stat(name, dir_fd=final_source_fd, follow_symlinks=False)
             except FileNotFoundError:
-                # Stable prior absence completes an already-retired move. If the source existed
-                # at the initial check and then vanished, its binding changed during final
-                # certification, so preserve the live copy but report an uncertain outcome.
-                return None if initial is None else "uncertain"
-            if initial is None or FileSnapshot.from_stat(current) != source_snapshot:
+                # The source vanished during final certification. Preserve the live copy and
+                # report the detected drift rather than claiming that this pass retired it.
+                return "uncertain"
+            if FileSnapshot.from_stat(current) != source_snapshot:
                 # The classified target is complete, but a new source object now owns the name.
                 # Preserve it for the next inventory rather than deleting unclassified bytes, and
                 # do not report an ordinary completion for a source binding we did not retire.
@@ -1506,10 +1612,19 @@ class _Scan:
                     0o600,
                     dir_fd=final_source_fd,
                 )
-                os.fchmod(reservation_fd, 0o600)
-                reservation_snapshot = FileSnapshot.from_stat(os.fstat(reservation_fd))
-                os.close(reservation_fd)
-                reservation_fd = None
+                reservation_identity = FileIdentity.from_stat(os.fstat(reservation_fd))
+                try:
+                    os.fchmod(reservation_fd, 0o600)
+                except OSError:
+                    self._cleanup_empty_reservation(
+                        day=day,
+                        source_identities=source_identities,
+                        target_fd=final_source_fd,
+                        candidate=retirement,
+                        reservation_fd=reservation_fd,
+                        expected_identity=reservation_identity,
+                    )
+                    return "uncertain"
                 try:
                     os.replace(
                         name,
@@ -1520,13 +1635,15 @@ class _Scan:
                 except OSError:
                     # A failed rename normally leaves our empty reservation. Remove only that
                     # exact inode; if the rename actually landed despite an ambiguous error, its
-                    # different snapshot/digest is preserved for the next inventory.
-                    assert reservation_snapshot is not None
-                    self._cleanup_candidate_at(
-                        final_source_fd,
-                        retirement,
-                        hashlib.sha256(b"").hexdigest(),
-                        reservation_snapshot,
+                    # different inode/non-empty bytes are preserved for the next inventory.
+                    assert reservation_identity is not None
+                    self._cleanup_empty_reservation(
+                        day=day,
+                        source_identities=source_identities,
+                        target_fd=final_source_fd,
+                        candidate=retirement,
+                        reservation_fd=reservation_fd,
+                        expected_identity=reservation_identity,
                     )
                     return "uncertain"
                 os.fsync(final_source_fd)
@@ -1591,6 +1708,96 @@ class _Scan:
                 except OSError:  # pragma: no cover - defensive close failure
                     pass
             _close_descriptors(final_source_chain)
+
+    def _cleanup_empty_reservation(
+        self,
+        *,
+        day: str,
+        source_identities: tuple[FileIdentity, ...],
+        target_fd: int,
+        candidate: str,
+        reservation_fd: int,
+        expected_identity: FileIdentity,
+    ) -> bool:
+        """Remove and fsync only this pass's still-live empty retirement reservation."""
+
+        try:
+            held = os.fstat(reservation_fd)
+            named = os.stat(candidate, dir_fd=target_fd, follow_symlinks=False)
+            if (
+                FileIdentity.from_stat(held) != expected_identity
+                or FileIdentity.from_stat(named) != expected_identity
+                or not stat.S_ISREG(named.st_mode)
+                or named.st_uid != _current_uid()
+                or named.st_nlink != 1
+                or named.st_size != 0
+            ):
+                return False
+            # Rebind the retained day descriptor to the current live pending chain immediately
+            # before mutation. If the namespace moved, preserve the reservation for inventory.
+            if not self._pending_binding_holds(day, source_identities):
+                return False
+            os.unlink(candidate, dir_fd=target_fd)
+            os.fsync(target_fd)
+            try:
+                os.stat(candidate, dir_fd=target_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return True
+            return False
+        except OSError:
+            return False
+
+    def _cleanup_stale_reservation(
+        self,
+        day: str,
+        name: str,
+        day_identity: FileIdentity,
+        snapshot: FileSnapshot,
+    ) -> str | None:
+        """Remove only exact empty retirement debris inventoried by this complete pass.
+
+        A process can stop after creating the private reservation but before capturing its
+        identity or tightening its mode. The next pass recognizes only a zero-byte, owned,
+        single-link regular file whose inode differs from the source identity encoded in the
+        reserved name. This method then reopens and rebinds the complete pending chain, proves
+        the exact inventoried snapshot twice immediately before unlink, fsyncs the directory,
+        and proves absence. Any drift is preserved and reported as uncertain.
+        """
+
+        source_chain = self._open_pending_chain(day, day_identity)
+        if source_chain is None:
+            return "uncertain"
+        source_descriptors, source_identities = source_chain
+        source_fd = source_descriptors[-1]
+        try:
+            initial = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            if (
+                FileSnapshot.from_stat(initial) != snapshot
+                or _failed_reservation_snapshot(name, initial) != snapshot
+            ):
+                return "uncertain"
+            if not self._pending_binding_holds(day, source_identities):
+                return "uncertain"
+            current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            if (
+                FileSnapshot.from_stat(current) != snapshot
+                or _failed_reservation_snapshot(name, current) != snapshot
+            ):
+                return "uncertain"
+
+            os.unlink(name, dir_fd=source_fd)
+            os.fsync(source_fd)
+            if not self._pending_binding_holds(day, source_identities):
+                return "uncertain"
+            try:
+                os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None if self._pending_binding_holds(day, source_identities) else "uncertain"
+            return "uncertain"
+        except OSError:
+            return "uncertain"
+        finally:
+            _close_descriptors(source_descriptors)
 
     def _cleanup_candidate_at(
         self,

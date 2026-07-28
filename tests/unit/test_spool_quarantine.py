@@ -140,6 +140,30 @@ def _publish_orphan(spool_root: Path, day: str, name: str, content: bytes) -> Pa
     return path
 
 
+def _plant_empty_retirement_reservation(source: Path, candidate: str = "batch-1.jsonl") -> Path:
+    """Model a process stop after reservation creation under a restrictive umask."""
+
+    snapshot = FileSnapshot.from_stat(os.stat(source, follow_symlinks=False))
+    reservation = source.with_name(reconcile_module._retirement_name(snapshot, candidate))
+    descriptor: int | None = None
+    prior_umask = os.umask(0o777)
+    try:
+        descriptor = os.open(
+            reservation,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    finally:
+        os.umask(prior_umask)
+        if descriptor is not None:
+            os.close(descriptor)
+    return reservation
+
+
 def _count(database, table: str = "_segments") -> int:
     return database.connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
 
@@ -266,6 +290,77 @@ def test_an_identical_conflict_quarantines_every_copy_as_duplicate(tmp_path: Pat
         assert {q.detail for q in report.quarantined} == {"conflict_duplicate"}
         assert len(report.quarantined) == 2
         assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_a_conflicted_fifo_is_bounded_and_does_not_wedge_the_writer_barrier(
+    tmp_path: Path,
+) -> None:
+    """Conflict hashing rejects a FIFO without waiting for a writer to open the pipe."""
+
+    import subprocess
+    import sys
+
+    database, _store, spool_root, _reconciler_unused = _reconciler(tmp_path)
+    try:
+        header, frames = _segment(batch_id="batch-1")
+        _publish_orphan(
+            spool_root,
+            "2026-07-23",
+            "batch-1.jsonl",
+            build_segment_bytes(header, frames),
+        )
+        fifo_day = spool_root / "pending" / "2026-07-24"
+        fifo_day.mkdir(mode=0o700)
+        os.chmod(fifo_day, 0o700)
+        fifo = fifo_day / "batch-1.jsonl"
+        os.mkfifo(fifo, 0o600)
+    finally:
+        database.close()
+
+    script = (
+        "import pathlib, sys\n"
+        "from milhouse.spooling import QuarantinedFile, SegmentAnomaly, SpoolReconciler\n"
+        "from milhouse.state import GlobalCommitBarrier, open_control_database\n"
+        "root = pathlib.Path(sys.argv[1])\n"
+        "database = open_control_database(root / 'control' / 'milhouse.sqlite3')\n"
+        "try:\n"
+        "    report = SpoolReconciler(\n"
+        "        database=database,\n"
+        "        barrier=GlobalCommitBarrier(root / 'control' / 'commit.lock'),\n"
+        "        spool_root=root / 'spool',\n"
+        "        installation_id=sys.argv[2],\n"
+        "    ).reconcile()\n"
+        "    assert report.complete\n"
+        "    assert report.quarantined == (\n"
+        "        QuarantinedFile('batch-1', '2026-07-23', 'conflict_divergent'),\n"
+        "    )\n"
+        "    assert SegmentAnomaly(\n"
+        "        'batch-1', '2026-07-24', 'quarantine_blocked', 'unsafe'\n"
+        "    ) in report.anomalies\n"
+        "finally:\n"
+        "    database.close()\n"
+    )
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), _INSTALLATION_ID],
+        check=True,
+        timeout=5,
+    )
+
+    assert stat.S_ISFIFO(os.lstat(fifo).st_mode)
+    database = open_control_database(tmp_path / "control" / "milhouse.sqlite3")
+    try:
+        writer = DurableSpool(
+            database=database,
+            barrier=GlobalCommitBarrier(tmp_path / "control" / "commit.lock"),
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        later_header, later_frames = _segment(batch_id="later-1")
+        writer.commit_segment(later_header, later_frames, committed_at=_NOW)
+        assert writer.read_segment("later-1") is not None
+        assert stat.S_ISFIFO(os.lstat(fifo).st_mode)
     finally:
         database.close()
 
@@ -1412,6 +1507,148 @@ def test_directory_validation_helpers_fail_safe(tmp_path: Path) -> None:
         os.close(parent)
 
 
+@pytest.mark.parametrize("without_nofollow_chmod", (False, True))
+def test_quarantine_directories_are_hardened_under_a_restrictive_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, without_nofollow_chmod: bool
+) -> None:
+    """Fresh reserved directories reach exact 0700 even when umask removes owner bits."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    if without_nofollow_chmod:
+        monkeypatch.setattr(
+            os, "supports_follow_symlinks", os.supports_follow_symlinks - {os.chmod}
+        )
+    prior_umask = os.umask(0o777)
+    try:
+        report = reconciler.reconcile()
+    finally:
+        os.umask(prior_umask)
+    try:
+        assert len(report.quarantined) == 1
+        assert not source.exists()
+        quarantine = spool_root / "quarantine"
+        assert stat.S_IMODE(os.stat(quarantine).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(quarantine / _DAY).st_mode) == 0o700
+        assert (quarantine / _DAY / "batch-1.jsonl").read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_interrupted_quarantine_directory_hardening_converges_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An owned mode-subset directory left after mkdir is safely repaired next pass."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    real_chmod = os.chmod
+    failed: list[bool] = []
+
+    def _failing_chmod(target, mode, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not failed and target == reconcile_module._QUARANTINE:
+            failed.append(True)
+            raise OSError(5, "planted directory hardening interruption")
+        return real_chmod(target, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", _failing_chmod)
+    prior_umask = os.umask(0o777)
+    try:
+        first = reconciler.reconcile()
+    finally:
+        os.umask(prior_umask)
+    try:
+        assert failed == [True]
+        assert first.quarantined == ()
+        assert (
+            SegmentAnomaly("batch-1", _DAY, "quarantine_blocked", "unreachable") in first.anomalies
+        )
+        quarantine = spool_root / "quarantine"
+        assert stat.S_IMODE(os.stat(quarantine).st_mode) == 0
+        assert source.read_bytes() == b"junk\n"
+
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert not source.exists()
+        assert stat.S_IMODE(os.stat(quarantine).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(quarantine / _DAY).st_mode) == 0o700
+        assert (quarantine / _DAY / "batch-1.jsonl").read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_directory_hardening_refuses_a_replacement_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hardened name must still open as the exact inode inspected before chmod."""
+
+    child = tmp_path / "child"
+    child.mkdir(mode=0o700)
+    os.chmod(child, 0)
+    displaced = tmp_path / "displaced"
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    real_open = os.open
+    swapped: list[bool] = []
+
+    def _swapping_open(target, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not swapped and target == "child" and kwargs.get("dir_fd") == parent_fd:
+            swapped.append(True)
+            os.rename(child, displaced)
+            child.mkdir(mode=0o700)
+            os.chmod(child, 0o700)
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _swapping_open)
+    try:
+        assert reconcile_module._ensure_private_dir_at(parent_fd, "child") is None
+        assert swapped == [True]
+        assert child.is_dir()
+        assert displaced.is_dir()
+    finally:
+        os.close(parent_fd)
+
+
+def test_directory_hardening_sync_failure_is_not_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repaired directory metadata must be fsynced before it becomes mutation authority."""
+
+    child = tmp_path / "child"
+    child.mkdir(mode=0o700)
+    os.chmod(child, 0)
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    real_sync = reconcile_module._fsync_descriptor
+    calls: list[int] = []
+
+    def _failing_child_sync(descriptor: int) -> bool:
+        calls.append(descriptor)
+        if descriptor != parent_fd:
+            return False
+        return real_sync(descriptor)
+
+    monkeypatch.setattr(reconcile_module, "_fsync_descriptor", _failing_child_sync)
+    try:
+        assert reconcile_module._ensure_private_dir_at(parent_fd, "child") is None
+        assert len(calls) == 2
+        assert stat.S_IMODE(os.stat(child).st_mode) == 0o700
+    finally:
+        os.close(parent_fd)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        f"{reconcile_module._RETIRE_PREFIX}1-1",
+        f"{reconcile_module._RETIRE_PREFIX}1--candidate",
+        f"{reconcile_module._RETIRE_PREFIX}zz-1--candidate",
+        f"{reconcile_module._RETIRE_PREFIX}1-zz--candidate",
+        f"{reconcile_module._RETIRE_PREFIX}1-1--",
+    ),
+)
+def test_malformed_retirement_names_never_grant_recovery_authority(name: str) -> None:
+    assert reconcile_module._retirement_parts(name) is None
+
+
 def test_the_exact_reader_refuses_shrinkage_growth_and_unreadable_descriptors(
     tmp_path: Path,
 ) -> None:
@@ -1546,7 +1783,7 @@ def test_a_mutation_during_the_verification_read_is_caught_by_the_snapshot(
         database.close()
 
 
-def test_a_source_removed_after_the_copy_is_a_completed_move(
+def test_a_source_removed_after_the_copy_is_uncertain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
@@ -1566,8 +1803,64 @@ def test_a_source_removed_after_the_copy_is_a_completed_move(
     monkeypatch.setattr(os, "link", _removing_link)
     try:
         report = reconciler.reconcile()
-        assert len(report.quarantined) == 1  # the classified bytes ARE durably quarantined
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
         assert (spool_root / "quarantine" / _DAY / "batch-1.jsonl").read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_an_inventoried_retirement_removed_before_finalization_is_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staged retirement that disappears in this pass is drift, not prior completion."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_unlink = os.unlink
+    unlink_failed: list[bool] = []
+
+    def _failing_retirement_unlink(target, *, dir_fd=None):  # type: ignore[no-untyped-def]
+        if not unlink_failed and str(target).startswith(reconcile_module._RETIRE_PREFIX):
+            unlink_failed.append(True)
+            raise OSError(5, "planted retirement unlink failure")
+        return real_unlink(target, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", _failing_retirement_unlink)
+    try:
+        first = reconciler.reconcile()
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        retirement = retirements[0]
+        assert retirement.read_bytes() == b"junk\n"
+
+        monkeypatch.setattr(os, "unlink", real_unlink)
+        real_finalize = reconcile_module._Scan._finalize_source_removal
+        removed: list[bool] = []
+
+        def _removing_before_finalize(self, **kwargs):  # type: ignore[no-untyped-def]
+            if not removed and kwargs["name"] == retirement.name:
+                removed.append(True)
+                os.unlink(retirement)
+            return real_finalize(self, **kwargs)
+
+        monkeypatch.setattr(
+            reconcile_module._Scan, "_finalize_source_removal", _removing_before_finalize
+        )
+        second = reconciler.reconcile()
+        assert removed == [True]
+        assert second.quarantined == ()
+        assert SegmentAnomaly("", _DAY, "quarantine_uncertain", "io") in second.anomalies
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+        assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+
+        third = reconciler.reconcile()
+        assert third.quarantined == ()
+        assert third.anomalies == ()
     finally:
         database.close()
 
@@ -3491,8 +3784,12 @@ def test_retirement_certification_failure_is_uncertain_and_retryable(
 
 
 @pytest.mark.parametrize("failure_point", ["certification", "cleanup"])
+@pytest.mark.parametrize("replacement", (b"", b"replacement\n"), ids=("empty", "nonempty"))
 def test_a_public_replacement_racing_retirement_failure_is_never_overwritten(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    replacement: bytes,
 ) -> None:
     """Failure paths retain the private source instead of restoring with destructive replace."""
 
@@ -3508,7 +3805,7 @@ def test_a_public_replacement_racing_retirement_failure_is_never_overwritten(
         def _failing_certify(self, target_fd, candidate, digest):  # type: ignore[no-untyped-def]
             if not fired and candidate.startswith(reconcile_module._RETIRE_PREFIX):
                 fired.append(True)
-                source.write_bytes(b"replacement\n")
+                source.write_bytes(replacement)
                 os.chmod(source, 0o600)
                 return None
             return real_certify(self, target_fd, candidate, digest)
@@ -3525,7 +3822,7 @@ def test_a_public_replacement_racing_retirement_failure_is_never_overwritten(
                 and os.fstat(dir_fd).st_ino == os.lstat(pending_day).st_ino
             ):
                 fired.append(True)
-                source.write_bytes(b"replacement\n")
+                source.write_bytes(replacement)
                 os.chmod(source, 0o600)
                 raise OSError(5, "planted retirement cleanup failure")
             return real_unlink(target, dir_fd=dir_fd)
@@ -3537,7 +3834,7 @@ def test_a_public_replacement_racing_retirement_failure_is_never_overwritten(
         assert fired == [True]
         assert first.quarantined == ()
         assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
-        assert source.read_bytes() == b"replacement\n"
+        assert source.read_bytes() == replacement
         retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
         assert len(retirements) == 1
         assert retirements[0].read_bytes() == b"junk\n"
@@ -3548,7 +3845,7 @@ def test_a_public_replacement_racing_retirement_failure_is_never_overwritten(
         assert list(pending_day.iterdir()) == []
         assert {entry.read_bytes() for entry in quarantine_day.iterdir()} == {
             b"junk\n",
-            b"replacement\n",
+            replacement,
         }
         third = reconciler.reconcile()
         assert third.quarantined == ()
@@ -3593,6 +3890,440 @@ def test_failed_source_retirement_cleans_only_its_empty_reservation_and_retries(
         targets = tuple(quarantine_day.iterdir())
         assert [entry.name for entry in targets] == ["batch-1.jsonl"]
         assert targets[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_failed_reservation_hardening_and_cleanup_converge_on_the_next_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later pass recovers when fchmod and its immediate cleanup each fail once."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    quarantine_day.mkdir(mode=0o700, parents=True)
+    os.chmod(quarantine_day.parent, 0o700)
+    os.chmod(quarantine_day, 0o700)
+    real_open = os.open
+    real_fchmod = os.fchmod
+    real_unlink = os.unlink
+    reservation_fds: set[int] = set()
+    failed: list[bool] = []
+    cleanup_failed: list[bool] = []
+
+    def _tracking_open(target, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        descriptor = real_open(target, flags, *args, **kwargs)
+        if str(target).startswith(reconcile_module._RETIRE_PREFIX) and flags & os.O_EXCL:
+            reservation_fds.add(descriptor)
+        return descriptor
+
+    def _failing_fchmod(descriptor: int, mode: int) -> None:
+        if descriptor in reservation_fds and not failed:
+            failed.append(True)
+            raise OSError(5, "planted reservation fchmod failure")
+        real_fchmod(descriptor, mode)
+
+    def _failing_cleanup_unlink(target, *, dir_fd=None):  # type: ignore[no-untyped-def]
+        if not cleanup_failed and str(target).startswith(reconcile_module._RETIRE_PREFIX):
+            cleanup_failed.append(True)
+            raise OSError(5, "planted reservation cleanup failure")
+        return real_unlink(target, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", _tracking_open)
+    monkeypatch.setattr(os, "fchmod", _failing_fchmod)
+    monkeypatch.setattr(os, "unlink", _failing_cleanup_unlink)
+    prior_umask = os.umask(0o777)
+    try:
+        first = reconciler.reconcile()
+    finally:
+        os.umask(prior_umask)
+    try:
+        assert failed == [True]
+        assert cleanup_failed == [True]
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert source.read_bytes() == b"junk\n"
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        assert stat.S_IMODE(os.stat(retirements[0]).st_mode) == 0
+        assert retirements[0].stat().st_size == 0
+        assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert SegmentAnomaly("", _DAY, "stale_temp", "staged_temporary") in second.anomalies
+        assert list(pending_day.iterdir()) == []
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+    finally:
+        database.close()
+
+
+def test_an_initial_reservation_fstat_failure_converges_on_the_next_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash-equivalent failure before identity capture leaves recoverable mode-000 debris."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    quarantine_day.mkdir(mode=0o700, parents=True)
+    os.chmod(quarantine_day.parent, 0o700)
+    os.chmod(quarantine_day, 0o700)
+    real_open = os.open
+    real_fstat = os.fstat
+    reservation_fds: set[int] = set()
+    failed: list[bool] = []
+
+    def _tracking_open(target, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        descriptor = real_open(target, flags, *args, **kwargs)
+        if str(target).startswith(reconcile_module._RETIRE_PREFIX) and flags & os.O_EXCL:
+            reservation_fds.add(descriptor)
+        return descriptor
+
+    def _failing_fstat(descriptor: int):
+        if descriptor in reservation_fds and not failed:
+            failed.append(True)
+            raise OSError(5, "planted reservation identity failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(os, "open", _tracking_open)
+    monkeypatch.setattr(os, "fstat", _failing_fstat)
+    prior_umask = os.umask(0o777)
+    try:
+        first = reconciler.reconcile()
+    finally:
+        os.umask(prior_umask)
+    try:
+        assert failed == [True]
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert source.read_bytes() == b"junk\n"
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        assert stat.S_IMODE(os.stat(retirements[0]).st_mode) == 0
+        assert retirements[0].stat().st_size == 0
+        assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert SegmentAnomaly("", _DAY, "stale_temp", "staged_temporary") in second.anomalies
+        assert list(pending_day.iterdir()) == []
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+    finally:
+        database.close()
+
+
+def test_a_persisted_empty_retirement_reservation_is_cleaned_before_source_retry(
+    tmp_path: Path,
+) -> None:
+    """A clean process can recover crash debris created before reservation hardening."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    reservation = _plant_empty_retirement_reservation(source)
+    try:
+        assert stat.S_IMODE(os.stat(reservation).st_mode) == 0
+        report = reconciler.reconcile()
+        assert len(report.quarantined) == 1
+        assert SegmentAnomaly("", _DAY, "stale_temp", "staged_temporary") in report.anomalies
+        assert list(pending_day.iterdir()) == []
+        assert (spool_root / "quarantine" / _DAY / "batch-1.jsonl").read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_a_real_empty_retired_source_is_copied_instead_of_cleaned_as_a_reservation(
+    tmp_path: Path,
+) -> None:
+    """Matching encoded identity distinguishes an empty retired source from empty debris."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"temporary")
+    source.write_bytes(b"")
+    os.chmod(source, 0o600)
+    snapshot = FileSnapshot.from_stat(os.stat(source, follow_symlinks=False))
+    retirement = source.with_name(reconcile_module._retirement_name(snapshot, "batch-1.jsonl"))
+    os.replace(source, retirement)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == (QuarantinedFile("", _DAY, "stale_temp"),)
+        assert SegmentAnomaly("", _DAY, "stale_temp", "staged_temporary") in report.anomalies
+        assert list(retirement.parent.iterdir()) == []
+        assert (spool_root / "quarantine" / _DAY / "batch-1.jsonl").read_bytes() == b""
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("replacement", (b"", b"replacement\n"), ids=("empty", "nonempty"))
+def test_replaced_reservation_is_preserved_and_quarantined_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: bytes
+) -> None:
+    """Snapshot drift preserves an unknown occupant, including an empty exact-0600 inode."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    reservation = _plant_empty_retirement_reservation(source)
+    real_cleanup = reconcile_module._Scan._cleanup_stale_reservation
+    replaced: list[bool] = []
+
+    def _replace_before_cleanup(self, day, name, day_identity, snapshot):  # type: ignore[no-untyped-def]
+        if not replaced:
+            replaced.append(True)
+            os.unlink(reservation)
+            reservation.write_bytes(replacement)
+            os.chmod(reservation, 0o600)
+        return real_cleanup(self, day, name, day_identity, snapshot)
+
+    monkeypatch.setattr(
+        reconcile_module._Scan, "_cleanup_stale_reservation", _replace_before_cleanup
+    )
+    try:
+        first = reconciler.reconcile()
+        assert replaced == [True]
+        assert first.complete
+        assert not first.recovery_safe
+        assert first.quarantined == ()
+        assert SegmentAnomaly("", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert source.read_bytes() == b"junk\n"
+        assert reservation.read_bytes() == replacement
+
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 2
+        assert list(source.parent.iterdir()) == []
+        assert {entry.read_bytes() for entry in (spool_root / "quarantine" / _DAY).iterdir()} == {
+            b"junk\n",
+            replacement,
+        }
+    finally:
+        database.close()
+
+
+def test_later_cleanup_uncertainty_reports_partial_recovery_without_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed cleanup plus later uncertainty stays inventory-complete but action-unsafe."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    header, frames = _segment()
+    content = build_segment_bytes(header, frames)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", content)
+    first_reservation = _plant_empty_retirement_reservation(source)
+    second_reservation = _plant_empty_retirement_reservation(source, "1.batch-1.jsonl")
+    ordered_reservations = sorted(
+        (first_reservation, second_reservation), key=lambda path: path.name
+    )
+    real_cleanup = reconcile_module._Scan._cleanup_stale_reservation
+    cleanups: list[str] = []
+
+    def _fail_second_cleanup(self, day, name, day_identity, snapshot):  # type: ignore[no-untyped-def]
+        cleanups.append(name)
+        if len(cleanups) == 2:
+            return "uncertain"
+        return real_cleanup(self, day, name, day_identity, snapshot)
+
+    monkeypatch.setattr(reconcile_module._Scan, "_cleanup_stale_reservation", _fail_second_cleanup)
+    try:
+        report = reconciler.reconcile()
+        assert cleanups == [path.name for path in ordered_reservations]
+        assert report.complete
+        assert not report.recovery_safe
+        assert report.registered == ()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        assert _count(database) == 0
+        assert not ordered_reservations[0].exists()
+        assert ordered_reservations[1].exists()
+        assert source.read_bytes() == content
+    finally:
+        database.close()
+
+
+def test_pending_day_displacement_before_deferred_cleanup_unlinks_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleanup drift invalidates the pass, including an otherwise valid orphan registration."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    header, frames = _segment()
+    source = _publish_orphan(
+        spool_root,
+        _DAY,
+        "batch-1.jsonl",
+        build_segment_bytes(header, frames),
+    )
+    reservation = _plant_empty_retirement_reservation(source)
+    displaced = source.parent.with_name("displaced")
+    real_cleanup = reconcile_module._Scan._cleanup_stale_reservation
+    moved: list[bool] = []
+
+    def _displace_before_cleanup(self, day, name, day_identity, snapshot):  # type: ignore[no-untyped-def]
+        if not moved:
+            moved.append(True)
+            os.rename(source.parent, displaced)
+            source.parent.mkdir(mode=0o700)
+            os.chmod(source.parent, 0o700)
+        return real_cleanup(self, day, name, day_identity, snapshot)
+
+    monkeypatch.setattr(
+        reconcile_module._Scan, "_cleanup_stale_reservation", _displace_before_cleanup
+    )
+    try:
+        report = reconciler.reconcile()
+        assert moved == [True]
+        assert report.complete
+        assert not report.recovery_safe
+        assert report.registered == ()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        assert _count(database) == 0
+        assert (displaced / source.name).read_bytes() == build_segment_bytes(header, frames)
+        assert (displaced / reservation.name).stat().st_size == 0
+        assert list(source.parent.iterdir()) == []
+        assert not (spool_root / "quarantine" / _DAY / "batch-1.jsonl").exists()
+    finally:
+        database.close()
+
+
+def test_deferred_cleanup_uncertainty_blocks_a_writer_with_a_distinct_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete inventory without recovery authority is not mislabeled as a scan bound."""
+
+    database, store, spool_root, _reconciler_unused = _reconciler(tmp_path)
+    header, frames = _segment()
+    content = build_segment_bytes(header, frames)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", content)
+    reservation = _plant_empty_retirement_reservation(source)
+    displaced = source.parent.with_name("displaced")
+    real_cleanup = reconcile_module._Scan._cleanup_stale_reservation
+    moved: list[bool] = []
+
+    def _displace_before_cleanup(self, day, name, day_identity, snapshot):  # type: ignore[no-untyped-def]
+        if not moved:
+            moved.append(True)
+            os.rename(source.parent, displaced)
+            source.parent.mkdir(mode=0o700)
+            os.chmod(source.parent, 0o700)
+        return real_cleanup(self, day, name, day_identity, snapshot)
+
+    monkeypatch.setattr(
+        reconcile_module._Scan, "_cleanup_stale_reservation", _displace_before_cleanup
+    )
+    later_header, later_frames = _segment(batch_id="batch-2")
+    try:
+        with pytest.raises(SpoolError) as raised:
+            store.commit_segment(later_header, later_frames, committed_at=_NOW)
+        assert raised.value.code == "MH_SPOOL_RECOVERY"
+        assert moved == [True]
+        assert store.last_reconciliation.complete
+        assert not store.last_reconciliation.recovery_safe
+        assert _count(database) == 0
+        assert (displaced / source.name).read_bytes() == content
+        assert (displaced / reservation.name).stat().st_size == 0
+        assert not (source.parent / "batch-2.jsonl").exists()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("level", ("day", "root"))
+def test_pending_displacement_during_deferred_unlink_invalidates_the_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, level: str
+) -> None:
+    """An adjacent unlink race is reported uncertain and cannot register the queued orphan."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    header, frames = _segment()
+    content = build_segment_bytes(header, frames)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", content)
+    reservation = _plant_empty_retirement_reservation(source)
+    pending = spool_root / "pending"
+    displaced_root = tmp_path / "displaced-spool"
+    displaced_day = pending / "displaced"
+    real_unlink = os.unlink
+    moved: list[bool] = []
+
+    def _displacing_unlink(target, *, dir_fd=None):  # type: ignore[no-untyped-def]
+        if not moved and str(target) == reservation.name:
+            moved.append(True)
+            if level == "day":
+                os.rename(source.parent, displaced_day)
+                source.parent.mkdir(mode=0o700)
+                os.chmod(source.parent, 0o700)
+            else:
+                os.rename(spool_root, displaced_root)
+                spool_root.mkdir(mode=0o700)
+                os.chmod(spool_root, 0o700)
+                live_pending = spool_root / "pending"
+                live_pending.mkdir(mode=0o700)
+                os.chmod(live_pending, 0o700)
+                live_day = live_pending / _DAY
+                live_day.mkdir(mode=0o700)
+                os.chmod(live_day, 0o700)
+        return real_unlink(target, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", _displacing_unlink)
+    try:
+        report = reconciler.reconcile()
+        assert moved == [True]
+        assert report.complete
+        assert not report.recovery_safe
+        assert report.registered == ()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        assert _count(database) == 0
+        old_day = displaced_day if level == "day" else displaced_root / "pending" / _DAY
+        assert (old_day / source.name).read_bytes() == content
+        assert not (old_day / reservation.name).exists()
+        assert list(spool_root.joinpath("pending", _DAY).iterdir()) == []
+    finally:
+        database.close()
+
+
+def test_an_ambiguous_retirement_replace_error_preserves_the_landed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reservation cleanup must not delete source bytes when replace landed before an error."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_replace = os.replace
+    fired: list[bool] = []
+
+    def _landing_then_failing_replace(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,  # type: ignore[no-untyped-def]
+    ):
+        result = real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        if not fired and str(dst).startswith(reconcile_module._RETIRE_PREFIX):
+            fired.append(True)
+            raise OSError(5, "planted ambiguous retirement replace failure")
+        return result
+
+    monkeypatch.setattr(os, "replace", _landing_then_failing_replace)
+    try:
+        first = reconciler.reconcile()
+        assert fired == [True]
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert not source.exists()
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        assert retirements[0].read_bytes() == b"junk\n"
+        assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert list(pending_day.iterdir()) == []
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
     finally:
         database.close()
 

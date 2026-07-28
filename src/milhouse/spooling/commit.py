@@ -272,6 +272,10 @@ class DurableSpool:
             # A truncated inventory cannot prove orphan absence or batch uniqueness, so mandatory
             # recovery fails closed: neither acquisition nor a commit may proceed on a partial view.
             _fail("MH_SPOOL_INCOMPLETE", "reconciliation was truncated by a scan bound")
+        if not report.recovery_safe:
+            # Inventory was complete, but an exact prior-recovery cleanup could not be verified.
+            # No later recovery or writer mutation ran, and this is not a scan-bound failure.
+            _fail("MH_SPOOL_RECOVERY", "reconciliation recovery could not be verified")
         return report
 
     def commit_segment(
