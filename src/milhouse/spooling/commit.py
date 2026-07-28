@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from milhouse.config.filesystem import (
+    FileIdentity,
     SecureFileError,
     lexical_absolute_path,
     require_no_extended_acl,
@@ -162,20 +163,48 @@ def _fsync_private_dir(path: Path, subject: str) -> None:
 
 
 def _secure_child_dir(parent: Path, name: str) -> Path:
+    """Create/repair one private child through the shared descriptor-relative primitive."""
+
+    # Reconciliation owns the shared spool-directory primitive. Import lazily to preserve the
+    # commit -> reconciliation dependency direction used by writer acquisition.
+    from milhouse.spooling.reconcile import (
+        _dir_flags,
+        _ensure_private_dir_at,
+        _validated_dir_descriptor,
+    )
+
     child = parent / name
-    create_failed = False
+    parent_fd: int | None = None
+    child_fd: int | None = None
+    accepted = False
     try:
-        os.mkdir(child, _DIR_MODE)
-    except FileExistsError:
-        pass
-    except OSError:
-        create_failed = True
-    if create_failed:
+        parent_fd = os.open(parent, _dir_flags())
+        parent_identity = _validated_dir_descriptor(parent_fd)
+        if parent_identity is not None:
+            child_pair = _ensure_private_dir_at(parent_fd, name, sync_child=True)
+            if child_pair is not None:
+                child_fd, child_identity = child_pair
+                named_parent = FileIdentity.from_stat(os.stat(parent, follow_symlinks=False))
+                named_child = FileIdentity.from_stat(
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                )
+                accepted = (
+                    named_parent == parent_identity
+                    and _validated_dir_descriptor(parent_fd) == parent_identity
+                    and named_child == child_identity
+                    and _validated_dir_descriptor(child_fd) == child_identity
+                )
+    except (OSError, ValueError):
+        accepted = False
+    finally:
+        for descriptor in (child_fd, parent_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:  # pragma: no cover - defensive close failure
+                    accepted = False
+    if not accepted:
         _fail("MH_SPOOL_DIR", "a spool directory could not be created")
-    _require_private_dir(child, "spool directory")
-    # Fsync every accepted parent, including retry after a prior failed fsync left the child
-    # visible but not yet proven durable.
-    _fsync_private_dir(parent, "spool parent directory")
     return child
 
 

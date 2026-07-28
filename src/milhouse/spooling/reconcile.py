@@ -44,9 +44,11 @@ ancestor pathname still naming an opened directory, so the exclusive hold and ow
 directories exclude cooperating writers from the adjacent-proof syscall window; an uncooperative
 same-UID process is outside that documented model. Outcomes distinguish pre-move blocked,
 completed, and commit-uncertain, with every claim verified, never assumed. Inventory completeness
-and recovery/action authority are reported separately: an inventory-incomplete pass is mutation-
-free, while uncertainty after a bounded prior-recovery cleanup blocks all subsequent ledger/file
-mutations and writer handoff without falsely claiming the inventory was truncated.
+and recovery/action authority are reported separately: an inventory-incomplete pass performs no
+ledger, segment, quarantine, or staging action, though inventory may durably normalize an existing
+owned directory whose mode is a safe subset of 0700. Uncertainty after a bounded prior-recovery
+cleanup blocks all subsequent ledger/file mutations and writer handoff without falsely claiming the
+inventory was truncated.
 Foreign-named entries are reported but
 left in place (they have no well-formed quarantine name). The scan never deletes SPOOL DATA: the
 only unlinks are a retired source after its verified copy and both namespaces are re-proven, the
@@ -107,6 +109,7 @@ _SPOOL = "spool"
 _PENDING = "pending"
 _QUARANTINE = "quarantine"
 _STAGE_PREFIX = ".milhouse-stage-"
+_WRITER_STAGE_PATTERN = re.compile(r"\.milhouse-stage-[0-9a-f]{32}\Z", flags=re.ASCII)
 # Codes whose subject cannot be moved: the directory changed since inventory (the classified
 # object is not the present one), the file vanished, or it is not a regular file (copying a
 # symlink target or a directory would import unclassified content). These stay report-only.
@@ -198,12 +201,14 @@ class ReconciliationReport:
     """The outcome of one reconciliation scan.
 
     ``complete`` is False when any enumeration bound or unreadable/unsafe directory truncated the
-    inventory. An incomplete scan is certification- and mutation-free: it registers nothing,
-    certifies nothing healthy, and asserts no missing files, because a truncated inventory cannot
-    prove global batch uniqueness or absence. ``recovery_safe`` is False when the complete
-    inventory found prior-pass recovery debris but its bounded cleanup could not be verified. Such
-    a pass may already have durably removed an exact empty reservation; it performs no subsequent
-    registration, quarantine, or writer action and reports the uncertainty distinctly.
+    inventory. An incomplete scan is certification- and data-action-free: it registers nothing,
+    certifies nothing healthy, asserts no missing files, and never moves or unlinks a file, because
+    a truncated inventory cannot prove global batch uniqueness or absence. Inventory may already
+    have durably restored an existing owned directory from a mode subset of 0700 to its required
+    private envelope. ``recovery_safe`` is False when the complete inventory found prior-pass
+    recovery debris but its bounded cleanup could not be verified. Such a pass may already have
+    durably removed exact empty staging debris; it performs no subsequent registration, quarantine,
+    or writer action and reports the uncertainty distinctly.
     """
 
     registered: tuple[OrphanRegistration, ...]
@@ -343,23 +348,29 @@ def _validated_dir_descriptor(descriptor: int) -> FileIdentity | None:
     return None if unsafe else identity
 
 
-def _ensure_private_dir_at(parent_fd: int, name: str) -> tuple[int, FileIdentity] | None:
+def _ensure_private_dir_at(
+    parent_fd: int, name: str, *, create: bool = True, sync_child: bool = False
+) -> tuple[int, FileIdentity] | None:
     """Create-if-absent, durably name, validate, and OPEN one directory beneath a held parent.
 
     Everything is descriptor-relative to the already-validated parent, so no path re-walk can be
-    redirected. The parent is fsynced on EVERY acceptance, not only when this call created the
-    entry — a directory that survived an earlier failed parent fsync is never implicitly trusted
-    (round-2 P1). Returns the OPEN no-follow descriptor plus its exact identity, or None; the
-    caller owns the descriptor.
+    redirected. Only an owned directory whose mode is an exact subset of 0700 can be hardened; a
+    symlink, non-directory, foreign owner, loose/special mode, ACL, or identity replacement is
+    refused. The parent name is fsynced on every acceptance; a newly hardened child is also
+    fsynced, and ``sync_child=True`` makes the writer re-prove child durability even when its mode
+    was already exact after an earlier interrupted attempt. ``create=False`` repairs only an
+    existing name and never recreates one that disappeared during inventory. Returns the OPEN
+    no-follow descriptor plus its exact identity, or None; the caller owns the descriptor.
     """
 
     descriptor: int | None = None
     identity: FileIdentity | None = None
     try:
-        try:
-            os.mkdir(name, _DIR_MODE, dir_fd=parent_fd)
-        except FileExistsError:
-            pass
+        if create:
+            try:
+                os.mkdir(name, _DIR_MODE, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
         info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         mode = stat.S_IMODE(info.st_mode)
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != _current_uid() or mode & ~_DIR_MODE:
@@ -382,13 +393,61 @@ def _ensure_private_dir_at(parent_fd: int, name: str) -> tuple[int, FileIdentity
                 )
             else:
                 os.chmod(name, _DIR_MODE, dir_fd=parent_fd)
-        if _fsync_descriptor(parent_fd):
-            descriptor = os.open(name, _dir_flags(), dir_fd=parent_fd)
-            if not hardened or _fsync_descriptor(descriptor):
-                identity = _validated_dir_descriptor(descriptor)
-                if identity != expected_identity:
-                    identity = None
+        descriptor = os.open(name, _dir_flags(), dir_fd=parent_fd)
+        opened_identity = _validated_dir_descriptor(descriptor)
+        named_identity = FileIdentity.from_stat(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        if opened_identity == expected_identity and named_identity == expected_identity:
+            child_synced = not (hardened or sync_child) or _fsync_descriptor(descriptor)
+            parent_synced = _fsync_descriptor(parent_fd)
+            if (
+                child_synced
+                and parent_synced
+                and _validated_dir_descriptor(descriptor) == expected_identity
+                and FileIdentity.from_stat(os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+                == expected_identity
+            ):
+                identity = expected_identity
     except (NotImplementedError, OSError, ValueError):
+        identity = None
+    if identity is None or descriptor is None:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover - defensive close failure
+                pass
+        return None
+    return descriptor, identity
+
+
+def _open_or_repair_private_dir_at(parent_fd: int, name: str) -> tuple[int, FileIdentity] | None:
+    """Open an exact private directory, or durably repair only a safe tighter-mode remnant.
+
+    Ordinary inventory must not inject directory fsyncs into already-valid namespaces: those fsyncs
+    are mutation-boundary evidence for writer/quarantine creation and would alter failure ordering.
+    A stricter owner-only directory, however, is an interrupted creation artifact and is repaired
+    through the full durable primitive without ever creating an absent replacement.
+    """
+
+    descriptor: int | None = None
+    identity: FileIdentity | None = None
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        mode = stat.S_IMODE(info.st_mode)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != _current_uid() or mode & ~_DIR_MODE:
+            return None
+        if mode != _DIR_MODE:
+            return _ensure_private_dir_at(parent_fd, name, create=False)
+        expected_identity = FileIdentity.from_stat(info)
+        descriptor = os.open(name, _dir_flags(), dir_fd=parent_fd)
+        if (
+            _validated_dir_descriptor(descriptor) == expected_identity
+            and FileIdentity.from_stat(os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+            == expected_identity
+        ):
+            identity = expected_identity
+    except OSError:
         identity = None
     if identity is None or descriptor is None:
         if descriptor is not None:
@@ -503,14 +562,21 @@ def _retirement_candidate(name: str, snapshot: FileSnapshot) -> str | None:
     return candidate if identity == FileIdentity(snapshot.device, snapshot.inode) else None
 
 
-def _failed_reservation_snapshot(name: str, info: os.stat_result) -> FileSnapshot | None:
-    """Recognize only an empty pass-reservation inode left at an encoded retirement name."""
+def _failed_staging_snapshot(name: str, info: os.stat_result) -> FileSnapshot | None:
+    """Recognize only exact empty private staging debris safe for deferred unlink.
+
+    Two create-before-hardening boundaries can leave an owned zero-byte file with a mode stricter
+    than 0600: a quarantine retirement reservation and the generic writer's generated 32-hex stage.
+    Arbitrary stage names, the live retired source inode, exact-0600 files, nonempty content, loose
+    modes, links, and non-regular/foreign objects never gain cleanup authority.
+    """
 
     parts = _retirement_parts(name)
     identity = FileIdentity.from_stat(info)
+    failed_retirement_reservation = parts is not None and parts[0] != identity
+    failed_writer_stage = _WRITER_STAGE_PATTERN.fullmatch(name) is not None
     if (
-        parts is None
-        or parts[0] == identity
+        (not failed_retirement_reservation and not failed_writer_stage)
         or not stat.S_ISREG(info.st_mode)
         or info.st_uid != _current_uid()
         or info.st_nlink != 1
@@ -647,7 +713,7 @@ class _Scan:
         "_move_failures",
         "_pending_quarantines",
         "_pending_registrations",
-        "_pending_reservation_cleanups",
+        "_pending_staging_cleanups",
         "_quarantined",
         "_recovery_safe",
         "_registered",
@@ -666,8 +732,8 @@ class _Scan:
         self._pending_quarantines: list[
             tuple[str, str, FileIdentity, FileSnapshot, str, str, str]
         ] = []
-        # (day, name, day_identity, exact empty-reservation snapshot)
-        self._pending_reservation_cleanups: list[tuple[str, str, FileIdentity, FileSnapshot]] = []
+        # (day, name, day_identity, exact empty restricted-mode staging snapshot)
+        self._pending_staging_cleanups: list[tuple[str, str, FileIdentity, FileSnapshot]] = []
         self._quarantined: list[QuarantinedFile] = []
         self._move_failures: list[SegmentAnomaly] = []
         self._anomalies: list[SegmentAnomaly] = []
@@ -787,10 +853,11 @@ class _Scan:
                 if self._capped():
                     self._complete = False
                 if self._complete:
-                    # Mutation happens only after complete, within-bounds classification proved
-                    # every candidate batch id globally unique and the anomaly budget was never
-                    # exhausted.
-                    for day, name, day_identity, snapshot in self._pending_reservation_cleanups:
+                    # Ledger, segment, quarantine, and staging mutations happen only after complete,
+                    # within-bounds classification proved every candidate batch id globally unique
+                    # and the anomaly budget was never exhausted. Inventory may already have
+                    # normalized only a verified existing private-directory mode subset.
+                    for day, name, day_identity, snapshot in self._pending_staging_cleanups:
                         outcome = self._cleanup_stale_reservation(day, name, day_identity, snapshot)
                         if outcome is not None:
                             self._move_failures.append(
@@ -839,7 +906,7 @@ class _Scan:
                 if not self._complete or not self._recovery_safe:
                     self._pending_registrations.clear()
                     self._pending_quarantines.clear()
-                    self._pending_reservation_cleanups.clear()
+                    self._pending_staging_cleanups.clear()
 
                 report = ReconciliationReport(
                     registered=tuple(self._registered),
@@ -920,7 +987,7 @@ class _Scan:
         try:
             root_fd = root_descriptors[-1]
             try:
-                pending_fd = os.open(_PENDING, _dir_flags(), dir_fd=root_fd)
+                os.stat(_PENDING, dir_fd=root_fd, follow_symlinks=False)
             except FileNotFoundError:
                 # Absence is a valid empty spool only when the held root still has its complete
                 # envelope and remains the configured live root at the decision point.
@@ -935,19 +1002,20 @@ class _Scan:
                 self._anomaly("", "", "foreign_name", "pending_unsafe")
                 self._complete = False
                 return []
-            held_descriptors = (*root_descriptors, pending_fd)
-            pending_identity = _validated_dir_descriptor(pending_fd)
-            if pending_identity is None:
+            pending_pair = _open_or_repair_private_dir_at(root_fd, _PENDING)
+            if pending_pair is None:
                 self._anomaly("", "", "foreign_name", "pending_unsafe")
                 self._complete = False
                 return []
+            pending_fd, pending_identity = pending_pair
+            held_descriptors = (*root_descriptors, pending_fd)
             pending_identities = (*root_identities, pending_identity)
             if not _descriptors_match(held_descriptors, pending_identities):
                 self._anomaly("", "", "foreign_name", "pending_changed")
                 self._complete = False
                 return []
-            day_names, pending_identity, problem = _secure_names_from_descriptor(pending_fd)
-            if problem is not None or pending_identity != pending_identities[-1]:
+            day_names, scanned_pending_identity, problem = _secure_names_from_descriptor(pending_fd)
+            if problem is not None or scanned_pending_identity != pending_identities[-1]:
                 self._anomaly("", "", "foreign_name", f"pending_{problem or 'changed'}")
                 self._complete = False
                 return []
@@ -1000,8 +1068,14 @@ class _Scan:
             day_identity: FileIdentity | None = None
             entry_problem: str | None = None
             try:
-                day_fd = os.open(day, _dir_flags(), dir_fd=pending_fd)
-                entries, day_identity, entry_problem = _secure_names_from_descriptor(day_fd)
+                day_pair = _open_or_repair_private_dir_at(pending_fd, day)
+                if day_pair is None:
+                    entry_problem = "unsafe"
+                else:
+                    day_fd, expected_day_identity = day_pair
+                    entries, day_identity, entry_problem = _secure_names_from_descriptor(day_fd)
+                    if entry_problem is None and day_identity != expected_day_identity:
+                        entry_problem = "changed"
             except OSError as error:
                 entry_problem = (
                     "unsafe" if error.errno in {errno.ELOOP, errno.ENOTDIR} else "unreadable"
@@ -1023,21 +1097,20 @@ class _Scan:
                 self._scanned += 1
                 if name.startswith(_STAGE_PREFIX):
                     # A crashed writer's staged temporary is never committed. Its leaf is still
-                    # inspected no-follow before quarantine is queued. A zero-byte retirement
-                    # reservation whose inode does not match the source identity encoded in its
-                    # name is safe cleanup debris, including when a restrictive umask plus a crash
-                    # left it unreadable before fchmod. Defer all mutation until inventory
-                    # completes.
+                    # inspected no-follow before quarantine is queued. Only an exact generated
+                    # writer stage or retirement reservation that is owned, zero-byte, single-link,
+                    # regular, and tighter than 0600 is safe cleanup debris after restrictive-umask
+                    # interruption. Defer all mutation until inventory completes.
                     self._anomaly("", day, "stale_temp", "staged_temporary")
-                    reservation_snapshot: FileSnapshot | None = None
+                    cleanup_snapshot: FileSnapshot | None = None
                     try:
-                        reservation_info = os.stat(name, dir_fd=day_fd, follow_symlinks=False)
-                        reservation_snapshot = _failed_reservation_snapshot(name, reservation_info)
+                        staging_info = os.stat(name, dir_fd=day_fd, follow_symlinks=False)
+                        cleanup_snapshot = _failed_staging_snapshot(name, staging_info)
                     except OSError:
                         pass
-                    if reservation_snapshot is not None:
-                        self._pending_reservation_cleanups.append(
-                            (day, name, day_identity, reservation_snapshot)
+                    if cleanup_snapshot is not None:
+                        self._pending_staging_cleanups.append(
+                            (day, name, day_identity, cleanup_snapshot)
                         )
                     else:
                         self._queue_quarantine(day, name, day_identity, "", "stale_temp")
@@ -1754,14 +1827,13 @@ class _Scan:
         day_identity: FileIdentity,
         snapshot: FileSnapshot,
     ) -> str | None:
-        """Remove only exact empty retirement debris inventoried by this complete pass.
+        """Remove only exact empty restricted-mode staging debris inventoried by this pass.
 
-        A process can stop after creating the private reservation but before capturing its
-        identity or tightening its mode. The next pass recognizes only a zero-byte, owned,
-        single-link regular file whose inode differs from the source identity encoded in the
-        reserved name. This method then reopens and rebinds the complete pending chain, proves
-        the exact inventoried snapshot twice immediately before unlink, fsyncs the directory,
-        and proves absence. Any drift is preserved and reported as uncertain.
+        A process can stop after creating a writer stage or private retirement reservation but
+        before tightening its mode. The next pass recognizes only the exact generated namespace
+        and safe empty shape. This method then reopens and rebinds the complete pending chain,
+        proves the exact inventoried snapshot twice immediately before unlink, fsyncs the
+        directory, and proves absence. Any drift is preserved and reported as uncertain.
         """
 
         source_chain = self._open_pending_chain(day, day_identity)
@@ -1773,7 +1845,7 @@ class _Scan:
             initial = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
             if (
                 FileSnapshot.from_stat(initial) != snapshot
-                or _failed_reservation_snapshot(name, initial) != snapshot
+                or _failed_staging_snapshot(name, initial) != snapshot
             ):
                 return "uncertain"
             if not self._pending_binding_holds(day, source_identities):
@@ -1781,7 +1853,7 @@ class _Scan:
             current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
             if (
                 FileSnapshot.from_stat(current) != snapshot
-                or _failed_reservation_snapshot(name, current) != snapshot
+                or _failed_staging_snapshot(name, current) != snapshot
             ):
                 return "uncertain"
 

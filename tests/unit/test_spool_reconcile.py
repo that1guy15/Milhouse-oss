@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -150,6 +151,98 @@ def _count(database, table: str = "_segments") -> int:
 
 
 # --- empty and healthy ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("level", ["pending", "day"])
+def test_reconciliation_repairs_owned_mode_subset_pending_directories(
+    tmp_path: Path, level: str
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    pending = spool_root / "pending"
+    pending.mkdir(mode=0o700)
+    os.chmod(pending, 0 if level == "pending" else 0o700)
+    day_dir = pending / _DAY
+    if level == "day":
+        day_dir.mkdir(mode=0o700)
+        os.chmod(day_dir, 0)
+    try:
+        report = reconciler.reconcile()
+        assert report.complete
+        assert report.recovery_safe
+        assert report.anomalies == ()
+        assert stat.S_IMODE(os.lstat(pending).st_mode) == 0o700
+        if level == "day":
+            assert stat.S_IMODE(os.lstat(day_dir).st_mode) == 0o700
+    finally:
+        database.close()
+
+
+def test_incomplete_inventory_only_normalizes_a_safe_pending_directory(
+    tmp_path: Path,
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    pending = spool_root / "pending"
+    day_dir = pending / _DAY
+    day_dir.mkdir(mode=0o700, parents=True)
+    os.chmod(day_dir, 0o777)
+    day_identity = (os.lstat(day_dir).st_dev, os.lstat(day_dir).st_ino)
+    pending_identity = (os.lstat(pending).st_dev, os.lstat(pending).st_ino)
+    os.chmod(pending, 0)
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.quarantined == ()
+        assert report.healthy == 0
+        assert report.anomalies == (SegmentAnomaly("", _DAY, "foreign_name", "day_unsafe"),)
+        assert stat.S_IMODE(os.lstat(pending).st_mode) == 0o700
+        assert (os.lstat(pending).st_dev, os.lstat(pending).st_ino) == pending_identity
+        assert stat.S_IMODE(os.lstat(day_dir).st_mode) == 0o777
+        assert (os.lstat(day_dir).st_dev, os.lstat(day_dir).st_ino) == day_identity
+        assert tuple(path.name for path in pending.iterdir()) == (_DAY,)
+        assert _count(database) == 0
+    finally:
+        os.chmod(day_dir, 0o700)
+        database.close()
+
+
+def test_open_private_directory_rejects_an_unvalidated_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(mode=0o700, parents=True)
+    os.chmod(parent, 0o700)
+    os.chmod(child, 0o700)
+    parent_fd = os.open(parent, reconcile_module._dir_flags())
+    try:
+        assert reconcile_module._open_or_repair_private_dir_at(parent_fd, "missing") is None
+        monkeypatch.setattr(reconcile_module, "_validated_dir_descriptor", lambda _fd: None)
+        assert reconcile_module._open_or_repair_private_dir_at(parent_fd, "child") is None
+        assert child.is_dir()
+    finally:
+        os.close(parent_fd)
+
+
+def test_nonempty_tight_writer_stage_is_never_cleanup_authority(tmp_path: Path) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    pending = spool_root / "pending"
+    day_dir = pending / _DAY
+    day_dir.mkdir(mode=0o700, parents=True)
+    os.chmod(pending, 0o700)
+    os.chmod(day_dir, 0o700)
+    stage = day_dir / f"{reconcile_module._STAGE_PREFIX}{'a' * 32}"
+    stage.write_bytes(b"preserve")
+    os.chmod(stage, 0)
+    try:
+        report = reconciler.reconcile()
+        assert stage.exists()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("", _DAY, "stale_temp", "staged_temporary") in report.anomalies
+        assert SegmentAnomaly("", _DAY, "quarantine_blocked", "unsafe") in report.anomalies
+    finally:
+        os.chmod(stage, 0o600)
+        database.close()
 
 
 def test_reconciling_an_empty_spool_reports_nothing(tmp_path: Path) -> None:

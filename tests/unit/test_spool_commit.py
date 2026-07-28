@@ -30,6 +30,7 @@ from milhouse.spooling import (
     spool_frame_line,
 )
 from milhouse.spooling import commit as commit_module
+from milhouse.spooling import reconcile as reconcile_module
 from milhouse.spooling.ledger import (
     authorize_local_persistence,
     load_exporters,
@@ -165,6 +166,151 @@ def test_commit_publishes_and_records_each_authorized_privacy_class(
         # the ledger digest/size describe the exact published bytes (single snapshot)
         assert record.byte_size == len(content)
         assert record.file_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    finally:
+        database.close()
+
+
+def test_commit_hardens_pending_directories_under_a_restrictive_umask(tmp_path: Path) -> None:
+    database, store, spool_root = _spool(tmp_path)
+    prior_umask = os.umask(0o777)
+    try:
+        frames = _frames()
+        store.commit_segment(_header(frames), frames, committed_at=_NOW)
+    finally:
+        os.umask(prior_umask)
+    try:
+        pending = spool_root / "pending"
+        day_dir = pending / _DAY
+        assert stat.S_IMODE(os.lstat(pending).st_mode) == 0o700
+        assert stat.S_IMODE(os.lstat(day_dir).st_mode) == 0o700
+        assert stat.S_IMODE(os.lstat(day_dir / "batch-1.jsonl").st_mode) == 0o600
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("failed_level", ["pending", "day"])
+def test_interrupted_pending_directory_hardening_converges_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_level: str
+) -> None:
+    database, store, spool_root = _spool(tmp_path)
+    pending = spool_root / "pending"
+    if failed_level == "day":
+        pending.mkdir(mode=0o700)
+        os.chmod(pending, 0o700)
+    failed_name = "pending" if failed_level == "pending" else _DAY
+    failed_path = pending if failed_level == "pending" else pending / _DAY
+    real_chmod = os.chmod
+    failed: list[str] = []
+
+    def _failing_chmod(target, mode, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not failed and target == failed_name:
+            failed.append(target)
+            raise OSError("planted directory hardening interruption")
+        return real_chmod(target, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", _failing_chmod)
+    frames = _frames()
+    header = _header(frames)
+    prior_umask = os.umask(0o777)
+    try:
+        with pytest.raises(SpoolError) as captured:
+            store.commit_segment(header, frames, committed_at=_NOW)
+    finally:
+        os.umask(prior_umask)
+    try:
+        assert captured.value.code == "MH_SPOOL_DIR"
+        assert failed == [failed_name]
+        assert stat.S_IMODE(os.lstat(failed_path).st_mode) == 0
+
+        store.commit_segment(header, frames, committed_at=_NOW)
+        assert stat.S_IMODE(os.lstat(pending).st_mode) == 0o700
+        assert stat.S_IMODE(os.lstat(pending / _DAY).st_mode) == 0o700
+        assert (pending / _DAY / "batch-1.jsonl").is_file()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("failed_level", ["pending", "day"])
+def test_pending_child_fsync_failure_blocks_and_converges_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_level: str
+) -> None:
+    database, store, spool_root = _spool(tmp_path)
+    pending = spool_root / "pending"
+    if failed_level == "day":
+        pending.mkdir(mode=0o700)
+        os.chmod(pending, 0o700)
+    failed_path = pending if failed_level == "pending" else pending / _DAY
+    real_fsync = os.fsync
+    failed = False
+
+    def _failing_fsync(descriptor: int) -> None:
+        nonlocal failed
+        info = os.fstat(descriptor)
+        if not failed and failed_path.exists():
+            expected = os.lstat(failed_path)
+            if (info.st_dev, info.st_ino) == (expected.st_dev, expected.st_ino):
+                failed = True
+                raise OSError("planted child directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", _failing_fsync)
+    frames = _frames()
+    header = _header(frames)
+    try:
+        with pytest.raises(SpoolError) as captured:
+            store.commit_segment(header, frames, committed_at=_NOW)
+        assert captured.value.code == "MH_SPOOL_DIR"
+        assert failed
+        assert stat.S_IMODE(os.lstat(failed_path).st_mode) == 0o700
+
+        store.commit_segment(header, frames, committed_at=_NOW)
+        assert (pending / _DAY / "batch-1.jsonl").is_file()
+    finally:
+        database.close()
+
+
+def test_pre_fchmod_writer_stage_is_cleaned_before_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, store, spool_root = _spool(tmp_path)
+    day_dir = spool_root / "pending" / _DAY
+    day_dir.mkdir(mode=0o700, parents=True)
+    os.chmod(spool_root / "pending", 0o700)
+    os.chmod(day_dir, 0o700)
+    real_fchmod = os.fchmod
+    failed = False
+
+    def _failing_fchmod(descriptor: int, mode: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("planted pre-write fchmod failure")
+        real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(os, "fchmod", _failing_fchmod)
+    frames = _frames()
+    header = _header(frames)
+    prior_umask = os.umask(0o777)
+    try:
+        with pytest.raises(SpoolError) as captured:
+            store.commit_segment(header, frames, committed_at=_NOW)
+    finally:
+        os.umask(prior_umask)
+    try:
+        assert captured.value.code == "MH_SPOOL_WRITE"
+        stages = tuple(day_dir.glob(".milhouse-stage-*"))
+        assert len(stages) == 1
+        stage = stages[0]
+        assert len(stage.name.removeprefix(".milhouse-stage-")) == 32
+        assert stat.S_IMODE(os.lstat(stage).st_mode) == 0
+        assert os.lstat(stage).st_size == 0
+
+        store.commit_segment(header, frames, committed_at=_NOW)
+        assert not stage.exists()
+        assert (day_dir / "batch-1.jsonl").is_file()
+        assert store.last_reconciliation.complete
+        assert store.last_reconciliation.recovery_safe
+        assert any(anomaly.kind == "stale_temp" for anomaly in store.last_reconciliation.anomalies)
     finally:
         database.close()
 
@@ -738,7 +884,7 @@ def test_child_directory_creation_failure_is_normalized(
     parent.mkdir(mode=0o700)
     os.chmod(parent, 0o700)
 
-    def _fail_mkdir(_path: Path, _mode: int) -> None:
+    def _fail_mkdir(_path, _mode, *args, **kwargs):  # type: ignore[no-untyped-def]
         raise OSError("planted mkdir failure")
 
     monkeypatch.setattr(commit_module.os, "mkdir", _fail_mkdir)
@@ -747,3 +893,19 @@ def test_child_directory_creation_failure_is_normalized(
     assert captured.value.code == "MH_SPOOL_DIR"
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
+
+
+def test_child_directory_creation_rejects_an_unvalidated_parent_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir(mode=0o700)
+    os.chmod(parent, 0o700)
+
+    monkeypatch.setattr(reconcile_module, "_validated_dir_descriptor", lambda _fd: None)
+    with pytest.raises(SpoolError) as captured:
+        commit_module._secure_child_dir(parent, "pending")
+    assert captured.value.code == "MH_SPOOL_DIR"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert not (parent / "pending").exists()
