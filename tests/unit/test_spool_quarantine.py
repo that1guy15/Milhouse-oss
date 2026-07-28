@@ -1515,9 +1515,28 @@ def test_quarantine_directories_are_hardened_under_a_restrictive_umask(
 
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    native_chmod = os.chmod
     if without_nofollow_chmod:
         monkeypatch.setattr(
-            os, "supports_follow_symlinks", os.supports_follow_symlinks - {os.chmod}
+            os, "supports_follow_symlinks", os.supports_follow_symlinks - {native_chmod}
+        )
+    else:
+
+        def _supported_chmod(
+            target,
+            mode,
+            *,
+            dir_fd=None,
+            follow_symlinks=True,  # type: ignore[no-untyped-def]
+        ) -> None:
+            assert follow_symlinks is False
+            native_chmod(target, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "chmod", _supported_chmod)
+        monkeypatch.setattr(
+            os,
+            "supports_follow_symlinks",
+            (os.supports_follow_symlinks - {native_chmod}) | {_supported_chmod},
         )
     prior_umask = os.umask(0o777)
     try:
