@@ -30,8 +30,10 @@ from milhouse.spooling import (
     spool_content_sha256,
     spool_frame_line,
 )
+from milhouse.spooling import commit as commit_module
 from milhouse.spooling import reconcile as reconcile_module
 from milhouse.state import (
+    ControlDatabase,
     GlobalCommitBarrier,
     StateError,
     initialize_control_state,
@@ -251,7 +253,7 @@ def test_acquiring_the_writer_reconciles_orphans_before_any_commit(tmp_path: Pat
 
 
 def test_a_commit_through_a_long_lived_writer_registers_a_later_crash_orphan(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # the gate review's reproduction: writer A outlives its constructor; writer B then crashes a
     # commit after publication; a commit through A must register B's orphan BEFORE A's new row
@@ -273,19 +275,16 @@ def test_a_commit_through_a_long_lived_writer_registers_a_later_crash_orphan(
             installation_id=_INSTALLATION_ID,
         )
 
-        class _TxnFailDatabase:
-            @property
-            def path(self) -> Path:
-                return second.path
+        real_transaction = ControlDatabase.transaction
 
-            @property
-            def connection(self) -> object:
-                return second.connection
-
-            def transaction(self) -> object:
+        @contextlib.contextmanager
+        def _fail_second_transaction(self):  # type: ignore[no-untyped-def]
+            if self is second:
                 raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
+            with real_transaction(self) as connection:
+                yield connection
 
-        writer_b._database = _TxnFailDatabase()  # type: ignore[attr-defined]
+        monkeypatch.setattr(ControlDatabase, "transaction", _fail_second_transaction)
         between_header, between_frames = _segment(batch_id="between-1")
         with pytest.raises(SpoolError) as crashed:
             writer_b.commit_segment(between_header, between_frames, committed_at=_NOW)
@@ -395,7 +394,9 @@ def test_acquisition_barrier_failure_surfaces_a_spool_error(tmp_path: Path) -> N
         database.close()
 
 
-def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) -> None:
+def test_a_crashed_commit_retry_converges_after_reacquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # end-to-end convergence: crash a real commit after publication, re-acquire via the normal
     # writer API, and prove a same-batch retry is distinguishable from an unrecoverable collision
     database, barrier, spool_root = _control(tmp_path)
@@ -408,23 +409,15 @@ def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) ->
         )
         header, frames = _segment(batch_id="batch-1")
 
-        class _TxnFailDatabase:
-            # reads (the pre-commit scan) succeed; only the write-side boundary fails, exactly
-            # like a crash between publication and the ledger insert
-            @property
-            def path(self) -> Path:
-                return database.path
+        @contextlib.contextmanager
+        def _fail_transaction(_self):  # type: ignore[no-untyped-def]
+            raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
+            yield  # pragma: no cover - contextmanager requires a generator
 
-            @property
-            def connection(self) -> object:
-                return database.connection
-
-            def transaction(self) -> object:
-                raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
-
-        store._database = _TxnFailDatabase()  # type: ignore[attr-defined]
-        with pytest.raises(SpoolError) as crashed:
-            store.commit_segment(header, frames, committed_at=_NOW)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ControlDatabase, "transaction", _fail_transaction)
+            with pytest.raises(SpoolError) as crashed:
+                store.commit_segment(header, frames, committed_at=_NOW)
         assert crashed.value.code == "MH_SPOOL_COMMIT"  # published durably, no ledger row
         assert _count(database) == 0
 
@@ -448,36 +441,42 @@ def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) ->
         database.close()
 
 
-def test_the_no_gap_lock_protocol_holds_exclusive_across_reconcile_and_commit(
+def test_the_no_gap_protocol_hands_exclusive_recovery_to_shared_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # pin the no-gap protocol: acquisition reconciles under ONE exclusive hold, and every commit
-    # runs reconcile+publish+insert under ONE exclusive hold — never a shared publish, never an
-    # unlock window between reconciliation and publication
+    # Pin the plan-preserving no-gap protocol: writer acquisition reconciles exclusively; every
+    # commit then reconciles exclusively and converts that same main descriptor to shared before
+    # publication, while the gate prevents a cooperating writer from entering during the handoff.
     database, barrier, spool_root = _control(tmp_path)
     calls: list[str] = []
-    held_through_publish: list[bool] = []
-    pending = spool_root / "pending"
     real_exclusive = GlobalCommitBarrier.exclusive
-    real_shared = GlobalCommitBarrier.shared
+    real_handoff = GlobalCommitBarrier.exclusive_then_shared
+    real_publish = commit_module.publish_segment_bytes
 
     @contextlib.contextmanager
     def _spy_exclusive(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
-        calls.append("exclusive")
-        before = pending.exists()
+        calls.append("constructor_exclusive")
         with real_exclusive(self, blocking=blocking):
             yield
-        # if publication happened during THIS single hold, pending appears while it was held
-        held_through_publish.append(not before and pending.exists())
 
     @contextlib.contextmanager
-    def _spy_shared(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
-        calls.append("shared")
-        with real_shared(self, blocking=blocking):
-            yield
+    def _spy_handoff(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        with real_handoff(self, blocking=blocking) as transition:
+            calls.append("writer_exclusive")
+
+            def _recording_transition() -> None:
+                transition()
+                calls.append("writer_shared")
+
+            yield _recording_transition
+
+    def _spy_publish(path: Path, content: bytes) -> None:
+        calls.append("publish")
+        real_publish(path, content)
 
     monkeypatch.setattr(GlobalCommitBarrier, "exclusive", _spy_exclusive)
-    monkeypatch.setattr(GlobalCommitBarrier, "shared", _spy_shared)
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive_then_shared", _spy_handoff)
+    monkeypatch.setattr(commit_module, "publish_segment_bytes", _spy_publish)
 
     try:
         store = DurableSpool(
@@ -486,12 +485,15 @@ def test_the_no_gap_lock_protocol_holds_exclusive_across_reconcile_and_commit(
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
         )
-        assert calls == ["exclusive"]
+        assert calls == ["constructor_exclusive"]
         header, frames = _segment()
         store.commit_segment(header, frames, committed_at=_NOW)
-        # exactly one more exclusive hold covered the whole reconcile+publish+insert; no shared use
-        assert calls == ["exclusive", "exclusive"]
-        assert held_through_publish == [False, True]
+        assert calls == [
+            "constructor_exclusive",
+            "writer_exclusive",
+            "writer_shared",
+            "publish",
+        ]
     finally:
         database.close()
 
@@ -682,6 +684,117 @@ def test_exclusive_authority_is_bound_to_the_state_root(tmp_path: Path) -> None:
         )
         assert report.registered == (OrphanRegistration("orphan-1", _DAY),)
         assert _count(database_a) == 1
+    finally:
+        database_a.close()
+        database_b.close()
+
+
+def test_a_barrier_with_a_displaced_gate_is_not_authority_for_the_main_lock(
+    tmp_path: Path,
+) -> None:
+    database, _barrier, spool_root = _control(tmp_path)
+    tampered = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")
+    object.__setattr__(tampered, "_gate_path", tmp_path / "foreign" / "commit.lock.gate")
+    try:
+        with pytest.raises(SpoolError) as public_error:
+            SpoolReconciler(
+                database=database,
+                barrier=tampered,
+                spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
+            )
+        assert public_error.value.code == "MH_SPOOL_STORE"
+
+        with pytest.raises(SpoolError) as direct_error:
+            reconcile_module._Scan(database, spool_root, _INSTALLATION_ID).run(tampered)
+        assert direct_error.value.code == "MH_SPOOL_BARRIER"
+        assert not (spool_root / "pending").exists()
+        assert not (spool_root / "quarantine").exists()
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_a_direct_scan_rejects_a_foreign_spool_before_any_mutation(tmp_path: Path) -> None:
+    (tmp_path / "rootA").mkdir()
+    (tmp_path / "foreign").mkdir()
+    database, barrier, _spool_a = _control(tmp_path / "rootA")
+    foreign_spool = tmp_path / "foreign" / "spool"
+    foreign_spool.mkdir(mode=0o700)
+    os.chmod(foreign_spool, 0o700)
+    header, frames = _segment(batch_id="orphan-1")
+    source = _publish_orphan(
+        foreign_spool, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames)
+    )
+    try:
+        with pytest.raises(SpoolError) as captured:
+            reconcile_module._Scan(database, foreign_spool, _INSTALLATION_ID).run(barrier)
+        assert captured.value.code == "MH_SPOOL_BARRIER"
+        assert source.exists()
+        assert _count(database) == 0
+        assert not (foreign_spool / "quarantine").exists()
+    finally:
+        database.close()
+
+
+def test_a_direct_scan_uses_the_validated_path_not_a_symlink_dotdot_spelling(
+    tmp_path: Path,
+) -> None:
+    database, barrier, spool_root = _control(tmp_path)
+    foreign = tmp_path / "foreign"
+    foreign_child = foreign / "child"
+    foreign_child.mkdir(parents=True, mode=0o700)
+    os.chmod(foreign, 0o700)
+    os.chmod(foreign_child, 0o700)
+    (spool_root / "alias").symlink_to(foreign_child, target_is_directory=True)
+    raw_spool = spool_root / "alias" / ".."
+    source = _publish_orphan(
+        foreign,
+        _DAY,
+        f"{reconcile_module._STAGE_PREFIX}foreign.jsonl",
+        b"classified-canary\n",
+    )
+    try:
+        report = reconcile_module._Scan(database, raw_spool, _INSTALLATION_ID).run(barrier)
+        assert report.complete
+        assert report.quarantined == ()
+        assert report.anomalies == ()
+        assert source.read_bytes() == b"classified-canary\n"
+        assert not (foreign / "quarantine").exists()
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_a_control_database_label_cannot_spoof_its_live_sqlite_binding(tmp_path: Path) -> None:
+    (tmp_path / "rootA").mkdir()
+    (tmp_path / "rootB").mkdir()
+    database_a, barrier_a, spool_a = _control(tmp_path / "rootA")
+    database_b, _barrier_b, _spool_b = _control(tmp_path / "rootB")
+    spoof = ControlDatabase(
+        connection=database_b.connection,
+        path=database_a.path,
+        created=False,
+    )
+    header, frames = _segment(batch_id="orphan-1")
+    source = _publish_orphan(spool_a, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames))
+    try:
+        with pytest.raises(SpoolError) as public_error:
+            SpoolReconciler(
+                database=spoof,
+                barrier=barrier_a,
+                spool_root=spool_a,
+                installation_id=_INSTALLATION_ID,
+            )
+        assert public_error.value.code == "MH_SPOOL_STORE"
+
+        with pytest.raises(SpoolError) as direct_error:
+            reconcile_module._Scan(spoof, spool_a, _INSTALLATION_ID).run(barrier_a)
+        assert direct_error.value.code == "MH_SPOOL_BARRIER"
+        assert _count(database_a) == 0
+        assert _count(database_b) == 0
+        assert source.exists()
+        assert not (spool_a / "quarantine").exists()
     finally:
         database_a.close()
         database_b.close()
@@ -1831,6 +1944,7 @@ def test_the_reconciler_rejects_a_bad_binding_or_installation(tmp_path: Path) ->
                 "MH_SPOOL_STORE",
             ),
             ({"spool_root": tmp_path / "elsewhere"}, "MH_SPOOL_STORE"),
+            ({"spool_root": object()}, "MH_SPOOL_STORE"),
             ({"installation_id": "bad"}, "MH_SPOOL_IDENTITY"),
         ):
             base = {
@@ -1843,6 +1957,23 @@ def test_the_reconciler_rejects_a_bad_binding_or_installation(tmp_path: Path) ->
             with pytest.raises(SpoolError) as captured:
                 SpoolReconciler(**base)  # type: ignore[arg-type]
             assert captured.value.code == code
+    finally:
+        database.close()
+
+
+def test_a_direct_scan_normalizes_an_invalid_spool_root_before_mutation(tmp_path: Path) -> None:
+    database, barrier, _spool_root = _control(tmp_path)
+    try:
+        scan = reconcile_module._Scan(
+            database,
+            object(),  # type: ignore[arg-type]
+            _INSTALLATION_ID,
+        )
+        with pytest.raises(SpoolError) as captured:
+            scan.run(barrier)
+        assert captured.value.code == "MH_SPOOL_BARRIER"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
     finally:
         database.close()
 
@@ -1901,6 +2032,42 @@ def test_a_callback_state_error_is_not_mislabeled_as_barrier_failure(
             scan.run(barrier, **{callback_name: _fail})
         assert captured.value.code == "MH_STATE_TXN"
         # The failed callback unwound the context and released both lock files.
+        with barrier.exclusive(blocking=False):
+            pass
+    finally:
+        database.close()
+
+
+def test_a_writer_phase_transition_failure_is_normalized_before_the_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, barrier, spool_root = _control(tmp_path)
+    real_handoff = GlobalCommitBarrier.exclusive_then_shared
+    action_called = False
+
+    @contextlib.contextmanager
+    def _failing_handoff(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        with real_handoff(self, blocking=blocking):
+
+            def _fail_transition() -> None:
+                raise StateError("MH_STATE_BARRIER", "planted phase-transition failure")
+
+            yield _fail_transition
+
+    def _action() -> None:
+        nonlocal action_called
+        action_called = True
+
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive_then_shared", _failing_handoff)
+    try:
+        scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
+        with pytest.raises(SpoolError) as captured:
+            scan.run(barrier, action=_action)
+        assert captured.value.code == "MH_SPOOL_BARRIER"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+        assert not action_called
+        # The failed transition unwound the context and released both descriptors.
         with barrier.exclusive(blocking=False):
             pass
     finally:

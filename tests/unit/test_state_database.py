@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 from pathlib import Path
 
 import pytest
 
 from milhouse.state import ControlDatabase, StateError, open_control_database
+from milhouse.state import database as database_module
 
 
 def _private_dir(root: Path, name: str = "control") -> Path:
@@ -111,3 +113,55 @@ def test_open_control_database_returns_the_wrapper_type(tmp_path: Path) -> None:
         assert isinstance(database, ControlDatabase)
     finally:
         database.close()
+
+
+def test_live_database_path_validation_rejects_closed_and_non_connection_handles(
+    tmp_path: Path,
+) -> None:
+    closed = open_control_database(_db_path(tmp_path))
+    closed.close()
+    assert database_module._validated_database_path(closed) is None
+
+    mislabeled = ControlDatabase(
+        connection=object(),  # type: ignore[arg-type]
+        path=tmp_path / "control" / "milhouse.sqlite3",
+        created=False,
+    )
+    assert database_module._validated_database_path(mislabeled) is None
+
+
+def test_live_database_path_validation_rejects_unqueryable_and_non_file_main_handles(
+    tmp_path: Path,
+) -> None:
+    closed_connection = sqlite3.connect(tmp_path / "closed.sqlite3")
+    closed_connection.close()
+    unqueryable = ControlDatabase(
+        connection=closed_connection,
+        path=tmp_path / "closed.sqlite3",
+        created=False,
+    )
+    assert database_module._validated_database_path(unqueryable) is None
+
+    memory_connection = sqlite3.connect(":memory:")
+    memory = ControlDatabase(
+        connection=memory_connection,
+        path=tmp_path / "invented.sqlite3",
+        created=False,
+    )
+    try:
+        assert database_module._validated_database_path(memory) is None
+    finally:
+        memory.close()
+
+
+def test_live_database_path_validation_rejects_an_invalid_claimed_path(tmp_path: Path) -> None:
+    connection = sqlite3.connect(tmp_path / "live.sqlite3")
+    invalid = ControlDatabase(
+        connection=connection,
+        path=object(),  # type: ignore[arg-type]
+        created=False,
+    )
+    try:
+        assert database_module._validated_database_path(invalid) is None
+    finally:
+        invalid.close()

@@ -121,6 +121,70 @@ def test_noncontiguous_definitions_are_rejected(tmp_path: Path) -> None:
         database.close()
 
 
+@pytest.mark.parametrize(
+    "migration",
+    [
+        Migration(1, "", ("CREATE TABLE t (x)",)),
+        Migration(1, "empty_statements", ()),
+        Migration(1, "blank_statement", ("",)),
+    ],
+)
+def test_invalid_migration_definition_fields_are_rejected(
+    tmp_path: Path, migration: Migration
+) -> None:
+    database, barrier = _db_and_barrier(tmp_path)
+    try:
+        with pytest.raises(StateError) as captured:
+            migrate(database, (migration,), barrier=barrier, applied_at=_NOW)
+        assert captured.value.code == "MH_STATE_MIGRATION"
+    finally:
+        database.close()
+
+
+def test_migrate_rejects_a_non_tuple_definition_sequence(tmp_path: Path) -> None:
+    database, barrier = _db_and_barrier(tmp_path)
+    try:
+        with pytest.raises(StateError) as captured:
+            migrate(database, [_M1], barrier=barrier, applied_at=_NOW)  # type: ignore[arg-type]
+        assert captured.value.code == "MH_STATE_MIGRATION"
+    finally:
+        database.close()
+
+
+def test_migrate_rejects_an_invalid_timestamp(tmp_path: Path) -> None:
+    database, barrier = _db_and_barrier(tmp_path)
+    try:
+        with pytest.raises(StateError) as captured:
+            migrate(database, (_M1,), barrier=barrier, applied_at=datetime(2026, 7, 24, 12))
+        assert captured.value.code == "MH_STATE_MIGRATION"
+    finally:
+        database.close()
+
+
+def test_migrate_rejects_a_noncontiguous_applied_ledger(tmp_path: Path) -> None:
+    database, barrier = _db_and_barrier(tmp_path)
+    try:
+        migrate(database, (_M1, _M2), barrier=barrier, applied_at=_NOW)
+        with database.transaction() as connection:
+            connection.execute("DELETE FROM _schema_migrations WHERE version = 1")
+        with pytest.raises(StateError) as captured:
+            migrate(database, (_M1, _M2), barrier=barrier, applied_at=_NOW)
+        assert captured.value.code == "MH_STATE_MIGRATION"
+    finally:
+        database.close()
+
+
+def test_migrate_rejects_applied_versions_without_definitions(tmp_path: Path) -> None:
+    database, barrier = _db_and_barrier(tmp_path)
+    try:
+        migrate(database, (_M1, _M2), barrier=barrier, applied_at=_NOW)
+        with pytest.raises(StateError) as captured:
+            migrate(database, (_M1,), barrier=barrier, applied_at=_NOW)
+        assert captured.value.code == "MH_STATE_MIGRATION"
+    finally:
+        database.close()
+
+
 def test_a_failing_statement_rolls_back_atomically_without_leaking_sqlite_detail(
     tmp_path: Path,
 ) -> None:
@@ -164,5 +228,18 @@ def test_schema_version_is_read_only_on_a_fresh_database(tmp_path: Path) -> None
             ).fetchall()
         }
         assert "_schema_migrations" not in tables  # a read must never create the ledger
+    finally:
+        database.close()
+
+
+def test_schema_version_normalizes_an_underlying_sqlite_failure(tmp_path: Path) -> None:
+    database, _barrier = _db_and_barrier(tmp_path)
+    try:
+        database.connection.close()
+        with pytest.raises(StateError) as captured:
+            schema_version(database)
+        assert captured.value.code == "MH_STATE_MIGRATION"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
     finally:
         database.close()

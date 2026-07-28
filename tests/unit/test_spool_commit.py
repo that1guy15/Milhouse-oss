@@ -29,6 +29,7 @@ from milhouse.spooling import (
     spool_content_sha256,
     spool_frame_line,
 )
+from milhouse.spooling import commit as commit_module
 from milhouse.spooling.ledger import (
     authorize_local_persistence,
     load_exporters,
@@ -528,6 +529,16 @@ def test_the_store_rejects_a_mismatched_barrier_or_spool_root(tmp_path: Path) ->
                 installation_id=_INSTALLATION_ID,
             )
         assert spool_error.value.code == "MH_SPOOL_STORE"
+        with pytest.raises(SpoolError) as invalid_spool:
+            DurableSpool(
+                database=database,
+                barrier=GlobalCommitBarrier(tmp_path / "control" / "commit.lock"),
+                spool_root=object(),  # type: ignore[arg-type]
+                installation_id=_INSTALLATION_ID,
+            )
+        assert invalid_spool.value.code == "MH_SPOOL_STORE"
+        assert invalid_spool.value.__cause__ is None
+        assert invalid_spool.value.__context__ is None
         # A barrier beside the database but on a different lock file shares no flock with
         # maintenance, so it must be rejected even though it lives in the control directory.
         with pytest.raises(SpoolError) as wrong_lock:
@@ -538,6 +549,18 @@ def test_the_store_rejects_a_mismatched_barrier_or_spool_root(tmp_path: Path) ->
                 installation_id=_INSTALLATION_ID,
             )
         assert wrong_lock.value.code == "MH_SPOOL_STORE"
+        displaced_gate = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")
+        object.__setattr__(
+            displaced_gate, "_gate_path", tmp_path / "elsewhere" / "commit.lock.gate"
+        )
+        with pytest.raises(SpoolError) as wrong_gate:
+            DurableSpool(
+                database=database,
+                barrier=displaced_gate,
+                spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
+            )
+        assert wrong_gate.value.code == "MH_SPOOL_STORE"
         with pytest.raises(SpoolError) as id_error:
             DurableSpool(
                 database=database,
@@ -555,15 +578,15 @@ def test_spool_directories_are_created_inside_the_barrier(
 ) -> None:
     database, store, spool_root = _spool(tmp_path)
     pending = spool_root / "pending"
-    real_exclusive = GlobalCommitBarrier.exclusive
+    real_handoff = GlobalCommitBarrier.exclusive_then_shared
 
     @contextlib.contextmanager
-    def _asserting_exclusive(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+    def _asserting_handoff(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
         assert not pending.exists()  # no namespace mutation before the barrier is held
-        with real_exclusive(self, blocking=blocking):
-            yield
+        with real_handoff(self, blocking=blocking) as transition:
+            yield transition
 
-    monkeypatch.setattr(GlobalCommitBarrier, "exclusive", _asserting_exclusive)
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive_then_shared", _asserting_handoff)
     try:
         frames = _frames()
         store.commit_segment(_header(frames), frames, committed_at=_NOW)
@@ -605,25 +628,16 @@ def test_an_unreadable_ledger_fails_the_commit_before_any_publication(tmp_path: 
 
 
 def test_a_transaction_boundary_failure_after_publication_is_commit_uncertain(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database, store, spool_root = _spool(tmp_path)
 
-    class _TxnFailDatabase:
-        # reads (the pre-commit scan) succeed against the real connection; only the write-side
-        # transaction boundary fails, exactly like a crash between publication and the insert
-        @property
-        def path(self) -> Path:
-            return database.path
+    @contextlib.contextmanager
+    def _fail_transaction(_self):  # type: ignore[no-untyped-def]
+        raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
+        yield  # pragma: no cover - contextmanager requires a generator
 
-        @property
-        def connection(self) -> object:
-            return database.connection
-
-        def transaction(self) -> object:
-            raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
-
-    store._database = _TxnFailDatabase()  # type: ignore[attr-defined]
+    monkeypatch.setattr(type(database), "transaction", _fail_transaction)
     try:
         frames = _frames()
         with pytest.raises(SpoolError) as captured:
@@ -631,6 +645,52 @@ def test_a_transaction_boundary_failure_after_publication_is_commit_uncertain(
         assert captured.value.code == "MH_SPOOL_COMMIT"
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
+        assert (spool_root / "pending" / _DAY / "batch-1.jsonl").exists()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("failed_parent", ["spool", "pending"])
+def test_a_pending_parent_fsync_failure_blocks_acknowledgement_and_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_parent: str
+) -> None:
+    database, store, spool_root = _spool(tmp_path)
+    real_fsync = os.fsync
+    failed_once = False
+    observed: list[str] = []
+
+    def _tracked_fsync(descriptor: int) -> None:
+        nonlocal failed_once
+        info = os.fstat(descriptor)
+        label = "other"
+        if info.st_ino == os.stat(spool_root).st_ino:
+            label = "spool"
+        else:
+            pending = spool_root / "pending"
+            if pending.exists() and info.st_ino == os.stat(pending).st_ino:
+                label = "pending"
+        observed.append(label)
+        if label == failed_parent and not failed_once:
+            failed_once = True
+            raise OSError("planted parent fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(commit_module.os, "fsync", _tracked_fsync)
+    frames = _frames()
+    header = _header(frames)
+    try:
+        with pytest.raises(SpoolError) as captured:
+            store.commit_segment(header, frames, committed_at=_NOW)
+        assert captured.value.code == "MH_SPOOL_DIR"
+        assert database.connection.execute("SELECT count(*) FROM _segments").fetchone()[0] == 0
+        assert not (spool_root / "pending" / _DAY / "batch-1.jsonl").exists()
+
+        # The failed mkdir may remain visible. A retry must fsync every accepted parent again before
+        # publication and may acknowledge only after both ancestor entries are durable.
+        before_retry = len(observed)
+        store.commit_segment(header, frames, committed_at=_NOW)
+        assert failed_parent in observed[before_retry:]
+        assert database.connection.execute("SELECT count(*) FROM _segments").fetchone()[0] == 1
         assert (spool_root / "pending" / _DAY / "batch-1.jsonl").exists()
     finally:
         database.close()
@@ -647,3 +707,43 @@ def test_a_non_private_spool_root_fails_closed(tmp_path: Path) -> None:
     finally:
         os.chmod(spool_root, 0o700)
         database.close()
+
+
+@pytest.mark.parametrize("helper_name", ["_require_private_dir", "_fsync_private_dir"])
+def test_private_directory_helpers_reject_unsafe_and_missing_paths(
+    tmp_path: Path, helper_name: str
+) -> None:
+    helper = getattr(commit_module, helper_name)
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o700)
+    os.chmod(unsafe, 0o777)
+
+    with pytest.raises(SpoolError) as unsafe_error:
+        helper(unsafe, "test directory")
+    assert unsafe_error.value.code == "MH_SPOOL_DIR"
+    assert unsafe_error.value.__cause__ is None
+    assert unsafe_error.value.__context__ is None
+
+    with pytest.raises(SpoolError) as missing_error:
+        helper(tmp_path / "missing", "test directory")
+    assert missing_error.value.code == "MH_SPOOL_DIR"
+    assert missing_error.value.__cause__ is None
+    assert missing_error.value.__context__ is None
+
+
+def test_child_directory_creation_failure_is_normalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir(mode=0o700)
+    os.chmod(parent, 0o700)
+
+    def _fail_mkdir(_path: Path, _mode: int) -> None:
+        raise OSError("planted mkdir failure")
+
+    monkeypatch.setattr(commit_module.os, "mkdir", _fail_mkdir)
+    with pytest.raises(SpoolError) as captured:
+        commit_module._secure_child_dir(parent, "pending")
+    assert captured.value.code == "MH_SPOOL_DIR"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None

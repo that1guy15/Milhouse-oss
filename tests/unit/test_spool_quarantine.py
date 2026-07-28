@@ -3344,6 +3344,12 @@ def test_a_name_max_staged_temporary_uses_a_bounded_recoverable_candidate(
         database.close()
 
 
+def test_a_candidate_is_refused_when_name_max_cannot_fit_a_recovery_name() -> None:
+    snapshot = FileSnapshot(device=1, inode=2, size=3, modified_ns=4, changed_ns=5)
+
+    assert reconcile_module._bounded_candidate_base("x", snapshot, "a" * 64, 1) is None
+
+
 @pytest.mark.parametrize(
     ("failure", "detail"),
     [("name-max", "io"), ("candidate-budget", "collision")],

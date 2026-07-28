@@ -87,17 +87,17 @@ from milhouse.spooling.ledger import (
 )
 from milhouse.spooling.reader import (
     INSTALLATION_ID_PATTERN,
-    MAX_SEGMENT_FILE_BYTES,
     ParsedSegment,
     read_trusted_segment,
 )
 from milhouse.spooling.segment import (
     BATCH_ID_PATTERN,
     FRAME_VERSION,
+    MAX_SEGMENT_FILE_BYTES,
     SCHEMA_VERSION,
 )
-from milhouse.state.barrier import GlobalCommitBarrier
-from milhouse.state.database import ControlDatabase
+from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
+from milhouse.state.database import ControlDatabase, _validated_database_path
 from milhouse.state.errors import StateError
 
 _SPOOL = "spool"
@@ -518,13 +518,20 @@ def _require_bound_state_root(
 
     if type(barrier) is not GlobalCommitBarrier:
         _fail("MH_SPOOL_STORE", "a commit barrier is required")
-    database_path = getattr(database, "path", None)
+    database_path = _validated_database_path(database)
     if database_path is None:
         _fail("MH_SPOOL_STORE", "a control database is required")
     control_dir = lexical_absolute_path(database_path).parent
     state_root = control_dir.parent
-    resolved_spool = lexical_absolute_path(spool_root)
-    if object.__getattribute__(barrier, "_path") != control_dir / _BARRIER_NAME:
+    invalid_spool = False
+    try:
+        resolved_spool = lexical_absolute_path(spool_root)
+    except SecureFileError:
+        invalid_spool = True
+        resolved_spool = Path()
+    if invalid_spool:
+        _fail("MH_SPOOL_STORE", "a spool root path is required")
+    if not _is_bound_barrier(barrier, control_dir / _BARRIER_NAME):
         _fail("MH_SPOOL_STORE", "the barrier must be the control-plane commit lock")
     if resolved_spool != state_root / _SPOOL:
         _fail("MH_SPOOL_STORE", "the spool root must be <state_root>/spool")
@@ -545,13 +552,14 @@ def _reconcile_under_barrier(
     action: Callable[[], None] | None = None,
     observe: Callable[[ReconciliationReport], None] | None = None,
 ) -> ReconciliationReport:
-    """The only reconciliation entrypoint: the scan owns its exact exclusive barrier context.
+    """The only reconciliation entrypoint: the scan owns the exact barrier context.
 
     This wrapper first validates that database, barrier, and spool root share one canonical state
-    root. :meth:`_Scan.run` then acquires and retains that concrete barrier across classification,
-    mutation, observation, and the optional commit action. There is no caller-mintable authority
-    token and no unlock gap between recovery and commit. ``observe`` receives the report inside the
-    hold before ``action`` runs, so a caller records it even when the action then fails.
+    root. :meth:`_Scan.run` acquires that concrete barrier exclusively for reconciliation. When a
+    durable-writer action follows, it converts the held main lock to shared without releasing the
+    exclusive gate, then releases the gate and runs the action under the shared side. There is no
+    caller-mintable authority token and no cooperating-writer gap. ``observe`` receives the report
+    before the phase transition, so a caller records it even when ``action`` then fails.
     """
 
     spool_root = _require_bound_state_root(database, barrier, spool_root, installation_id)
@@ -602,31 +610,36 @@ class _Scan:
         action: Callable[[], None] | None = None,
         observe: Callable[[ReconciliationReport], None] | None = None,
     ) -> ReconciliationReport:
-        """Acquire the bound barrier and retain it through scan, observation, and action."""
+        """Acquire the bound barrier and retain it through recovery and any writer action."""
 
         # Validate the concrete barrier BEFORE the first ledger read. The scan acquires the lock
         # itself, so a direct call cannot substitute a forged token or rely on a caller's claim that
         # some lock is held.
-        database_path = getattr(self._database, "path", None)
-        expected_lock = (
-            lexical_absolute_path(database_path).parent / _BARRIER_NAME
-            if database_path is not None
-            else None
-        )
-        if (
-            type(barrier) is not GlobalCommitBarrier
-            or expected_lock is None
-            or object.__getattribute__(barrier, "_path") != expected_lock
-        ):
+        binding_failed = False
+        resolved_spool: Path | None = None
+        try:
+            resolved_spool = _require_bound_state_root(
+                self._database, barrier, self._spool_root, self._installation_id
+            )
+        except SpoolError:
+            binding_failed = True
+        if binding_failed:
             _fail(
                 "MH_SPOOL_BARRIER",
-                "reconciliation requires this control plane's exclusive commit barrier",
+                "reconciliation requires this control plane's bound commit barrier",
             )
+        assert resolved_spool is not None
+        # Use the exact normalized path that passed the binding. Retaining a raw ``symlink/..``
+        # spelling would let POSIX traversal resolve somewhere different from lexical validation.
+        self._spool_root = resolved_spool
         report: ReconciliationReport | None = None
         barrier_failed = False
         barrier_acquired = False
+        barrier_context = (
+            barrier.exclusive_then_shared() if action is not None else barrier.exclusive()
+        )
         try:
-            with barrier.exclusive():
+            with barrier_context as transition:
                 barrier_acquired = True
                 ledger, malformed = self._ledger_index()
                 for batch_id in sorted(malformed):
@@ -751,6 +764,13 @@ class _Scan:
                 if observe is not None:
                     observe(report)
                 if action is not None and report.complete:
+                    if transition is None:  # pragma: no cover - context selection is local above
+                        _fail("MH_SPOOL_BARRIER", "the writer barrier transition is unavailable")
+                    # Normalize only a failed lock-mode transition as a barrier failure. Once the
+                    # transition succeeds, preserve any StateError raised by the writer action.
+                    barrier_acquired = False
+                    transition()
+                    barrier_acquired = True
                     action()
         except StateError:
             if barrier_acquired:
@@ -1929,22 +1949,7 @@ class SpoolReconciler:
         spool_root: str | Path,
         installation_id: str,
     ) -> None:
-        if not isinstance(database, ControlDatabase):
-            _fail("MH_SPOOL_STORE", "a control database is required")
-        if not isinstance(barrier, GlobalCommitBarrier):
-            _fail("MH_SPOOL_STORE", "a commit barrier is required")
-        control_dir = lexical_absolute_path(database.path).parent
-        state_root = control_dir.parent
-        resolved_spool = lexical_absolute_path(spool_root)
-        if lexical_absolute_path(barrier.path) != control_dir / _BARRIER_NAME:
-            _fail("MH_SPOOL_STORE", "the barrier must be the control-plane commit lock")
-        if resolved_spool != state_root / _SPOOL:
-            _fail("MH_SPOOL_STORE", "the spool root must be <state_root>/spool")
-        if (
-            type(installation_id) is not str
-            or INSTALLATION_ID_PATTERN.fullmatch(installation_id) is None
-        ):
-            _fail("MH_SPOOL_IDENTITY", "a well-formed installation id is required")
+        resolved_spool = _require_bound_state_root(database, barrier, spool_root, installation_id)
         self._database = database
         self._barrier = barrier
         self._spool_root = resolved_spool
