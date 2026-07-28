@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from milhouse.config.filesystem import SecureFileError, SecureFileErrorKind
 from milhouse.domain.records import (
     CollectorDescriptorV1,
     EventDataV1,
@@ -155,6 +156,55 @@ def test_reconciling_an_empty_spool_reports_nothing(tmp_path: Path) -> None:
     try:
         report = reconciler.reconcile()
         assert report == reconcile_module.ReconciliationReport((), (), (), 0, 0, complete=True)
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("root_state", ["missing", "symlink", "mode", "owner", "acl"])
+def test_an_untrusted_spool_root_is_never_certified_as_an_empty_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_state: str
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    real_fstat = os.fstat
+    real_acl_check = reconcile_module.require_no_extended_acl
+    trusted_empty = tmp_path / "trusted-empty"
+    if root_state == "missing":
+        spool_root.rmdir()
+    elif root_state == "symlink":
+        spool_root.rmdir()
+        trusted_empty.mkdir(mode=0o700)
+        os.chmod(trusted_empty, 0o700)
+        spool_root.symlink_to(trusted_empty, target_is_directory=True)
+    elif root_state == "mode":
+        os.chmod(spool_root, 0o755)
+    elif root_state == "owner":
+        root_inode = os.lstat(spool_root).st_ino
+
+        def _foreign_root(descriptor: int) -> os.stat_result:
+            info = real_fstat(descriptor)
+            if info.st_ino != root_inode:
+                return info
+            fields = list(info)
+            fields[4] = os.geteuid() + 1
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(os, "fstat", _foreign_root)
+    else:
+        root_inode = os.lstat(spool_root).st_ino
+
+        def _root_acl(descriptor: int) -> None:
+            if real_fstat(descriptor).st_ino == root_inode:
+                raise SecureFileError(SecureFileErrorKind.ACCESS_CONTROL_UNSAFE)
+            real_acl_check(descriptor)
+
+        monkeypatch.setattr(reconcile_module, "require_no_extended_acl", _root_acl)
+
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.quarantined == ()
+        assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "spool_root_unsafe"),)
     finally:
         database.close()
 
@@ -689,20 +739,20 @@ def test_the_anomaly_cap_stops_directory_enumeration(
         (pending / junk).mkdir(mode=0o700)
     header, frames = _segment(batch_id="batch-1")
     _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
-    opened: list[Path] = []
-    real_names = reconcile_module._secure_dir_names
+    opened: list[int] = []
+    real_names = reconcile_module._secure_names_from_descriptor
 
-    def _recording_names(path: Path):  # type: ignore[no-untyped-def]
-        opened.append(path)
-        return real_names(path)
+    def _recording_names(descriptor: int):
+        opened.append(os.fstat(descriptor).st_ino)
+        return real_names(descriptor)
 
-    monkeypatch.setattr(reconcile_module, "_secure_dir_names", _recording_names)
+    monkeypatch.setattr(reconcile_module, "_secure_names_from_descriptor", _recording_names)
     try:
         report = reconciler.reconcile()
         assert not report.complete
         assert report.registered == ()
         assert report.scanned == 0  # no entry was ever classified
-        assert opened == [pending]  # the valid day directory was never opened
+        assert opened == [os.lstat(pending).st_ino]  # the valid day directory was never opened
         assert _count(database) == 0
     finally:
         database.close()
@@ -1378,7 +1428,18 @@ def test_a_foreign_owned_pending_directory_is_reported_unsafe(
     pending.mkdir(mode=0o700)
     os.chmod(pending, 0o700)
     real_uid = os.geteuid()
-    monkeypatch.setattr(reconcile_module, "_current_uid", lambda: real_uid + 1)
+    pending_inode = os.lstat(pending).st_ino
+    real_fstat = os.fstat
+
+    def _foreign_pending(descriptor: int) -> os.stat_result:
+        info = real_fstat(descriptor)
+        if info.st_ino != pending_inode:
+            return info
+        fields = list(info)
+        fields[4] = real_uid + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", _foreign_pending)
     try:
         report = reconciler.reconcile()
         assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "pending_unsafe"),)
@@ -1399,15 +1460,18 @@ def test_a_foreign_owned_day_directory_is_reported_unsafe(
     day_dir.mkdir(mode=0o700)
     os.chmod(day_dir, 0o700)
     real_uid = os.geteuid()
-    real_current_uid = reconcile_module._current_uid
-    calls: list[int] = []
+    day_inode = os.lstat(day_dir).st_ino
+    real_fstat = os.fstat
 
-    def _foreign_after_pending() -> int:
-        calls.append(1)
-        # the pending check passes with the real uid; the day check then sees a foreign owner
-        return real_current_uid() if len(calls) == 1 else real_uid + 1
+    def _foreign_day(descriptor: int) -> os.stat_result:
+        info = real_fstat(descriptor)
+        if info.st_ino != day_inode:
+            return info
+        fields = list(info)
+        fields[4] = real_uid + 1  # st_uid in the portable ten-field stat_result sequence
+        return os.stat_result(fields)
 
-    monkeypatch.setattr(reconcile_module, "_current_uid", _foreign_after_pending)
+    monkeypatch.setattr(os, "fstat", _foreign_day)
     try:
         report = reconciler.reconcile()
         assert SegmentAnomaly("", _DAY, "foreign_name", "day_unsafe") in report.anomalies

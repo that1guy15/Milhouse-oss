@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from milhouse.config.filesystem import SecureFileError, SecureFileErrorKind
+from milhouse.config.filesystem import FileSnapshot, SecureFileError, SecureFileErrorKind
 from milhouse.domain.records import (
     CollectorDescriptorV1,
     EventDataV1,
@@ -395,11 +395,15 @@ def test_an_acl_bearing_pending_directory_is_unsafe(
     pending = spool_root / "pending"
     pending.mkdir(mode=0o700)
     os.chmod(pending, 0o700)
+    pending_inode = os.lstat(pending).st_ino
+    real_acl_check = reconcile_module.require_no_extended_acl
 
-    def _acl_everywhere(_descriptor: int) -> None:
-        raise SecureFileError(SecureFileErrorKind.ACCESS_CONTROL_UNSAFE)
+    def _acl_on_pending(descriptor: int) -> None:
+        if os.fstat(descriptor).st_ino == pending_inode:
+            raise SecureFileError(SecureFileErrorKind.ACCESS_CONTROL_UNSAFE)
+        real_acl_check(descriptor)
 
-    monkeypatch.setattr(reconcile_module, "require_no_extended_acl", _acl_everywhere)
+    monkeypatch.setattr(reconcile_module, "require_no_extended_acl", _acl_on_pending)
     try:
         report = reconciler.reconcile()
         assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "pending_unsafe"),)
@@ -785,7 +789,8 @@ def test_a_regular_replacement_swapped_in_during_the_copy_is_never_unlinked(
     monkeypatch.setattr(os, "link", _swapping_link)
     try:
         report = reconciler.reconcile()
-        assert len(report.quarantined) == 1  # the CLASSIFIED bytes are quarantined
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
         target = spool_root / "quarantine" / _DAY / "batch-1.jsonl"
         assert target.read_bytes() == b"junk\n"  # exactly the classified digest, nothing else
         assert path.read_bytes() == b"replacement-not-classified"  # never unlinked
@@ -818,7 +823,8 @@ def test_a_symlink_replacement_swapped_in_during_the_copy_is_never_followed(
     monkeypatch.setattr(os, "link", _swapping_link)
     try:
         report = reconciler.reconcile()
-        assert len(report.quarantined) == 1
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
         target = spool_root / "quarantine" / _DAY / "batch-1.jsonl"
         assert target.read_bytes() == b"junk\n"  # the classified bytes, never the canary
         assert os.path.islink(path)  # the swapped-in symlink was never unlinked or followed
@@ -851,7 +857,7 @@ def test_the_move_orders_target_fsync_before_source_unlink(
     quarantine_root = spool_root / "quarantine"
     quarantine_day = quarantine_root / _DAY
     log: list[tuple[str, object]] = []
-    real_link, real_fsync, real_unlink = os.link, os.fsync, os.unlink
+    real_link, real_fsync, real_replace, real_unlink = os.link, os.fsync, os.replace, os.unlink
 
     def _labelled(fd: int) -> object:
         ident = (os.fstat(fd).st_dev, os.fstat(fd).st_ino)
@@ -880,8 +886,14 @@ def test_the_move_orders_target_fsync_before_source_unlink(
         log.append(("unlink", label))
         real_unlink(name, dir_fd=dir_fd)
 
+    def _logging_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):  # type: ignore[no-untyped-def]
+        label = "other" if src_dir_fd is None else _labelled(src_dir_fd)
+        log.append(("retire", label))
+        real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
     monkeypatch.setattr(os, "link", _logging_link)
     monkeypatch.setattr(os, "fsync", _logging_fsync)
+    monkeypatch.setattr(os, "replace", _logging_replace)
     monkeypatch.setattr(os, "unlink", _logging_unlink)
     try:
         report = reconciler.reconcile()
@@ -892,16 +904,23 @@ def test_the_move_orders_target_fsync_before_source_unlink(
         # BEFORE anything was linked into it
         assert log.index(("fsync", "spool-root")) < link_at
         assert log.index(("fsync", "quarantine-root")) < link_at
-        # the target directory is durable before the source is touched; the source directory
-        # is flushed last
+        # The target is durable before the source is atomically retired. The retirement is made
+        # durable before its cleanup, and that cleanup is flushed last.
         assert [entry for entry in log if entry == ("unlink", "pending-day")] == [
             ("unlink", "pending-day")
+        ]
+        retire_at = log.index(("retire", "pending-day"))
+        cleanup_at = log.index(("unlink", "pending-day"))
+        pending_syncs = [
+            index for index, entry in enumerate(log) if entry == ("fsync", "pending-day")
         ]
         assert (
             link_at
             < log.index(("fsync", "quarantine-day"))
-            < log.index(("unlink", "pending-day"))
-            < log.index(("fsync", "pending-day"))
+            < retire_at
+            < pending_syncs[0]
+            < cleanup_at
+            < pending_syncs[-1]
         )
         assert not path.exists()
         assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
@@ -1060,8 +1079,8 @@ def test_an_undurable_directory_creation_is_unreachable(
 def test_a_source_unlink_failure_reports_commit_uncertain_and_converges(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # after the target is durable, an unlink failure is COMMIT-UNCERTAIN: never reported as
-    # completed, never as still-pending — and the next scan adopts the same-inode twin
+    # after the target is durable, a retirement-unlink failure is COMMIT-UNCERTAIN: never reported
+    # as completed, and the next scan adopts the target through the encoded candidate base
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     path = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
     pending_day = spool_root / "pending" / _DAY
@@ -1082,15 +1101,18 @@ def test_a_source_unlink_failure_reports_commit_uncertain_and_converges(
         report = reconciler.reconcile()
         assert report.quarantined == ()
         assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
-        # the durable copy and the pending source are SEPARATE inodes with identical bytes: an
-        # in-place rewrite of the pending file can no longer reach into quarantine
+        # The public source name is gone, but the exact bytes remain under a private retirement.
+        # The durable target and staged source are separate inodes.
         target = quarantine_day / "batch-1.jsonl"
-        assert os.stat(path).st_ino != os.stat(target).st_ino
-        assert target.read_bytes() == path.read_bytes() == b"junk\n"
-        # the retry converges by adopting the same-digest copy: one durable name, no aliases
+        assert not path.exists()
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        assert os.stat(retirements[0]).st_ino != os.stat(target).st_ino
+        assert target.read_bytes() == retirements[0].read_bytes() == b"junk\n"
+        # the retry converges by adopting the same-digest copy: one durable target, no debris
         second = reconciler.reconcile()
         assert len(second.quarantined) == 1
-        assert not path.exists()
+        assert list(pending_day.iterdir()) == []
         assert sorted(entry.name for entry in quarantine_day.iterdir()) == ["batch-1.jsonl"]
         assert target.read_bytes() == b"junk\n"
         third = reconciler.reconcile()  # and the scan after that is clean
@@ -1108,13 +1130,14 @@ def test_a_source_fsync_failure_after_unlink_reports_uncertain(
     pending_day = spool_root / "pending" / _DAY
     quarantine_day = spool_root / "quarantine" / _DAY
     real_fsync = os.fsync
-    fail = [True]
+    pending_fsyncs: list[int] = []
 
     def _failing_fsync(fd: int) -> None:
         info = os.fstat(fd)
-        if fail and _dir_ident(pending_day) == (info.st_dev, info.st_ino):
-            fail.clear()
-            raise OSError(5, "planted source fsync failure")
+        if _dir_ident(pending_day) == (info.st_dev, info.st_ino):
+            pending_fsyncs.append(fd)
+            if len(pending_fsyncs) == 2:
+                raise OSError(5, "planted source fsync failure")
         real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", _failing_fsync)
@@ -1221,7 +1244,8 @@ def test_an_in_place_rewrite_during_target_creation_is_never_unlinked(
     monkeypatch.setattr(os, "link", _mutating_link)
     try:
         report = reconciler.reconcile()
-        assert len(report.quarantined) == 1  # completed FOR THE CLASSIFIED BYTES only
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
         target = spool_root / "quarantine" / _DAY / "batch-1.jsonl"
         assert target.read_bytes() == b"junk\n"  # exactly the classified digest
         assert os.lstat(target).st_ino != original_inode  # a copy: the writable inode is severed
@@ -1795,6 +1819,37 @@ def test_an_oversize_subject_is_refused_at_classification(
         database.close()
 
 
+def test_an_oversize_quarantine_candidate_is_rejected_before_its_bytes_are_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, _reconciler_unused = _reconciler(tmp_path)
+    quarantine_day = spool_root / "quarantine" / _DAY
+    quarantine_day.mkdir(mode=0o700, parents=True)
+    os.chmod(quarantine_day.parent, 0o700)
+    os.chmod(quarantine_day, 0o700)
+    candidate = quarantine_day / "candidate"
+    candidate.write_bytes(b"x" * 9)
+    os.chmod(candidate, 0o600)
+    target_fd = os.open(quarantine_day, os.O_RDONLY)
+    reads: list[int] = []
+    real_read = reconcile_module._read_descriptor
+
+    def _recording_read(descriptor: int, size: int) -> bytes | None:
+        reads.append(size)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(reconcile_module, "MAX_SEGMENT_FILE_BYTES", 8)
+    monkeypatch.setattr(reconcile_module, "_read_descriptor", _recording_read)
+    try:
+        scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
+        digest = hashlib.sha256(b"x" * 9).hexdigest()
+        assert scan._certify_target(target_fd, "candidate", digest) is None
+        assert reads == []
+    finally:
+        os.close(target_fd)
+        database.close()
+
+
 def test_an_empty_subject_is_quarantined_as_an_empty_copy(tmp_path: Path) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     try:
@@ -1903,7 +1958,7 @@ def test_the_copy_data_is_fsynced_before_the_publish_link(
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
     log: list[tuple[str, str]] = []
-    real_fsync, real_link, real_unlink = os.fsync, os.link, os.unlink
+    real_fsync, real_link, real_replace = os.fsync, os.link, os.replace
 
     def _kind(fd: int) -> str:
         return "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
@@ -1918,21 +1973,21 @@ def test_the_copy_data_is_fsynced_before_the_publish_link(
             src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=follow_symlinks
         )
 
-    def _logging_unlink(target, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if target == "batch-1.jsonl":
-            log.append(("unlink", "source"))
-        return real_unlink(target, *args, **kwargs)
+    def _logging_replace(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if src == "batch-1.jsonl" and str(dst).startswith(reconcile_module._RETIRE_PREFIX):
+            log.append(("retire", "source"))
+        return real_replace(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(os, "fsync", _logging_fsync)
     monkeypatch.setattr(os, "link", _logging_link)
-    monkeypatch.setattr(os, "unlink", _logging_unlink)
+    monkeypatch.setattr(os, "replace", _logging_replace)
     try:
         report = reconciler.reconcile()
         assert len(report.quarantined) == 1
         link_at = log.index(("link", ""))
-        # the copy's BYTES are durable before its name is published, and both precede the unlink
+        # The copy's bytes are durable before its name is published, and both precede retirement.
         assert ("fsync", "file") in log[:link_at]
-        assert log.index(("unlink", "source")) > link_at
+        assert log.index(("retire", "source")) > link_at
     finally:
         database.close()
 
@@ -1949,7 +2004,7 @@ def test_an_adopted_copy_is_file_fsynced_before_the_source_unlink(
     (quarantine_day / "batch-1.jsonl").write_bytes(b"junk\n")  # an earlier interrupted copy
     os.chmod(quarantine_day / "batch-1.jsonl", 0o600)
     log: list[tuple[str, str]] = []
-    real_fsync, real_unlink = os.fsync, os.unlink
+    real_fsync, real_replace = os.fsync, os.replace
 
     def _kind(fd: int) -> str:
         return "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
@@ -1958,18 +2013,18 @@ def test_an_adopted_copy_is_file_fsynced_before_the_source_unlink(
         log.append(("fsync", _kind(fd)))
         real_fsync(fd)
 
-    def _logging_unlink(target, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if target == "batch-1.jsonl":
-            log.append(("unlink", "source"))
-        return real_unlink(target, *args, **kwargs)
+    def _logging_replace(src, dst, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if src == "batch-1.jsonl" and str(dst).startswith(reconcile_module._RETIRE_PREFIX):
+            log.append(("retire", "source"))
+        return real_replace(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(os, "fsync", _logging_fsync)
-    monkeypatch.setattr(os, "unlink", _logging_unlink)
+    monkeypatch.setattr(os, "replace", _logging_replace)
     try:
         report = reconciler.reconcile()
         assert len(report.quarantined) == 1
         assert not path.exists()
-        unlink_at = log.index(("unlink", "source"))
+        unlink_at = log.index(("retire", "source"))
         # the adopted candidate's DATA was re-proven durable before the source was removed
         assert ("fsync", "file") in log[:unlink_at]
     finally:
@@ -2360,5 +2415,1263 @@ def test_a_candidate_mutated_while_being_made_durable_is_never_adopted(
         assert report.quarantined == ()
         assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
         assert path.read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+# --- round-4 regressions: mutation-time live namespace and envelope proof ------------------------
+
+
+@pytest.mark.parametrize("swap_level", ["day", "root"])
+def test_target_displaced_during_final_certification_never_authorizes_source_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap_level: str
+) -> None:
+    """The final target proof must be followed by a fresh secure live-chain proof."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    quarantine_root = spool_root / "quarantine"
+    quarantine_day = quarantine_root / _DAY
+    displaced = tmp_path / f"displaced-target-{swap_level}"
+    real_certify = reconcile_module._Scan._certify_target
+    calls: list[int] = []
+
+    def _displacing_certify(self, target_fd, candidate, digest):  # type: ignore[no-untyped-def]
+        certified = real_certify(self, target_fd, candidate, digest)
+        calls.append(1)
+        if len(calls) == 2:
+            if swap_level == "day":
+                os.rename(quarantine_day, displaced)
+                quarantine_day.mkdir(mode=0o700)
+                os.chmod(quarantine_day, 0o700)
+            else:
+                os.rename(quarantine_root, displaced)
+                quarantine_day.mkdir(mode=0o700, parents=True)
+                os.chmod(quarantine_root, 0o700)
+                os.chmod(quarantine_day, 0o700)
+        return certified
+
+    monkeypatch.setattr(reconcile_module._Scan, "_certify_target", _displacing_certify)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        assert source.read_bytes() == b"junk\n"
+        displaced_target = (
+            displaced / "batch-1.jsonl"
+            if swap_level == "day"
+            else displaced / _DAY / "batch-1.jsonl"
+        )
+        assert not displaced_target.exists()  # this pass's escaped copy was proven and removed
+        assert list(quarantine_day.iterdir()) == []
+        if swap_level == "day":
+            quarantine_day.rmdir()
+            os.rename(displaced, quarantine_day)
+        else:
+            quarantine_day.rmdir()
+            quarantine_root.rmdir()
+            os.rename(displaced, quarantine_root)
+        retry = reconciler.reconcile()
+        assert len(retry.quarantined) == 1
+        assert not source.exists()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("swap_level", ["day", "root"])
+def test_pending_chain_displaced_after_source_open_never_unlinks_outside_spool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap_level: str
+) -> None:
+    """A held pending descriptor is not unlink authority after its live chain moves."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_root = spool_root / "pending"
+    pending_day = pending_root / _DAY
+    displaced = tmp_path / f"displaced-pending-{swap_level}"
+    real_read = reconcile_module._read_descriptor
+    calls: list[int] = []
+
+    def _displacing_read(descriptor: int, size: int):  # type: ignore[no-untyped-def]
+        content = real_read(descriptor, size)
+        calls.append(descriptor)
+        if len(calls) == 2:
+            if swap_level == "day":
+                os.rename(pending_day, displaced)
+                pending_day.mkdir(mode=0o700)
+                os.chmod(pending_day, 0o700)
+            else:
+                os.rename(pending_root, displaced)
+                pending_day.mkdir(mode=0o700, parents=True)
+                os.chmod(pending_root, 0o700)
+                os.chmod(pending_day, 0o700)
+        return content
+
+    monkeypatch.setattr(reconcile_module, "_read_descriptor", _displacing_read)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_blocked", "changed") in report.anomalies
+        displaced_source = (
+            displaced / "batch-1.jsonl"
+            if swap_level == "day"
+            else displaced / _DAY / "batch-1.jsonl"
+        )
+        assert displaced_source.read_bytes() == b"junk\n"
+        assert not (pending_day / "batch-1.jsonl").exists()
+        if swap_level == "day":
+            pending_day.rmdir()
+            os.rename(displaced, pending_day)
+        else:
+            pending_day.rmdir()
+            pending_root.rmdir()
+            os.rename(displaced, pending_root)
+        retry = reconciler.reconcile()
+        assert len(retry.quarantined) == 1
+        assert not (spool_root / "pending" / _DAY / "batch-1.jsonl").exists()
+        candidates = tuple((spool_root / "quarantine" / _DAY).glob("*batch-1.jsonl"))
+        assert len(candidates) == 1
+        assert candidates[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_quarantine_directory_mode_drift_before_publication_never_reports_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The held target descriptor must retain the private 0700 envelope at publication."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_publish = reconcile_module._Scan._publish_copy
+    changed: list[bool] = []
+
+    def _loosening_publish(self, day, identities, candidate, content, digest):  # type: ignore[no-untyped-def]
+        if not changed:
+            changed.append(True)
+            os.chmod(quarantine_day, 0o755)
+        return real_publish(self, day, identities, candidate, content, digest)
+
+    monkeypatch.setattr(reconcile_module._Scan, "_publish_copy", _loosening_publish)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert any(anomaly.kind.startswith("quarantine_") for anomaly in report.anomalies)
+        assert source.read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("swap_level", ["day", "root"])
+def test_pending_chain_displaced_during_final_source_validation_never_unlinks_outside_spool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap_level: str
+) -> None:
+    """The final source-name check cannot authorize unlink through a newly stale descriptor."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_root = spool_root / "pending"
+    pending_day = pending_root / _DAY
+    pending_day_inode = os.lstat(pending_day).st_ino
+    displaced = tmp_path / f"final-pending-{swap_level}"
+    real_stat = os.stat
+    swapped: list[bool] = []
+
+    def _displacing_stat(target, *args, **kwargs):  # type: ignore[no-untyped-def]
+        dir_fd = kwargs.get("dir_fd")
+        if (
+            not swapped
+            and target == "batch-1.jsonl"
+            and dir_fd is not None
+            and os.fstat(dir_fd).st_ino == pending_day_inode
+        ):
+            swapped.append(True)
+            if swap_level == "day":
+                os.rename(pending_day, displaced)
+                os.mkdir(pending_day, 0o700)
+            else:
+                os.rename(pending_root, displaced)
+                os.mkdir(pending_root, 0o700)
+                os.mkdir(pending_day, 0o700)
+        return real_stat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", _displacing_stat)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        displaced_source = (
+            displaced / "batch-1.jsonl"
+            if swap_level == "day"
+            else displaced / _DAY / "batch-1.jsonl"
+        )
+        assert displaced_source.read_bytes() == b"junk\n"
+        assert not (spool_root / "quarantine" / _DAY / "batch-1.jsonl").exists()
+        if swap_level == "day":
+            pending_day.rmdir()
+            os.rename(displaced, pending_day)
+        else:
+            pending_day.rmdir()
+            pending_root.rmdir()
+            os.rename(displaced, pending_root)
+        retry = reconciler.reconcile()
+        assert len(retry.quarantined) == 1
+        assert not (spool_root / "pending" / _DAY / "batch-1.jsonl").exists()
+        candidates = tuple((spool_root / "quarantine" / _DAY).glob("*batch-1.jsonl"))
+        assert len(candidates) == 1
+        assert candidates[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("namespace", "level"),
+    [("quarantine", "root"), ("quarantine", "day"), ("pending", "root"), ("pending", "day")],
+)
+def test_live_binding_rejects_directory_mode_drift_at_every_namespace_level(
+    tmp_path: Path, namespace: str, level: str
+) -> None:
+    database, _store, spool_root, _reconciler_unused = _reconciler(tmp_path)
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
+    quarantine_chain = scan._open_quarantine_chain(_DAY)
+    assert quarantine_chain is not None
+    quarantine_descriptors, quarantine_identities = quarantine_chain
+    reconcile_module._close_descriptors(quarantine_descriptors)
+    pending_day = spool_root / "pending" / _DAY
+    pending_chain = scan._open_pending_chain(
+        _DAY, reconcile_module.FileIdentity.from_stat(os.lstat(pending_day))
+    )
+    assert pending_chain is not None
+    pending_descriptors, pending_identities = pending_chain
+    reconcile_module._close_descriptors(pending_descriptors)
+    target = spool_root / namespace / (_DAY if level == "day" else "")
+    os.chmod(target, 0o755)
+    try:
+        if namespace == "quarantine":
+            assert not scan._quarantine_binding_holds(_DAY, quarantine_identities)
+        else:
+            assert not scan._pending_binding_holds(_DAY, pending_identities)
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("namespace", "level"),
+    [("quarantine", "root"), ("quarantine", "day"), ("pending", "root"), ("pending", "day")],
+)
+def test_live_binding_rejects_directory_acl_drift_at_every_namespace_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    namespace: str,
+    level: str,
+) -> None:
+    database, _store, spool_root, _reconciler_unused = _reconciler(tmp_path)
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
+    quarantine_chain = scan._open_quarantine_chain(_DAY)
+    assert quarantine_chain is not None
+    quarantine_descriptors, quarantine_identities = quarantine_chain
+    reconcile_module._close_descriptors(quarantine_descriptors)
+    pending_day = spool_root / "pending" / _DAY
+    pending_chain = scan._open_pending_chain(
+        _DAY, reconcile_module.FileIdentity.from_stat(os.lstat(pending_day))
+    )
+    assert pending_chain is not None
+    pending_descriptors, pending_identities = pending_chain
+    reconcile_module._close_descriptors(pending_descriptors)
+    target = spool_root / namespace / (_DAY if level == "day" else "")
+    target_inode = os.lstat(target).st_ino
+    real_acl_check = reconcile_module.require_no_extended_acl
+
+    def _acl_drift(descriptor: int) -> None:
+        if os.fstat(descriptor).st_ino == target_inode:
+            raise SecureFileError(SecureFileErrorKind.ACCESS_CONTROL_UNSAFE)
+        real_acl_check(descriptor)
+
+    monkeypatch.setattr(reconcile_module, "require_no_extended_acl", _acl_drift)
+    try:
+        if namespace == "quarantine":
+            assert not scan._quarantine_binding_holds(_DAY, quarantine_identities)
+        else:
+            assert not scan._pending_binding_holds(_DAY, pending_identities)
+    finally:
+        database.close()
+
+
+def test_live_bindings_recheck_the_owner_predicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, _reconciler_unused = _reconciler(tmp_path)
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
+    quarantine_chain = scan._open_quarantine_chain(_DAY)
+    assert quarantine_chain is not None
+    quarantine_descriptors, quarantine_identities = quarantine_chain
+    reconcile_module._close_descriptors(quarantine_descriptors)
+    pending_day = spool_root / "pending" / _DAY
+    pending_chain = scan._open_pending_chain(
+        _DAY, reconcile_module.FileIdentity.from_stat(os.lstat(pending_day))
+    )
+    assert pending_chain is not None
+    pending_descriptors, pending_identities = pending_chain
+    reconcile_module._close_descriptors(pending_descriptors)
+    actual_uid = reconcile_module._current_uid()
+    monkeypatch.setattr(reconcile_module, "_current_uid", lambda: actual_uid + 1)
+    try:
+        assert not scan._quarantine_binding_holds(_DAY, quarantine_identities)
+        assert not scan._pending_binding_holds(_DAY, pending_identities)
+    finally:
+        database.close()
+
+
+def test_pending_root_swap_during_inventory_invalidates_the_whole_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One inventory may never combine day names from two pending namespaces."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    original = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_root = spool_root / "pending"
+    displaced = tmp_path / "inventory-pending"
+    real_names = reconcile_module._secure_names_from_descriptor
+    calls: list[int] = []
+
+    def _swapping_names(descriptor: int):
+        result = real_names(descriptor)
+        calls.append(descriptor)
+        if len(calls) == 2:
+            os.rename(pending_root, displaced)
+            os.mkdir(pending_root, 0o700)
+        return result
+
+    monkeypatch.setattr(reconcile_module, "_secure_names_from_descriptor", _swapping_names)
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("", "", "foreign_name", "pending_changed") in report.anomalies
+        assert not original.exists()
+        assert (displaced / _DAY / "batch-1.jsonl").read_bytes() == b"junk\n"
+        assert list(pending_root.iterdir()) == []
+    finally:
+        database.close()
+
+
+def test_final_source_unlink_follows_pending_proof_and_final_target_certification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_inode = os.lstat(spool_root / "pending" / _DAY).st_ino
+    events: list[str] = []
+    real_certify = reconcile_module._Scan._certify_live_target
+    real_target_binding = reconcile_module._Scan._quarantine_binding_holds
+    real_source_binding = reconcile_module._Scan._pending_binding_holds
+    real_unlink = os.unlink
+
+    def _certify(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_certify(self, *args, **kwargs)
+        events.append("certify-target")
+        return result
+
+    def _target_binding(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_target_binding(self, *args, **kwargs)
+        events.append("bind-target")
+        return result
+
+    def _source_binding(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_source_binding(self, *args, **kwargs)
+        events.append("bind-pending")
+        return result
+
+    def _unlink(target, *args, **kwargs):  # type: ignore[no-untyped-def]
+        dir_fd = kwargs.get("dir_fd")
+        if (
+            str(target).startswith(reconcile_module._RETIRE_PREFIX)
+            and dir_fd is not None
+            and os.fstat(dir_fd).st_ino == pending_inode
+        ):
+            events.append("unlink-retirement")
+        return real_unlink(target, *args, **kwargs)
+
+    monkeypatch.setattr(reconcile_module._Scan, "_certify_live_target", _certify)
+    monkeypatch.setattr(reconcile_module._Scan, "_quarantine_binding_holds", _target_binding)
+    monkeypatch.setattr(reconcile_module._Scan, "_pending_binding_holds", _source_binding)
+    monkeypatch.setattr(os, "unlink", _unlink)
+    try:
+        report = reconciler.reconcile()
+        assert len(report.quarantined) == 1
+        unlink_index = events.index("unlink-retirement")
+        assert events[unlink_index - 3 : unlink_index] == [
+            "certify-target",
+            "bind-pending",
+            "bind-target",
+        ]
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("swap_level", ["day", "root"])
+def test_publication_reopens_the_live_target_and_cleans_a_displaced_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap_level: str
+) -> None:
+    """A held target descriptor is cleanup authority, never publication authority."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    quarantine_root = spool_root / "quarantine"
+    quarantine_day = quarantine_root / _DAY
+    displaced = tmp_path / f"publish-displaced-{swap_level}"
+    real_publish = reconcile_module._Scan._publish_copy
+    swapped: list[bool] = []
+
+    def _displacing_publish(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not swapped:
+            swapped.append(True)
+            if swap_level == "day":
+                os.rename(quarantine_day, displaced)
+                os.mkdir(quarantine_day, 0o700)
+            else:
+                os.rename(quarantine_root, displaced)
+                os.mkdir(quarantine_root, 0o700)
+                os.mkdir(quarantine_day, 0o700)
+        return real_publish(self, *args, **kwargs)
+
+    monkeypatch.setattr(reconcile_module._Scan, "_publish_copy", _displacing_publish)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert source.read_bytes() == b"junk\n"
+        escaped_day = displaced if swap_level == "day" else displaced / _DAY
+        assert list(escaped_day.iterdir()) == []
+        assert list(quarantine_day.iterdir()) == []
+    finally:
+        database.close()
+
+
+def test_publication_certification_cleanup_preserves_a_same_digest_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cleanup authority is the published inode snapshot, never digest equality alone."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    quarantine_day = spool_root / "quarantine" / _DAY
+    displaced_copy = quarantine_day / "created-copy"
+    candidate = quarantine_day / "batch-1.jsonl"
+    real_certify = reconcile_module._Scan._certify_target
+    fired: list[bool] = []
+
+    def _replacing_certify(self, target_fd, target, digest):  # type: ignore[no-untyped-def]
+        if not fired and target == "batch-1.jsonl":
+            fired.append(True)
+            os.rename(candidate, displaced_copy)
+            candidate.write_bytes(b"junk\n")
+            os.chmod(candidate, 0o600)
+            return None
+        return real_certify(self, target_fd, target, digest)
+
+    monkeypatch.setattr(reconcile_module._Scan, "_certify_target", _replacing_certify)
+    try:
+        report = reconciler.reconcile()
+        assert fired == [True]
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        assert source.read_bytes() == b"junk\n"
+        assert candidate.read_bytes() == displaced_copy.read_bytes() == b"junk\n"
+        assert os.stat(candidate).st_ino != os.stat(displaced_copy).st_ino
+    finally:
+        database.close()
+
+
+def test_publication_routes_a_certified_same_digest_replacement_through_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement can be adopted safely, but never gains created-copy cleanup authority."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    quarantine_day = spool_root / "quarantine" / _DAY
+    displaced_copy = quarantine_day / "created-copy"
+    candidate = quarantine_day / "batch-1.jsonl"
+    real_certify = reconcile_module._Scan._certify_target
+    fired: list[bool] = []
+
+    def _replacing_certify(self, target_fd, target, digest):  # type: ignore[no-untyped-def]
+        if not fired and target == "batch-1.jsonl":
+            fired.append(True)
+            os.rename(candidate, displaced_copy)
+            candidate.write_bytes(b"junk\n")
+            os.chmod(candidate, 0o600)
+        return real_certify(self, target_fd, target, digest)
+
+    monkeypatch.setattr(reconcile_module._Scan, "_certify_target", _replacing_certify)
+    try:
+        report = reconciler.reconcile()
+        assert fired == [True]
+        assert len(report.quarantined) == 1
+        assert not source.exists()
+        assert candidate.read_bytes() == displaced_copy.read_bytes() == b"junk\n"
+        assert os.stat(candidate).st_ino != os.stat(displaced_copy).st_ino
+    finally:
+        database.close()
+
+
+def test_publication_exception_cleanup_preserves_a_same_digest_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exception/finally cleanup paths carry the same exact-inode authority."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    quarantine_day = spool_root / "quarantine" / _DAY
+    displaced_day = tmp_path / "publication-exception-displaced"
+    candidate = quarantine_day / "batch-1.jsonl"
+    created_copy_name = "created-copy"
+    real_fsync = os.fsync
+    fired: list[bool] = []
+
+    def _replacing_fsync(descriptor: int) -> None:
+        info = os.fstat(descriptor)
+        if (
+            not fired
+            and quarantine_day.exists()
+            and os.lstat(quarantine_day).st_ino == info.st_ino
+            and candidate.exists()
+            and not (quarantine_day / reconcile_module._QUARANTINE_STAGE).exists()
+        ):
+            fired.append(True)
+            os.rename(candidate, quarantine_day / created_copy_name)
+            candidate.write_bytes(b"junk\n")
+            os.chmod(candidate, 0o600)
+            os.rename(quarantine_day, displaced_day)
+            os.mkdir(quarantine_day, 0o700)
+            raise OSError(5, "planted target-directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", _replacing_fsync)
+    try:
+        report = reconciler.reconcile()
+        assert fired == [True]
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        assert source.read_bytes() == b"junk\n"
+        replacement = displaced_day / "batch-1.jsonl"
+        created_copy = displaced_day / created_copy_name
+        assert replacement.read_bytes() == created_copy.read_bytes() == b"junk\n"
+        assert os.stat(replacement).st_ino != os.stat(created_copy).st_ino
+        assert list(quarantine_day.iterdir()) == []
+    finally:
+        database.close()
+
+
+def test_target_displaced_by_the_last_pending_proof_never_authorizes_source_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The target proof which authorizes removal must follow every pending-chain callback."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    quarantine_day = spool_root / "quarantine" / _DAY
+    displaced = tmp_path / "target-displaced-by-pending-proof"
+    real_pending_binding = reconcile_module._Scan._pending_binding_holds
+    swapped: list[bool] = []
+
+    def _displacing_pending_binding(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_pending_binding(self, *args, **kwargs)
+        if not swapped and (quarantine_day / "batch-1.jsonl").exists():
+            swapped.append(True)
+            os.rename(quarantine_day, displaced)
+            os.mkdir(quarantine_day, 0o700)
+        return result
+
+    monkeypatch.setattr(
+        reconcile_module._Scan, "_pending_binding_holds", _displacing_pending_binding
+    )
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        assert not source.exists()
+        retirements = tuple(source.parent.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        assert retirements[0].read_bytes() == b"junk\n"
+        assert list(displaced.iterdir()) == []  # this pass created the escaped copy and cleaned it
+
+        quarantine_day.rmdir()
+        os.rename(displaced, quarantine_day)
+        retry = reconciler.reconcile()
+        assert len(retry.quarantined) == 1
+        assert list(source.parent.iterdir()) == []
+        targets = tuple(quarantine_day.iterdir())
+        assert [target.name for target in targets] == ["batch-1.jsonl"]
+        assert targets[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("swap_level", ["day", "root"])
+@pytest.mark.parametrize("certify_call", [2, 3], ids=["pre-retirement", "post-retirement"])
+def test_pending_displaced_during_final_target_certification_is_never_unlinked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swap_level: str,
+    certify_call: int,
+) -> None:
+    """Both target-certification phases are followed by a pending live-binding proof."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_root = spool_root / "pending"
+    pending_day = pending_root / _DAY
+    quarantine_day = spool_root / "quarantine" / _DAY
+    displaced = tmp_path / f"pending-during-certify-{certify_call}-{swap_level}"
+    real_certify = reconcile_module._Scan._certify_live_target
+    calls: list[int] = []
+
+    def _displacing_certify(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_certify(self, *args, **kwargs)
+        calls.append(1)
+        if len(calls) == certify_call:
+            if swap_level == "day":
+                os.rename(pending_day, displaced)
+                os.mkdir(pending_day, 0o700)
+            else:
+                os.rename(pending_root, displaced)
+                os.mkdir(pending_root, 0o700)
+                os.mkdir(pending_day, 0o700)
+        return result
+
+    monkeypatch.setattr(reconcile_module._Scan, "_certify_live_target", _displacing_certify)
+    try:
+        report = reconciler.reconcile()
+        assert len(calls) >= certify_call
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        displaced_day = displaced if swap_level == "day" else displaced / _DAY
+        staged = tuple(displaced_day.iterdir())
+        assert len(staged) == 1
+        assert staged[0].read_bytes() == b"junk\n"
+        if certify_call == 2:
+            assert staged[0].name == "batch-1.jsonl"
+            assert list(quarantine_day.iterdir()) == []
+        else:
+            assert staged[0].name.startswith(reconcile_module._RETIRE_PREFIX)
+            targets = tuple(quarantine_day.iterdir())
+            assert [target.name for target in targets] == ["batch-1.jsonl"]
+            assert targets[0].read_bytes() == b"junk\n"
+        assert list(pending_day.iterdir()) == []
+
+        if swap_level == "day":
+            pending_day.rmdir()
+            os.rename(displaced, pending_day)
+        else:
+            pending_day.rmdir()
+            pending_root.rmdir()
+            os.rename(displaced, pending_root)
+        retry = reconciler.reconcile()
+        assert len(retry.quarantined) == 1
+        assert list(pending_day.iterdir()) == []
+        targets = tuple(quarantine_day.iterdir())
+        assert [target.name for target in targets] == ["batch-1.jsonl"]
+        assert targets[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("certify_call", [2, 3], ids=["pre-retirement", "post-retirement"])
+def test_a_final_quarantine_binding_failure_preserves_recoverable_source_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, certify_call: int
+) -> None:
+    """Each final target certification is followed by its own explicit live-binding decision."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_certify = reconcile_module._Scan._certify_live_target
+    real_binding = reconcile_module._Scan._quarantine_binding_holds
+    calls: list[int] = []
+    armed: list[bool] = []
+
+    def _arming_certify(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_certify(self, *args, **kwargs)
+        calls.append(1)
+        if len(calls) == certify_call:
+            armed.append(True)
+        return result
+
+    def _failing_binding(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if armed:
+            armed.clear()
+            return False
+        return real_binding(self, *args, **kwargs)
+
+    monkeypatch.setattr(reconcile_module._Scan, "_certify_live_target", _arming_certify)
+    monkeypatch.setattr(reconcile_module._Scan, "_quarantine_binding_holds", _failing_binding)
+    try:
+        first = reconciler.reconcile()
+        assert len(calls) >= certify_call
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        staged = tuple(pending_day.iterdir())
+        assert len(staged) == 1
+        assert staged[0].read_bytes() == b"junk\n"
+        if certify_call == 2:
+            assert staged[0].name == "batch-1.jsonl"
+        else:
+            assert staged[0].name.startswith(reconcile_module._RETIRE_PREFIX)
+        assert list(quarantine_day.iterdir()) == []
+
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert list(pending_day.iterdir()) == []
+        targets = tuple(quarantine_day.iterdir())
+        assert [entry.name for entry in targets] == ["batch-1.jsonl"]
+        assert targets[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("namespace", ["pending", "quarantine"])
+@pytest.mark.parametrize("swap_level", ["day", "root"])
+def test_an_adjacent_unlink_namespace_swap_is_detected_as_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    namespace: str,
+    swap_level: str,
+) -> None:
+    """The unavoidable same-UID syscall window never produces a false success claim."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_root = spool_root / "pending"
+    pending_day = pending_root / _DAY
+    quarantine_root = spool_root / "quarantine"
+    quarantine_day = quarantine_root / _DAY
+    live_root = pending_root if namespace == "pending" else quarantine_root
+    live_day = pending_day if namespace == "pending" else quarantine_day
+    displaced = tmp_path / f"adjacent-unlink-{namespace}-{swap_level}"
+    real_unlink = os.unlink
+    fired: list[bool] = []
+
+    def _displacing_unlink(target, *, dir_fd=None):  # type: ignore[no-untyped-def]
+        if not fired and str(target).startswith(reconcile_module._RETIRE_PREFIX):
+            fired.append(True)
+            if swap_level == "day":
+                os.rename(live_day, displaced)
+                os.mkdir(live_day, 0o700)
+            else:
+                os.rename(live_root, displaced)
+                os.mkdir(live_root, 0o700)
+                os.mkdir(live_day, 0o700)
+        return real_unlink(target, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", _displacing_unlink)
+    try:
+        first = reconciler.reconcile()
+        assert fired == [True]
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert not source.exists()
+        displaced_day = displaced if swap_level == "day" else displaced / _DAY
+        if namespace == "pending":
+            assert list(displaced_day.iterdir()) == []
+            assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+        else:
+            assert (displaced_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+            assert list(quarantine_day.iterdir()) == []
+
+        live_day.rmdir()
+        if swap_level == "day":
+            os.rename(displaced, live_day)
+        else:
+            live_root.rmdir()
+            os.rename(displaced, live_root)
+        second = reconciler.reconcile()
+        assert second.quarantined == ()
+        assert second.anomalies == ()
+        assert (spool_root / "quarantine" / _DAY / "batch-1.jsonl").read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("swap_level", ["day", "root"])
+def test_target_displaced_during_final_source_stat_leaves_recoverable_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap_level: str
+) -> None:
+    """A target move after the source decision cannot turn retirement into deletion."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = spool_root / "pending" / _DAY
+    pending_inode = os.lstat(pending_day).st_ino
+    quarantine_root = spool_root / "quarantine"
+    quarantine_day = quarantine_root / _DAY
+    displaced = tmp_path / f"target-during-source-stat-{swap_level}"
+    real_stat = os.stat
+    source_stats: list[int] = []
+
+    def _displacing_stat(target, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_stat(target, *args, **kwargs)
+        dir_fd = kwargs.get("dir_fd")
+        if (
+            target == "batch-1.jsonl"
+            and dir_fd is not None
+            and os.fstat(dir_fd).st_ino == pending_inode
+        ):
+            source_stats.append(1)
+            if len(source_stats) == 2:
+                if swap_level == "day":
+                    os.rename(quarantine_day, displaced)
+                    os.mkdir(quarantine_day, 0o700)
+                else:
+                    os.rename(quarantine_root, displaced)
+                    os.mkdir(quarantine_root, 0o700)
+                    os.mkdir(quarantine_day, 0o700)
+        return result
+
+    monkeypatch.setattr(os, "stat", _displacing_stat)
+    try:
+        report = reconciler.reconcile()
+        assert len(source_stats) >= 2
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        assert not source.exists()
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        assert retirements[0].read_bytes() == b"junk\n"
+        escaped_day = displaced if swap_level == "day" else displaced / _DAY
+        assert list(escaped_day.iterdir()) == []
+        assert list(quarantine_day.iterdir()) == []
+
+        if swap_level == "day":
+            quarantine_day.rmdir()
+            os.rename(displaced, quarantine_day)
+        else:
+            quarantine_day.rmdir()
+            quarantine_root.rmdir()
+            os.rename(displaced, quarantine_root)
+        retry = reconciler.reconcile()
+        assert len(retry.quarantined) == 1
+        assert list(pending_day.iterdir()) == []
+        targets = tuple(quarantine_day.iterdir())
+        assert [target.name for target in targets] == ["batch-1.jsonl"]
+        assert targets[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_an_interrupted_retirement_reuses_the_original_candidate_without_debris(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry adopts the encoded candidate instead of publishing under the private stage name."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    quarantine_day.mkdir(mode=0o700, parents=True)
+    os.chmod(quarantine_day.parent, 0o700)
+    os.chmod(quarantine_day, 0o700)
+    target = quarantine_day / "batch-1.jsonl"
+    target.write_bytes(b"junk\n")
+    os.chmod(target, 0o600)
+    real_pending_binding = reconcile_module._Scan._pending_binding_holds
+    calls: list[int] = []
+
+    def _failing_post_retirement_proof(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(1)
+        if len(calls) == 3:
+            return False
+        return real_pending_binding(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        reconcile_module._Scan, "_pending_binding_holds", _failing_post_retirement_proof
+    )
+    try:
+        first = reconciler.reconcile()
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert not source.exists()
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        assert retirements[0].read_bytes() == b"junk\n"
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+
+        second = reconciler.reconcile()
+        assert second.quarantined == (QuarantinedFile("", _DAY, "stale_temp"),)
+        assert list(pending_day.iterdir()) == []
+        targets = tuple(quarantine_day.iterdir())
+        assert [entry.name for entry in targets] == ["batch-1.jsonl"]
+        assert targets[0].read_bytes() == b"junk\n"
+        third = reconciler.reconcile()
+        assert third.quarantined == ()
+        assert third.anomalies == ()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("name_length", [240, 255])
+def test_a_name_max_staged_temporary_uses_a_bounded_recoverable_candidate(
+    tmp_path: Path, name_length: int
+) -> None:
+    """A legal long entry cannot make retirement fail forever with ``ENAMETOOLONG``."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    prefix = reconcile_module._STAGE_PREFIX
+    name = f"{prefix}{'x' * (name_length - len(prefix))}"
+    source = _publish_orphan(spool_root, _DAY, name, b"junk\n")
+    quarantine_day = spool_root / "quarantine" / _DAY
+    try:
+        first = reconciler.reconcile()
+        assert first.quarantined == (QuarantinedFile("", _DAY, "stale_temp"),)
+        assert SegmentAnomaly("", _DAY, "stale_temp", "staged_temporary") in first.anomalies
+        assert not source.exists()
+        assert list(source.parent.iterdir()) == []
+        targets = tuple(quarantine_day.iterdir())
+        assert len(targets) == 1
+        assert targets[0].name.startswith(".milhouse-quarantine-")
+        assert len(os.fsencode(targets[0].name)) <= os.pathconf(quarantine_day, "PC_NAME_MAX")
+        assert targets[0].read_bytes() == b"junk\n"
+        second = reconciler.reconcile()
+        assert second.quarantined == ()
+        assert second.anomalies == ()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("failure", "detail"),
+    [("name-max", "io"), ("candidate-budget", "collision")],
+)
+def test_candidate_name_bound_failures_leave_the_source_unmodified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, detail: str
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    quarantine_day = spool_root / "quarantine" / _DAY
+    if failure == "name-max":
+
+        def _failing_pathconf(_descriptor: int, _name: str) -> int:
+            raise OSError(5, "planted pathconf failure")
+
+        monkeypatch.setattr(os, "fpathconf", _failing_pathconf)
+    else:
+        monkeypatch.setattr(reconcile_module, "_bounded_candidate_base", lambda *_args: None)
+    try:
+        report = reconciler.reconcile()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_blocked", detail) in report.anomalies
+        assert source.read_bytes() == b"junk\n"
+        assert list(quarantine_day.iterdir()) == []
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "mismatch"])
+def test_retirement_certification_failure_is_uncertain_and_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """An uncertified retirement remains staged and is not falsely reported as completed."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_certify = reconcile_module._Scan._certify_target
+    fired: list[bool] = []
+
+    def _failing_retirement_certify(self, target_fd, candidate, digest):  # type: ignore[no-untyped-def]
+        result = real_certify(self, target_fd, candidate, digest)
+        if not fired and candidate.startswith(reconcile_module._RETIRE_PREFIX):
+            fired.append(True)
+            if failure == "unreadable":
+                return None
+            assert result is not None
+            return FileSnapshot(
+                result.device,
+                result.inode,
+                result.size + 1,
+                result.modified_ns,
+                result.changed_ns,
+            )
+        return result
+
+    monkeypatch.setattr(reconcile_module._Scan, "_certify_target", _failing_retirement_certify)
+    try:
+        first = reconciler.reconcile()
+        assert fired == [True]
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert not source.exists()
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        assert retirements[0].read_bytes() == b"junk\n"
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+
+        second = reconciler.reconcile()
+        assert second.quarantined == (QuarantinedFile("", _DAY, "stale_temp"),)
+        assert list(pending_day.iterdir()) == []
+        targets = tuple(quarantine_day.iterdir())
+        assert [entry.name for entry in targets] == ["batch-1.jsonl"]
+        assert targets[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("failure_point", ["certification", "cleanup"])
+def test_a_public_replacement_racing_retirement_failure_is_never_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str
+) -> None:
+    """Failure paths retain the private source instead of restoring with destructive replace."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    fired: list[bool] = []
+
+    if failure_point == "certification":
+        real_certify = reconcile_module._Scan._certify_target
+
+        def _failing_certify(self, target_fd, candidate, digest):  # type: ignore[no-untyped-def]
+            if not fired and candidate.startswith(reconcile_module._RETIRE_PREFIX):
+                fired.append(True)
+                source.write_bytes(b"replacement\n")
+                os.chmod(source, 0o600)
+                return None
+            return real_certify(self, target_fd, candidate, digest)
+
+        monkeypatch.setattr(reconcile_module._Scan, "_certify_target", _failing_certify)
+    else:
+        real_unlink = os.unlink
+
+        def _failing_unlink(target, *, dir_fd=None):  # type: ignore[no-untyped-def]
+            if (
+                not fired
+                and str(target).startswith(reconcile_module._RETIRE_PREFIX)
+                and dir_fd is not None
+                and os.fstat(dir_fd).st_ino == os.lstat(pending_day).st_ino
+            ):
+                fired.append(True)
+                source.write_bytes(b"replacement\n")
+                os.chmod(source, 0o600)
+                raise OSError(5, "planted retirement cleanup failure")
+            return real_unlink(target, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "unlink", _failing_unlink)
+
+    try:
+        first = reconciler.reconcile()
+        assert fired == [True]
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert source.read_bytes() == b"replacement\n"
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        assert retirements[0].read_bytes() == b"junk\n"
+        assert (quarantine_day / "batch-1.jsonl").read_bytes() == b"junk\n"
+
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 2
+        assert list(pending_day.iterdir()) == []
+        assert {entry.read_bytes() for entry in quarantine_day.iterdir()} == {
+            b"junk\n",
+            b"replacement\n",
+        }
+        third = reconciler.reconcile()
+        assert third.quarantined == ()
+        assert third.anomalies == ()
+    finally:
+        database.close()
+
+
+def test_failed_source_retirement_cleans_only_its_empty_reservation_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_replace = os.replace
+    fired: list[bool] = []
+
+    def _failing_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):  # type: ignore[no-untyped-def]
+        if (
+            not fired
+            and src == "batch-1.jsonl"
+            and str(dst).startswith(reconcile_module._RETIRE_PREFIX)
+        ):
+            fired.append(True)
+            raise OSError(5, "planted retirement failure")
+        return real_replace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(os, "replace", _failing_replace)
+    try:
+        first = reconciler.reconcile()
+        assert fired == [True]
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert source.read_bytes() == b"junk\n"
+        assert [entry.name for entry in pending_day.iterdir()] == ["batch-1.jsonl"]
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert list(pending_day.iterdir()) == []
+        targets = tuple(quarantine_day.iterdir())
+        assert [entry.name for entry in targets] == ["batch-1.jsonl"]
+        assert targets[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_a_retirement_reservation_open_failure_is_uncertain_and_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    real_open = os.open
+    fired: list[bool] = []
+
+    def _failing_open(target, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if (
+            not fired
+            and str(target).startswith(reconcile_module._RETIRE_PREFIX)
+            and flags & os.O_EXCL
+        ):
+            fired.append(True)
+            raise OSError(5, "planted reservation failure")
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _failing_open)
+    try:
+        first = reconciler.reconcile()
+        assert fired == [True]
+        assert first.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in first.anomalies
+        assert source.read_bytes() == b"junk\n"
+        assert [entry.name for entry in pending_day.iterdir()] == ["batch-1.jsonl"]
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+
+        second = reconciler.reconcile()
+        assert len(second.quarantined) == 1
+        assert list(pending_day.iterdir()) == []
+        assert [entry.name for entry in quarantine_day.iterdir()] == ["batch-1.jsonl"]
+    finally:
+        database.close()
+
+
+def test_a_retired_source_advances_when_its_encoded_target_was_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bounded candidate sequence preserves a conflicting target and still converges."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_day = source.parent
+    quarantine_day = spool_root / "quarantine" / _DAY
+    quarantine_day.mkdir(mode=0o700, parents=True)
+    os.chmod(quarantine_day.parent, 0o700)
+    os.chmod(quarantine_day, 0o700)
+    target = quarantine_day / "batch-1.jsonl"
+    target.write_bytes(b"junk\n")
+    os.chmod(target, 0o600)
+    real_pending_binding = reconcile_module._Scan._pending_binding_holds
+    calls: list[int] = []
+
+    def _failing_post_retirement_proof(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(1)
+        if len(calls) == 3:
+            return False
+        return real_pending_binding(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        reconcile_module._Scan, "_pending_binding_holds", _failing_post_retirement_proof
+    )
+    try:
+        first = reconciler.reconcile()
+        assert first.quarantined == ()
+        retirements = tuple(pending_day.glob(f"{reconcile_module._RETIRE_PREFIX}*"))
+        assert len(retirements) == 1
+        target.write_bytes(b"different\n")
+
+        second = reconciler.reconcile()
+        assert second.quarantined == (QuarantinedFile("", _DAY, "stale_temp"),)
+        assert list(pending_day.iterdir()) == []
+        targets = {entry.name: entry.read_bytes() for entry in quarantine_day.iterdir()}
+        assert targets == {
+            "1.batch-1.jsonl": b"junk\n",
+            "batch-1.jsonl": b"different\n",
+        }
+        third = reconciler.reconcile()
+        assert third.quarantined == ()
+        assert third.anomalies == ()
+    finally:
+        database.close()
+
+
+def test_source_removed_during_final_target_certification_is_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source that vanishes after the initial stat must not be reported completed."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    real_certify = reconcile_module._Scan._certify_live_target
+    certify_calls: list[int] = []
+
+    def _removing_certify(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_certify(self, *args, **kwargs)
+        certify_calls.append(1)
+        if len(certify_calls) == 2:
+            os.unlink(source)
+        return result
+
+    monkeypatch.setattr(reconcile_module._Scan, "_certify_live_target", _removing_certify)
+    try:
+        report = reconciler.reconcile()
+        assert not source.exists()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        assert (spool_root / "quarantine" / _DAY / "batch-1.jsonl").read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+def test_source_replaced_during_final_target_certification_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lengthy target reads must finish before the source's final snapshot decision."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    source = _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    classified = tmp_path / "classified-source"
+    real_certify = reconcile_module._Scan._certify_live_target
+    certify_calls: list[int] = []
+
+    def _replacing_certify(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_certify(self, *args, **kwargs)
+        certify_calls.append(1)
+        if len(certify_calls) == 2:
+            os.rename(source, classified)
+            source.write_bytes(b"replacement\n")
+            os.chmod(source, 0o600)
+        return result
+
+    monkeypatch.setattr(reconcile_module._Scan, "_certify_live_target", _replacing_certify)
+    try:
+        report = reconciler.reconcile()
+        assert source.read_bytes() == b"replacement\n"
+        assert classified.read_bytes() == b"junk\n"
+        assert report.quarantined == ()
+        assert (spool_root / "quarantine" / _DAY / "batch-1.jsonl").read_bytes() == b"junk\n"
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
     finally:
         database.close()

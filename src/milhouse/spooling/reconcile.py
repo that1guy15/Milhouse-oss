@@ -32,16 +32,24 @@ re-verified day descriptor, requiring snapshot equality, reading the bytes from 
 requiring digest equality (re-checking the snapshot after the read), staging and
 no-replace-publishing the copy (a candidate name is only ever absent or complete, and an existing
 same-digest candidate is adopted, never aliased), fsyncing file then directory BEFORE the source
-is touched, and revalidating the source name immediately before its unlink — narrowing (POSIX has
-no compare-and-unlink, so no re-stat can fully eliminate) the stat-to-unlink window; the exclusive
-hold and owner-only 0700 pending directory exclude every cooperating writer from that window, and
-whatever happens to the source name, the quarantine target only ever holds the exact classified
-bytes. Outcomes distinguish pre-move blocked, completed, and commit-uncertain, with every claim
-verified, never assumed. Foreign-named entries are reported but
+is touched. Publication and adoption each reopen a fully validated live spool-root -> quarantine
+-> day chain; a copy created by this pass retains cleanup authority and is removed and fsynced if
+that namespace binding is later lost. Finalization performs every long digest and source-snapshot
+check before a last pending live-binding proof, then atomically renames the exact source to a
+private retirement name which encodes its bounded target candidate and fsyncs the day. It re-proves
+the target bytes plus both complete live directory chains AFTER that reversible retirement; only
+then is the retirement unlinked and fsynced. A failed proof leaves classified bytes discoverable as
+a staged temporary for deterministic retry. POSIX has no rename/unlink primitive conditional on an
+ancestor pathname still naming an opened directory, so the exclusive hold and owner-only 0700
+directories exclude cooperating writers from the adjacent-proof syscall window; an uncooperative
+same-UID process is outside that documented model. Outcomes distinguish pre-move blocked,
+completed, and commit-uncertain, with every claim verified, never assumed.
+Foreign-named entries are reported but
 left in place (they have no well-formed quarantine name). The scan never deletes SPOOL DATA: the
-only unlinks are a source whose verified copy is already durably in quarantine and the scan's own
-staging debris (which never holds a last copy). An incomplete pass moves nothing. Every failure
-is a fixed ``MH_SPOOL_*`` error raised outside any handler.
+only unlinks are a retired source after its verified copy and both namespaces are re-proven, the
+scan's own empty reservation/staging debris, or a copy created by this pass after its live binding
+is lost (none ever holds a last copy). An incomplete pass moves nothing. Every failure is a fixed
+``MH_SPOOL_*`` error raised outside any handler.
 """
 
 from __future__ import annotations
@@ -117,6 +125,10 @@ _MAX_MOVE_ATTEMPTS = 100
 # ever absent or a COMPLETE copy, so a crash can never leave partial classified bytes at a name a
 # later scan would have to disambiguate. Crash debris under this name is cleared on the next pass.
 _QUARANTINE_STAGE = ".milhouse-stage-quarantine-copy"
+# Final source removal is two-phase. The public pending name is first atomically replaced by one
+# private retirement name; both namespaces are then re-proven before that retirement is unlinked.
+# A failed proof therefore leaves recoverable staged bytes instead of deleting the source.
+_RETIRE_PREFIX = ".milhouse-stage-quarantine-retired-"
 # A strict ASCII partition-day shape. `datetime.strptime(day, "%Y-%m-%d")` alone is not enough: its
 # `%d`/`%m` accept space-padded fields (e.g. "2026-07- 5"), which would then produce a committed_at
 # the schema's length-only CHECK admits but the ledger reader's stricter stamp regex rejects — a
@@ -146,9 +158,10 @@ class SegmentAnomaly:
     stays in pending and is re-reported every scan — reasons ``unsafe`` (the subject is not an
     owned, exact-0600, single-link, ACL-free regular file: a staged symlink, directory, FIFO,
     device, or multi-link file is never queued, followed, or linked), ``unreachable``,
-    ``changed``, ``collision``, ``io``), ``quarantine_uncertain`` (a durable quarantine
-    copy of the classified bytes exists — or could not be ruled out — but the pending source's
-    state could not be confirmed; the next scan converges by adopting the same-digest copy), or
+    ``changed``, ``collision``, ``io``), ``quarantine_uncertain`` (a durable quarantine copy was
+    created, exists, or could not be ruled out, but the pending source's state or live target
+    binding could not be confirmed; the next scan converges by adopting a live same-digest copy or
+    producing a fresh live copy), or
     ``limit`` (a scan bound was exceeded).
     ``batch_id`` and ``day`` are validated identifiers or empty when the underlying name was
     invalid (untrusted names are omitted entirely, never echoed or fingerprinted); ``detail`` is a
@@ -193,6 +206,20 @@ class ReconciliationReport:
     healthy: int
     scanned: int
     complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PlacedCopy:
+    """A certified target plus cleanup authority for a copy created by this pass."""
+
+    candidate: str
+    snapshot: FileSnapshot
+    target_identities: tuple[FileIdentity, FileIdentity, FileIdentity]
+    cleanup_fd: int | None
+
+    @property
+    def created(self) -> bool:
+        return self.cleanup_fd is not None
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -267,6 +294,25 @@ def _fsync_descriptor(descriptor: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _close_descriptors(descriptors: tuple[int, ...]) -> None:
+    """Best-effort close a descriptor chain without masking the classified operation result."""
+
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError:  # pragma: no cover - defensive close failure
+            pass
+
+
+def _descriptors_match(descriptors: tuple[int, ...], identities: tuple[FileIdentity, ...]) -> bool:
+    """Revalidate every held directory's complete envelope and captured identity together."""
+
+    return len(descriptors) == len(identities) and all(
+        _validated_dir_descriptor(descriptor) == identity
+        for descriptor, identity in zip(descriptors, identities, strict=True)
+    )
 
 
 def _validated_dir_descriptor(descriptor: int) -> FileIdentity | None:
@@ -392,60 +438,69 @@ def _is_valid_day(day: str) -> bool:
     return valid
 
 
-def _secure_dir_names(
-    path: Path,
-) -> tuple[tuple[str, ...] | None, FileIdentity | None, str | None]:
-    """List a directory over an owned 0700 no-follow descriptor, capping entries before collecting.
+def _retirement_candidate(name: str, snapshot: FileSnapshot) -> str | None:
+    """Recover the exact quarantine candidate encoded in one retirement name.
 
-    Returns ``(names, identity, None)`` on success (``((), None, None)`` if absent), where
-    ``identity`` is the opened directory's device/inode so a later per-file read can prove it still
-    operates beneath the exact inventoried directory; or ``(None, None, reason)`` where reason is
-    ``unsafe`` (symlink, non-directory, wrong owner, or mode) or ``unreadable``.
+    Device and inode bind the private name to the staged object. A planted name that merely uses
+    the reserved prefix is therefore handled as an ordinary staged temporary, never as recovery
+    authority for an unrelated quarantine candidate.
     """
 
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
-        return (), None, None
-    except OSError as exc:
-        return None, None, "unsafe" if exc.errno in {errno.ELOOP, errno.ENOTDIR} else "unreadable"
-    problem: str | None = None
+    marker = f"{_RETIRE_PREFIX}{snapshot.device:x}-{snapshot.inode:x}--"
+    if not name.startswith(marker):
+        return None
+    candidate = name[len(marker) :]
+    return candidate or None
+
+
+def _retirement_name(snapshot: FileSnapshot, candidate: str) -> str:
+    """Encode the durable target name so an interrupted retirement can adopt it on retry."""
+
+    return f"{_RETIRE_PREFIX}{snapshot.device:x}-{snapshot.inode:x}--{candidate}"
+
+
+def _bounded_candidate_base(
+    name: str, snapshot: FileSnapshot, digest: str, name_max: int
+) -> str | None:
+    """Choose a deterministic candidate whose worst-case retirement name fits ``NAME_MAX``."""
+
+    attempt_prefix = f"{_MAX_MOVE_ATTEMPTS - 1}."
+    retirement_overhead = len(os.fsencode(_retirement_name(snapshot, attempt_prefix)))
+    candidate_budget = name_max - retirement_overhead
+    encoded_name = os.fsencode(name)
+    if 0 < len(encoded_name) <= candidate_budget:
+        return name
+    token = hashlib.sha256(encoded_name + b"\0" + digest.encode("ascii")).hexdigest()
+    compact = f".milhouse-quarantine-{token}"
+    if len(os.fsencode(compact)) <= candidate_budget:
+        return compact
+    return None
+
+
+def _secure_names_from_descriptor(
+    descriptor: int,
+) -> tuple[tuple[str, ...] | None, FileIdentity | None, str | None]:
+    """List one already-open directory while preserving its complete secure envelope."""
+
+    identity = _validated_dir_descriptor(descriptor)
+    if identity is None:
+        return None, None, "unsafe"
     names: tuple[str, ...] | None = None
-    identity: FileIdentity | None = None
+    problem: str | None = None
     try:
-        info = os.fstat(descriptor)
-        identity = FileIdentity.from_stat(info)
-        acl_unsafe = False
-        try:
-            require_no_extended_acl(descriptor)
-        except SecureFileError:
-            acl_unsafe = True
-        if (
-            acl_unsafe
-            or not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != _current_uid()
-            or stat.S_IMODE(info.st_mode) != _DIR_MODE
-        ):
+        collected: list[str] = []
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if len(collected) >= _MAX_ENTRIES:
+                    problem = "too_many"
+                    break
+                collected.append(entry.name)
+        if problem is None:
+            names = tuple(sorted(collected))
+        if _validated_dir_descriptor(descriptor) != identity:
             problem = "unsafe"
-        else:
-            collected: list[str] = []
-            with os.scandir(descriptor) as entries:
-                for entry in entries:
-                    if len(collected) >= _MAX_ENTRIES:
-                        problem = "too_many"
-                        break
-                    collected.append(entry.name)
-            if problem is None:
-                names = tuple(sorted(collected))
-    except OSError:  # pragma: no cover - defensive: fstat/scandir failure after a successful open
+    except OSError:
         problem = "unreadable"
-    finally:
-        try:
-            os.close(descriptor)
-        except OSError:  # pragma: no cover - defensive: close failure on a valid descriptor
-            problem = problem or "unreadable"
     if problem is not None:
         return None, None, problem
     return names, identity, None
@@ -664,8 +719,9 @@ class _Scan:
                     self._quarantined.append(QuarantinedFile(batch_id, day, detail))
                 elif outcome == "uncertain":
                     # the target is durably named but the source state could not be confirmed:
-                    # reported distinctly, never as completed and never as still-pending; the next
-                    # scan converges by adopting the same-inode twin
+                    # reported distinctly, never as completed; the public source may remain or be
+                    # recoverably retired in pending, and the next scan converges through the live
+                    # certified copy or a fresh live copy
                     self._move_failures.append(
                         SegmentAnomaly(batch_id, day, "quarantine_uncertain", "io")
                     )
@@ -722,57 +778,137 @@ class _Scan:
 
     def _inventory(self) -> list[tuple[str, str, Path, FileIdentity]]:
         pending = self._spool_root / _PENDING
-        day_names, _pending_identity, problem = _secure_dir_names(pending)
-        if problem is not None:
-            # an unlistable pending directory means the inventory cannot be proven complete
-            self._anomaly("", "", "foreign_name", f"pending_{problem}")
+        root_chain = self._open_existing_chain(())
+        if root_chain is None:
+            # Only a validated spool root may certify an empty inventory. A missing, symlinked,
+            # foreign, loose, ACL-bearing, or unreadable configured root is never equivalent to an
+            # empty pending child.
+            self._anomaly("", "", "foreign_name", "spool_root_unsafe")
             self._complete = False
             return []
-        assert day_names is not None
-        if len(day_names) > _MAX_DAYS:
-            self._anomaly("", "", "limit", "day_limit")
-            self._complete = False
-            return []
+        root_descriptors, root_identities = root_chain
+        held_descriptors = root_descriptors
         candidates: list[tuple[str, str, Path, FileIdentity]] = []
-        for day in day_names:
-            if self._capped():
-                # The anomaly cap bounds lock-hold WORK, not just report size: once it fires, no
-                # further directory is opened and no further entry is classified.
+        try:
+            root_fd = root_descriptors[-1]
+            try:
+                pending_fd = os.open(_PENDING, _dir_flags(), dir_fd=root_fd)
+            except FileNotFoundError:
+                # Absence is a valid empty spool only when the held root still has its complete
+                # envelope and remains the configured live root at the decision point.
+                if _descriptors_match(root_descriptors, root_identities) and self._binding_holds(
+                    (), root_identities
+                ):
+                    return []
+                self._anomaly("", "", "foreign_name", "spool_root_changed")
+                self._complete = False
+                return []
+            except OSError:
+                self._anomaly("", "", "foreign_name", "pending_unsafe")
+                self._complete = False
+                return []
+            held_descriptors = (*root_descriptors, pending_fd)
+            pending_identity = _validated_dir_descriptor(pending_fd)
+            if pending_identity is None:
+                self._anomaly("", "", "foreign_name", "pending_unsafe")
+                self._complete = False
+                return []
+            pending_identities = (*root_identities, pending_identity)
+            if not _descriptors_match(held_descriptors, pending_identities):
+                self._anomaly("", "", "foreign_name", "pending_changed")
+                self._complete = False
+                return []
+            day_names, pending_identity, problem = _secure_names_from_descriptor(pending_fd)
+            if problem is not None or pending_identity != pending_identities[-1]:
+                self._anomaly("", "", "foreign_name", f"pending_{problem or 'changed'}")
+                self._complete = False
+                return []
+            assert day_names is not None
+            if len(day_names) > _MAX_DAYS:
+                self._anomaly("", "", "limit", "day_limit")
+                self._complete = False
+                return []
+            for day in day_names:
+                if self._capped():
+                    # The anomaly cap bounds lock-hold WORK, not just report size: once it fires,
+                    # no further directory is opened and no further entry is classified.
+                    self._complete = False
+                    return candidates
+                if not _is_valid_day(day):
+                    self._anomaly("", "", "foreign_name", "day")
+                    continue
+                if not self._inventory_day(pending_fd, pending, day, candidates):
+                    return candidates
+                if not _descriptors_match(
+                    held_descriptors, pending_identities
+                ) or not self._binding_holds((_PENDING,), pending_identities):
+                    self._anomaly("", "", "foreign_name", "pending_changed")
+                    self._complete = False
+                    return candidates
+            if not _descriptors_match(
+                held_descriptors, pending_identities
+            ) or not self._binding_holds((_PENDING,), pending_identities):
+                self._anomaly("", "", "foreign_name", "pending_changed")
                 self._complete = False
                 return candidates
-            if not _is_valid_day(day):
-                self._anomaly("", "", "foreign_name", "day")
-                continue
-            entries, day_identity, entry_problem = _secure_dir_names(pending / day)
+            if self._capped():
+                self._complete = False  # the anomaly cap fired on the final inventory item
+            return candidates
+        finally:
+            _close_descriptors(held_descriptors)
+
+    def _inventory_day(
+        self,
+        pending_fd: int,
+        pending: Path,
+        day: str,
+        candidates: list[tuple[str, str, Path, FileIdentity]],
+    ) -> bool:
+        """Inventory one day relative to the held pending descriptor; always close the day fd."""
+
+        day_fd: int | None = None
+        try:
+            entries: tuple[str, ...] | None = None
+            day_identity: FileIdentity | None = None
+            entry_problem: str | None = None
+            try:
+                day_fd = os.open(day, _dir_flags(), dir_fd=pending_fd)
+                entries, day_identity, entry_problem = _secure_names_from_descriptor(day_fd)
+            except OSError as error:
+                entry_problem = (
+                    "unsafe" if error.errno in {errno.ELOOP, errno.ENOTDIR} else "unreadable"
+                )
             if entry_problem is not None:
-                # an unlistable or truncated day leaves possible batches (and duplicates) unseen
+                # An unlistable or truncated day leaves possible batches and duplicates unseen.
                 self._anomaly("", day, "foreign_name", f"day_{entry_problem}")
                 self._complete = False
-                continue
+                return True
             assert entries is not None and day_identity is not None
             for name in entries:
                 if self._capped():
                     self._complete = False
-                    return candidates
+                    return False
                 if self._scanned >= _MAX_TOTAL:
                     self._anomaly("", "", "limit", "scan_limit")
                     self._complete = False
-                    return candidates
+                    return False
                 self._scanned += 1
                 if name.startswith(_STAGE_PREFIX):
-                    # a crashed writer's staged temporary: never a committed artifact, so it is
-                    # quarantined by policy rather than recovered (replay regenerates the batch).
-                    # The leaf is inspected no-follow like every quarantine subject: a staged
-                    # symlink/directory/FIFO/foreign shape is refused, never followed or moved.
+                    # A crashed writer's staged temporary is never committed. Its leaf is still
+                    # inspected no-follow before quarantine is queued.
                     self._anomaly("", day, "stale_temp", "staged_temporary")
                     self._queue_quarantine(day, name, day_identity, "", "stale_temp")
                     continue
                 resolved = self._classify_name(pending / day / name, day, name)
                 if resolved is not None:
                     candidates.append((*resolved, day_identity))
-        if self._capped():
-            self._complete = False  # the anomaly cap fired on the final inventory item
-        return candidates
+            return True
+        finally:
+            if day_fd is not None:
+                try:
+                    os.close(day_fd)
+                except OSError:  # pragma: no cover - defensive close failure
+                    self._complete = False
 
     def _classify_name(self, path: Path, day: str, name: str) -> tuple[str, str, Path] | None:
         if not name.endswith(_SEGMENT_SUFFIX):
@@ -922,72 +1058,172 @@ class _Scan:
 
     def _open_quarantine_chain(
         self, day: str
-    ) -> tuple[int, tuple[FileIdentity, FileIdentity, FileIdentity]] | None:
+    ) -> tuple[tuple[int, int, int], tuple[FileIdentity, FileIdentity, FileIdentity]] | None:
         """Open spool-root -> quarantine -> day as a validated descriptor chain.
 
         Every level is opened no-follow relative to its already-validated parent and its exact
-        identity captured, so a path re-walk can never be redirected mid-chain. Returns the OPEN
-        day descriptor plus the (root, quarantine, day) identities, or None.
+        identity captured, so a path re-walk can never be redirected mid-chain. All three
+        descriptors stay open for the caller, preventing a captured ancestor inode from being
+        recycled while a mutation is in flight.
         """
 
-        root_fd: int | None = None
-        quarantine_fd: int | None = None
-        result: tuple[int, tuple[FileIdentity, FileIdentity, FileIdentity]] | None = None
+        descriptors: list[int] = []
+        result: (
+            tuple[tuple[int, int, int], tuple[FileIdentity, FileIdentity, FileIdentity]] | None
+        ) = None
         try:
             root_fd = os.open(self._spool_root, _dir_flags())
+            descriptors.append(root_fd)
             root_identity = _validated_dir_descriptor(root_fd)
             if root_identity is not None:
                 quarantine = _ensure_private_dir_at(root_fd, _QUARANTINE)
                 if quarantine is not None:
                     quarantine_fd, quarantine_identity = quarantine
+                    descriptors.append(quarantine_fd)
                     day_pair = _ensure_private_dir_at(quarantine_fd, day)
                     if day_pair is not None:
                         day_fd, day_identity = day_pair
-                        result = (day_fd, (root_identity, quarantine_identity, day_identity))
+                        descriptors.append(day_fd)
+                        held_descriptors = (root_fd, quarantine_fd, day_fd)
+                        identities = (root_identity, quarantine_identity, day_identity)
+                        if _descriptors_match(held_descriptors, identities):
+                            result = (held_descriptors, identities)
         except OSError:
             result = None
         finally:
-            for descriptor in (quarantine_fd, root_fd):
-                if descriptor is not None:
-                    try:
-                        os.close(descriptor)
-                    except OSError:  # pragma: no cover - defensive close failure
-                        pass
+            if result is None:
+                _close_descriptors(tuple(descriptors))
         return result
+
+    def _open_existing_chain(
+        self, components: tuple[str, ...]
+    ) -> tuple[tuple[int, ...], tuple[FileIdentity, ...]] | None:
+        """Open and fully validate an existing live chain beneath the configured spool root.
+
+        Every descriptor is opened no-follow relative to the previously validated descriptor.
+        Ownership, exact 0700 mode, directory type, and the ACL envelope are checked at every
+        level. Every descriptor remains open for the caller so none of the captured ancestor
+        identities can be recycled before the caller finishes its proof or mutation.
+        """
+
+        descriptors: list[int] = []
+        identities: list[FileIdentity] = []
+        complete = False
+        try:
+            root_fd = os.open(self._spool_root, _dir_flags())
+            descriptors.append(root_fd)
+            root_identity = _validated_dir_descriptor(root_fd)
+            if root_identity is None:
+                return None
+            identities.append(root_identity)
+            parent_fd = root_fd
+            for component in components:
+                descriptor = os.open(component, _dir_flags(), dir_fd=parent_fd)
+                descriptors.append(descriptor)
+                identity = _validated_dir_descriptor(descriptor)
+                if identity is None:
+                    return None
+                identities.append(identity)
+                parent_fd = descriptor
+            held_descriptors = tuple(descriptors)
+            captured_identities = tuple(identities)
+            if not _descriptors_match(held_descriptors, captured_identities):
+                return None
+            complete = True
+            return held_descriptors, captured_identities
+        except OSError:
+            return None
+        finally:
+            if not complete:
+                _close_descriptors(tuple(descriptors))
+
+    def _binding_holds(
+        self, components: tuple[str, ...], identities: tuple[FileIdentity, ...]
+    ) -> bool:
+        """Require a fresh secure live-chain walk to match every captured identity."""
+
+        chain = self._open_existing_chain(components)
+        if chain is None:
+            return False
+        descriptors, current_identities = chain
+        try:
+            return current_identities == identities
+        finally:
+            _close_descriptors(descriptors)
+
+    def _open_matching_chain(
+        self, components: tuple[str, ...], identities: tuple[FileIdentity, ...]
+    ) -> tuple[int, ...] | None:
+        """Open a fresh secure live chain and require every expected identity."""
+
+        chain = self._open_existing_chain(components)
+        if chain is None:
+            return None
+        descriptors, current_identities = chain
+        if current_identities == identities:
+            return descriptors
+        _close_descriptors(descriptors)
+        return None
+
+    def _open_pending_chain(
+        self, day: str, inventoried_day_identity: FileIdentity
+    ) -> tuple[tuple[int, ...], tuple[FileIdentity, ...]] | None:
+        """Open the live spool-root -> pending -> day chain from the configured root."""
+
+        chain = self._open_existing_chain((_PENDING, day))
+        if chain is None:
+            return None
+        descriptors, identities = chain
+        if identities[-1] == inventoried_day_identity:
+            return descriptors, identities
+        _close_descriptors(descriptors)
+        return None
 
     def _quarantine_binding_holds(
         self, day: str, identities: tuple[FileIdentity, FileIdentity, FileIdentity]
     ) -> bool:
-        """Re-walk spool-root -> quarantine -> day and require the EXACT captured identities.
+        """Re-walk spool-root -> quarantine -> day and require its secure captured binding.
 
         The round-3 review displaced the held day descriptor with a rename after validation, so
         the copy landed outside ``spool/quarantine`` while the source was unlinked. Publication
-        and the source unlink each re-prove that the live pathname still resolves to the exact
-        directories the chain validated; any swap refuses the mutation.
+        and retirement finalization each re-prove that the live pathname still resolves to the
+        exact, owned, ACL-free 0700 directories the chain validated; a swap or envelope drift
+        refuses destructive cleanup.
         """
 
-        root_identity, quarantine_identity, day_identity = identities
-        opened: list[int] = []
-        holds = False
+        return self._binding_holds((_QUARANTINE, day), identities)
+
+    def _pending_binding_holds(self, day: str, identities: tuple[FileIdentity, ...]) -> bool:
+        """Re-prove the exact secure live spool-root -> pending -> day binding."""
+
+        return self._binding_holds((_PENDING, day), identities)
+
+    def _certify_live_target(
+        self,
+        day: str,
+        identities: tuple[FileIdentity, FileIdentity, FileIdentity],
+        candidate: str,
+        digest: str,
+    ) -> FileSnapshot | None:
+        """Certify a target reached through a fresh exact secure live-chain walk."""
+
+        chain = self._open_existing_chain((_QUARANTINE, day))
+        if chain is None:
+            return None
+        descriptors, live_identities = chain
         try:
-            root_fd = os.open(self._spool_root, _dir_flags())
-            opened.append(root_fd)
-            if FileIdentity.from_stat(os.fstat(root_fd)) == root_identity:
-                quarantine_fd = os.open(_QUARANTINE, _dir_flags(), dir_fd=root_fd)
-                opened.append(quarantine_fd)
-                if FileIdentity.from_stat(os.fstat(quarantine_fd)) == quarantine_identity:
-                    day_fd = os.open(day, _dir_flags(), dir_fd=quarantine_fd)
-                    opened.append(day_fd)
-                    holds = FileIdentity.from_stat(os.fstat(day_fd)) == day_identity
-        except OSError:
-            holds = False
+            if live_identities != identities:
+                return None
+            snapshot = self._certify_target(descriptors[-1], candidate, digest)
+            if (
+                snapshot is None
+                or not _descriptors_match(descriptors, identities)
+                or not self._quarantine_binding_holds(day, identities)
+            ):
+                return None
+            return snapshot
         finally:
-            for descriptor in opened:
-                try:
-                    os.close(descriptor)
-                except OSError:  # pragma: no cover - defensive close failure
-                    pass
-        return holds
+            _close_descriptors(descriptors)
 
     def _move_to_quarantine(
         self,
@@ -1001,23 +1237,30 @@ class _Scan:
 
         A hard link cannot freeze content — both names remain the same writable inode — so the
         move copies (the round-2 review reproduced an in-place rewrite being certified as the
-        classified file). The source is re-opened no-follow beneath the re-verified pending day
-        descriptor and must match the classification-time snapshot exactly; its bytes are read
-        FROM THAT DESCRIPTOR, must hash to the classified digest, and the snapshot is
+        classified file). The source is re-opened no-follow beneath a retained secure
+        spool-root -> pending -> day descriptor chain and must match the classification-time
+        snapshot exactly; its bytes are read FROM THAT DESCRIPTOR, must hash to the classified
+        digest, and the snapshot is
         re-verified after the read — so no name swap or in-place mutation can substitute bytes.
-        The quarantine target directory is reached ONLY through a validated descriptor chain
-        (spool root -> quarantine -> day, each opened no-follow relative to its parent, each
-        identity captured), and that exact live binding is re-proven immediately before
-        publication and again before the source unlink — a displaced directory refuses the
-        mutation (round-3 P1). The copy is staged and no-replace-published (a candidate name is
-        only ever absent or complete), fsynced file then directory BEFORE the source is touched.
+        Publication and adoption each freshly reopen the quarantine chain, require every captured
+        identity and access-control envelope, and rebind the live target after certification. A
+        copy created by this pass retains a day descriptor used only for exact-copy cleanup, never
+        as stale publication or destructive-cleanup authority. Finalization freshly opens pending,
+        performs the long target and source checks, and re-proves the pending binding before the
+        bounded reservation-and-rename sequence that retires the source under a private name.
+        After that reversible rename it re-proves the live target and both namespace bindings
+        before deleting the retirement; a failed proof leaves staged bytes for bounded retry. A
+        displaced or access-control-drifted chain therefore refuses destructive cleanup
+        (round-4/5 P1/P2). The copy is staged and no-replace-published (a
+        candidate is only ever absent or complete), fsynced file then directory BEFORE the source
+        is touched.
         A pre-existing candidate is adopted ONLY when it passes the full subject envelope
         (owned, exact-0600, single-link, ACL-free, snapshot-stable) AND holds the exact
         classified digest; any foreign or multi-link occupant advances the bounded counter
-        (round-3 P1). The certified target's identity and the source name are both revalidated
-        immediately before the unlink, refusing whatever the re-stat can observe (POSIX offers
-        no compare-and-unlink; the exclusive hold and owner-only directories exclude cooperating
-        writers from the one-syscall window). Returns ``None`` when the classified bytes are
+        (round-3 P1). The retired source, certified target, and complete live bindings are all
+        revalidated immediately before retirement cleanup (POSIX offers no ancestor-conditional
+        unlink; the exclusive hold and owner-only directories exclude cooperating writers from
+        the adjacent syscall window). Returns ``None`` when the classified bytes are
         durably quarantined under the live namespace, ``"unreachable"``/``"changed"``/
         ``"collision"``/``"io"`` when verifiably nothing of this subject's moved (the file stays
         in pending), or ``"uncertain"`` when a copy may exist — or its namespace binding could
@@ -1025,96 +1268,318 @@ class _Scan:
         unmovable file cannot wedge recovery.
         """
 
-        chain = self._open_quarantine_chain(day)
-        if chain is None:
+        target_chain = self._open_quarantine_chain(day)
+        if target_chain is None:
             return "unreachable"
-        target_fd, identities = chain
-        source_dir_fd: int | None = None
+        target_descriptors, target_identities = target_chain
+        _close_descriptors(target_descriptors)
+        source_descriptors: tuple[int, ...] = ()
         source_fd: int | None = None
+        placed: _PlacedCopy | None = None
         outcome: str | None = "io"
         try:
-            source_dir_fd = os.open(self._spool_root / _PENDING / day, _dir_flags())
-            if FileIdentity.from_stat(os.fstat(source_dir_fd)) != day_identity:
+            source_chain = self._open_pending_chain(day, day_identity)
+            if source_chain is None:
                 return "changed"
+            source_descriptors, source_identities = source_chain
+            source_dir_fd = source_descriptors[-1]
             try:
                 source_fd = os.open(name, _leaf_probe_flags(), dir_fd=source_dir_fd)
             except OSError:
-                return "changed"  # vanished, or a symlink swapped in (rejected by no-follow)
+                return "changed"
             if FileSnapshot.from_stat(os.fstat(source_fd)) != snapshot:
-                return "changed"  # replaced OR rewritten in place since classification
+                return "changed"
             content = _read_descriptor(source_fd, snapshot.size)
             if content is None or hashlib.sha256(content).hexdigest() != digest:
-                return "changed"  # the bytes are not the classified bytes
+                return "changed"
             if FileSnapshot.from_stat(os.fstat(source_fd)) != snapshot:
-                return "changed"  # mutated during the read (ctime/mtime backstop)
-            if not self._quarantine_binding_holds(day, identities):
-                return "changed"  # the quarantine namespace was displaced after validation
-            placed_snapshot: FileSnapshot | None = None
-            for attempt in range(_MAX_MOVE_ATTEMPTS):
-                candidate = name if attempt == 0 else f"{attempt}.{name}"
+                return "changed"
+            if not self._pending_binding_holds(day, source_identities):
+                return "changed"
+            if not self._quarantine_binding_holds(day, target_identities):
+                return "changed"
+
+            recovered_candidate = _retirement_candidate(name, snapshot)
+            if recovered_candidate is None:
+                try:
+                    name_max = int(os.fpathconf(source_dir_fd, "PC_NAME_MAX"))
+                except (OSError, ValueError):
+                    return "io"
+                candidate_base = _bounded_candidate_base(name, snapshot, digest, name_max)
+                if candidate_base is None:
+                    return "collision"
+                attempts = _MAX_MOVE_ATTEMPTS
+            else:
+                candidate_base = recovered_candidate
+                # The retirement encodes the deterministic candidate-set base. A retry first
+                # adopts that exact destination, then may advance through the same bounded
+                # counter sequence if the target was subsequently replaced or corrupted.
+                attempts = _MAX_MOVE_ATTEMPTS
+            for attempt in range(attempts):
+                candidate = candidate_base if attempt == 0 else f"{attempt}.{candidate_base}"
                 if candidate == _QUARANTINE_STAGE:
-                    # the fixed staging name is clearable debris by definition, so a copy
-                    # published THERE would be destroyed by the next publish into this day —
-                    # the verification workflow reproduced exactly that via a pending subject
-                    # named like the stage; such a subject lands at a counter-prefixed name
                     continue
-                published = self._publish_copy(target_fd, candidate, content)
+                published, fresh = self._publish_copy(
+                    day, target_identities, candidate, content, digest
+                )
                 if published == "placed":
-                    placed_snapshot = self._certify_target(target_fd, candidate, digest)
-                    if placed_snapshot is None:
-                        return "uncertain"  # the fresh copy could not be certified in place
+                    assert fresh is not None
+                    placed = fresh
                     break
+                if published == "uncertain":
+                    return "uncertain"
                 if published == "exists":
-                    verdict, adopted_snapshot = self._adopt_existing(target_fd, candidate, digest)
+                    verdict, adopted_snapshot = self._adopt_existing(
+                        day, target_identities, candidate, digest
+                    )
                     if verdict == "adopted":
-                        placed_snapshot = adopted_snapshot  # an earlier interrupted move: ours
+                        assert adopted_snapshot is not None
+                        placed = _PlacedCopy(
+                            candidate, adopted_snapshot, target_identities, cleanup_fd=None
+                        )
                         break
                     if verdict in ("different", "absent"):
-                        continue  # a foreign occupant: advance the bounded counter
-                    # an unexaminable pre-existing occupant COULD be this source's own earlier
-                    # interrupted copy: a clean blocked code would overclaim, so report the
-                    # ambiguity honestly — the next scan converges once it can be examined
+                        continue
                     return "uncertain"
-                # published == "failed": VERIFY whether the durable name appeared anyway —
-                # the round-2 review showed a clean blocked code masking an unproven state
-                verdict, adopted_snapshot = self._adopt_existing(target_fd, candidate, digest)
+                # A failed fresh publication is rechecked through a NEW live chain. This cannot
+                # adopt an escaped copy because adoption never reads through the publisher's held
+                # descriptor.
+                verdict, adopted_snapshot = self._adopt_existing(
+                    day, target_identities, candidate, digest
+                )
                 if verdict == "adopted":
-                    placed_snapshot = adopted_snapshot  # the copy landed and is proven durable
+                    assert adopted_snapshot is not None
+                    placed = _PlacedCopy(
+                        candidate, adopted_snapshot, target_identities, cleanup_fd=None
+                    )
                     break
                 if verdict in ("different", "absent"):
-                    return "io"  # verified: no classified copy exists; the source is untouched
-                return "uncertain"  # a copy may exist but could not be proven or disproven
-            if placed_snapshot is None:
+                    return "io"
+                return "uncertain"
+            if placed is None:
                 return "collision"
-            # the classified bytes are durably named in quarantine; from here failures are
-            # commit-uncertain, never silently misreported as "still pending"
+
             outcome = "uncertain"
-            if not self._quarantine_binding_holds(day, identities):
-                return "uncertain"  # the namespace moved AFTER publication: never unlink
-            certified = self._certify_target(target_fd, candidate, digest)
-            if certified is None or certified != placed_snapshot:
-                return "uncertain"  # the certified copy is no longer provably in place
-            try:
-                current = os.stat(name, dir_fd=source_dir_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                return None  # the source name is already gone; the move is complete
-            if FileSnapshot.from_stat(current) != snapshot:
-                # the name was replaced or rewritten after the copy: never unlink the
-                # unclassified object — the classified bytes are safely in quarantine and the
-                # newcomer is scanned next pass
+            finalized = self._finalize_source_removal(
+                day=day,
+                name=name,
+                source_identities=source_identities,
+                source_snapshot=snapshot,
+                placed=placed,
+                digest=digest,
+            )
+            if finalized is None:
                 return None
-            os.unlink(name, dir_fd=source_dir_fd)
-            os.fsync(source_dir_fd)
-            return None
+            if finalized == "cleanup" and placed.created:
+                self._cleanup_created_copy(placed, digest)
+            return "uncertain"
         except OSError:
             return outcome
         finally:
-            for descriptor in (target_fd, source_fd, source_dir_fd):
-                if descriptor is not None:
-                    try:
-                        os.close(descriptor)
-                    except OSError:  # pragma: no cover - defensive close failure
-                        pass
+            if placed is not None and placed.cleanup_fd is not None:
+                try:
+                    os.close(placed.cleanup_fd)
+                except OSError:  # pragma: no cover - defensive close failure
+                    pass
+            if source_fd is not None:
+                try:
+                    os.close(source_fd)
+                except OSError:  # pragma: no cover - defensive close failure
+                    pass
+            _close_descriptors(source_descriptors)
+
+    def _finalize_source_removal(
+        self,
+        *,
+        day: str,
+        name: str,
+        source_identities: tuple[FileIdentity, ...],
+        source_snapshot: FileSnapshot,
+        placed: _PlacedCopy,
+        digest: str,
+    ) -> str | None:
+        """Retire the source atomically, re-prove both namespaces, then clean the retirement.
+
+        The public source name is never directly unlinked. It is first moved over a private
+        reservation in the same pending day, preserving whichever exact object owned the name at
+        that atomic syscall. Only after the retirement snapshot, pending binding, target binding,
+        and target copy are all re-proven is the retirement unlinked. A failed proof leaves staged
+        recovery evidence for the next bounded inventory.
+        """
+
+        final_source_chain = self._open_matching_chain((_PENDING, day), source_identities)
+        if final_source_chain is None:
+            return "cleanup"
+        final_source_fd = final_source_chain[-1]
+        recovered_candidate = _retirement_candidate(name, source_snapshot)
+        already_retired = recovered_candidate is not None
+        retirement = (
+            name if already_retired else _retirement_name(source_snapshot, placed.candidate)
+        )
+        reservation_fd: int | None = None
+        reservation_snapshot: FileSnapshot | None = None
+        try:
+            try:
+                initial = os.stat(name, dir_fd=final_source_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                initial = None
+            if (
+                self._certify_live_target(day, placed.target_identities, placed.candidate, digest)
+                != placed.snapshot
+            ):
+                return "cleanup"
+            if not self._quarantine_binding_holds(day, placed.target_identities):
+                return "cleanup"
+            try:
+                current = os.stat(name, dir_fd=final_source_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                # Stable prior absence completes an already-retired move. If the source existed
+                # at the initial check and then vanished, its binding changed during final
+                # certification, so preserve the live copy but report an uncertain outcome.
+                return None if initial is None else "uncertain"
+            if initial is None or FileSnapshot.from_stat(current) != source_snapshot:
+                # The classified target is complete, but a new source object now owns the name.
+                # Preserve it for the next inventory rather than deleting unclassified bytes, and
+                # do not report an ordinary completion for a source binding we did not retire.
+                return "uncertain"
+            if FileSnapshot.from_stat(initial) != source_snapshot:
+                return "uncertain"
+
+            # Revalidate immediately before creating the private reservation. A06 trusts the
+            # installation account across the bounded reservation-and-rename syscall sequence;
+            # the post-retirement proofs below report detected namespace drift as uncertain.
+            if not self._pending_binding_holds(day, source_identities):
+                return "cleanup"
+
+            if not already_retired:
+                reservation_fd = os.open(
+                    retirement,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=final_source_fd,
+                )
+                os.fchmod(reservation_fd, 0o600)
+                reservation_snapshot = FileSnapshot.from_stat(os.fstat(reservation_fd))
+                os.close(reservation_fd)
+                reservation_fd = None
+                try:
+                    os.replace(
+                        name,
+                        retirement,
+                        src_dir_fd=final_source_fd,
+                        dst_dir_fd=final_source_fd,
+                    )
+                except OSError:
+                    # A failed rename normally leaves our empty reservation. Remove only that
+                    # exact inode; if the rename actually landed despite an ambiguous error, its
+                    # different snapshot/digest is preserved for the next inventory.
+                    assert reservation_snapshot is not None
+                    self._cleanup_candidate_at(
+                        final_source_fd,
+                        retirement,
+                        hashlib.sha256(b"").hexdigest(),
+                        reservation_snapshot,
+                    )
+                    return "uncertain"
+                os.fsync(final_source_fd)
+
+                retired_snapshot = self._certify_target(final_source_fd, retirement, digest)
+                if retired_snapshot is None or (
+                    retired_snapshot.device,
+                    retired_snapshot.inode,
+                    retired_snapshot.size,
+                    retired_snapshot.modified_ns,
+                ) != (
+                    source_snapshot.device,
+                    source_snapshot.inode,
+                    source_snapshot.size,
+                    source_snapshot.modified_ns,
+                ):
+                    # A replacement won the final name race or certification became unavailable.
+                    # Retain the private name for inventory; restoring with replace would have a
+                    # destructive absent-check race against a newly created public source.
+                    return "uncertain"
+
+            # Re-prove AFTER the reversible retirement. A namespace displaced during the long
+            # digest read or final source decision leaves the classified bytes staged, never gone.
+            if (
+                self._certify_live_target(day, placed.target_identities, placed.candidate, digest)
+                != placed.snapshot
+            ):
+                return "cleanup"
+            if not self._pending_binding_holds(day, source_identities):
+                # The source has already been retired. Preserve the separately certified live
+                # quarantine copy rather than deleting it and leaving the only known source bytes
+                # in a displaced pending namespace.
+                return "uncertain"
+            if not self._quarantine_binding_holds(day, placed.target_identities):
+                return "cleanup"
+
+            try:
+                os.unlink(retirement, dir_fd=final_source_fd)
+                os.fsync(final_source_fd)
+            except OSError:
+                # The retirement may remain (unlink failed) or already be gone (its directory
+                # fsync failed). Never restore with a destructive replace; the next inventory can
+                # safely decide whichever state is durably visible.
+                return "uncertain"
+            # No further mutation follows. Re-prove both live namespaces and the target so an
+            # uncooperative same-UID rename in the unavoidable adjacent-syscall window is at least
+            # reported as uncertain rather than falsely claimed as an ordinary completion.
+            if not self._pending_binding_holds(day, source_identities):
+                return "uncertain"
+            if (
+                self._certify_live_target(day, placed.target_identities, placed.candidate, digest)
+                != placed.snapshot
+            ):
+                return "uncertain"
+            return None
+        except OSError:
+            return "uncertain"
+        finally:
+            if reservation_fd is not None:
+                try:
+                    os.close(reservation_fd)
+                except OSError:  # pragma: no cover - defensive close failure
+                    pass
+            _close_descriptors(final_source_chain)
+
+    def _cleanup_candidate_at(
+        self,
+        target_fd: int,
+        candidate: str,
+        digest: str,
+        expected_snapshot: FileSnapshot | None = None,
+    ) -> bool:
+        """Remove and fsync one exact certified candidate through retained authority."""
+
+        try:
+            certified = self._certify_target(target_fd, candidate, digest)
+            if certified is None or (
+                expected_snapshot is not None and certified != expected_snapshot
+            ):
+                return False
+            os.unlink(candidate, dir_fd=target_fd)
+            os.fsync(target_fd)
+            try:
+                os.stat(candidate, dir_fd=target_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return True
+            return False
+        except OSError:
+            return False
+
+    def _cleanup_created_copy(self, placed: _PlacedCopy, digest: str) -> bool:
+        """Remove only this pass's exact copy through retained cleanup authority and fsync it."""
+
+        target_fd = placed.cleanup_fd
+        return target_fd is not None and self._cleanup_candidate_at(
+            target_fd, placed.candidate, digest, placed.snapshot
+        )
 
     def _certify_target(self, target_fd: int, candidate: str, digest: str) -> FileSnapshot | None:
         """Prove the candidate is a stable, enveloped copy of the classified bytes right now."""
@@ -1129,7 +1594,11 @@ class _Scan:
                 require_no_extended_acl(descriptor)
             except SecureFileError:
                 acl_unsafe = True
-            if not acl_unsafe and _permitted_quarantine_shape(info):
+            if (
+                not acl_unsafe
+                and _permitted_quarantine_shape(info)
+                and info.st_size <= MAX_SEGMENT_FILE_BYTES
+            ):
                 existing = _read_descriptor(descriptor, info.st_size)
                 if (
                     existing is not None
@@ -1147,18 +1616,33 @@ class _Scan:
                     certified = None
         return certified
 
-    def _publish_copy(self, target_fd: int, candidate: str, content: bytes) -> str:
-        """Stage and no-replace-publish one quarantine copy beneath the held day descriptor.
+    def _publish_copy(
+        self,
+        day: str,
+        identities: tuple[FileIdentity, FileIdentity, FileIdentity],
+        candidate: str,
+        content: bytes,
+        digest: str,
+    ) -> tuple[str, _PlacedCopy | None]:
+        """Publish only through a fresh live target chain and retain cleanup authority.
 
-        Returns ``"placed"`` (the candidate is durably complete), ``"exists"`` (the candidate
-        name was already taken — the caller decides adoption), or ``"failed"`` (the caller must
-        verify whether the name appeared). The fixed staging name keeps the candidate name
-        binary: absent, or a complete copy. Stage debris from an earlier crash is cleared.
+        A descriptor captured before this call is never publication authority. If the fresh chain
+        loses its live binding after a candidate appears, this method removes and fsyncs only that
+        exact copy; an unproved cleanup is ``"uncertain"``.
         """
 
+        target_descriptors = self._open_matching_chain((_QUARANTINE, day), identities)
+        if target_descriptors is None:
+            return "failed", None
         stage_fd: int | None = None
         stage_live = False
+        candidate_live = False
+        published_snapshot: FileSnapshot | None = None
+        target_fd = target_descriptors[-1]
+        result: tuple[str, _PlacedCopy | None] = ("failed", None)
         try:
+            if not _descriptors_match(target_descriptors, identities):
+                return result
             for _attempt in range(2):
                 try:
                     stage_fd = os.open(
@@ -1172,14 +1656,15 @@ class _Scan:
                         dir_fd=target_fd,
                     )
                     stage_live = True
+                    os.fchmod(stage_fd, 0o600)
                     break
                 except FileExistsError:
                     # our own crash debris beneath our private day directory: clear and retry
                     os.unlink(_QUARANTINE_STAGE, dir_fd=target_fd)
             if stage_fd is None:  # pragma: no cover - two O_EXCL failures require a live racer
-                return "failed"
+                return result
             if content and os.write(stage_fd, content) != len(content):
-                return "failed"
+                return result
             os.fsync(stage_fd)
             try:
                 os.link(
@@ -1190,13 +1675,64 @@ class _Scan:
                     follow_symlinks=False,
                 )
             except FileExistsError:
-                return "exists"
+                return "exists", None
+            candidate_live = True
             os.unlink(_QUARANTINE_STAGE, dir_fd=target_fd)
             stage_live = False
+            published_snapshot = FileSnapshot.from_stat(os.fstat(stage_fd))
             os.fsync(target_fd)  # the candidate name is durable only after this succeeds
-            return "placed"
+            snapshot = self._certify_target(target_fd, candidate, digest)
+            if snapshot is None:
+                cleaned = self._cleanup_candidate_at(
+                    target_fd, candidate, digest, expected_snapshot=published_snapshot
+                )
+                candidate_live = not cleaned
+                return ("failed" if cleaned else "uncertain"), None
+            if snapshot != published_snapshot:
+                candidate_live = False  # a fresh live adoption must decide the replacement
+                return "failed", None
+            live_snapshot = self._certify_live_target(day, identities, candidate, digest)
+            if not self._quarantine_binding_holds(day, identities) or not _descriptors_match(
+                target_descriptors, identities
+            ):
+                cleaned = self._cleanup_candidate_at(
+                    target_fd, candidate, digest, expected_snapshot=snapshot
+                )
+                candidate_live = not cleaned
+                return ("failed" if cleaned else "uncertain"), None
+            if live_snapshot != snapshot:
+                candidate_live = False  # the live fresh adoption path must make the decision
+                return "failed", None
+            cleanup_fd = os.dup(target_fd)
+            candidate_live = False  # ownership transfers to the returned cleanup descriptor
+            result = (
+                "placed",
+                _PlacedCopy(candidate, snapshot, identities, cleanup_fd=cleanup_fd),
+            )
+            return result
         except OSError:
-            return "failed"
+            if stage_live:
+                try:
+                    os.unlink(_QUARANTINE_STAGE, dir_fd=target_fd)
+                    stage_live = False
+                    if candidate_live and stage_fd is not None:
+                        published_snapshot = FileSnapshot.from_stat(os.fstat(stage_fd))
+                except OSError:
+                    pass
+            if candidate_live:
+                if self._quarantine_binding_holds(day, identities) and _descriptors_match(
+                    target_descriptors, identities
+                ):
+                    candidate_live = False  # preserve for the caller's fresh adoption proof
+                    return "failed", None
+                if published_snapshot is None:
+                    return "uncertain", None
+                cleaned = self._cleanup_candidate_at(
+                    target_fd, candidate, digest, expected_snapshot=published_snapshot
+                )
+                candidate_live = not cleaned
+                return ("failed" if cleaned else "uncertain"), None
+            return result
         finally:
             if stage_fd is not None:
                 try:
@@ -1210,9 +1746,18 @@ class _Scan:
                     os.unlink(_QUARANTINE_STAGE, dir_fd=target_fd)
                 except OSError:  # pragma: no cover - debris cleanup is best-effort
                     pass
+            if candidate_live and published_snapshot is not None:
+                self._cleanup_candidate_at(
+                    target_fd, candidate, digest, expected_snapshot=published_snapshot
+                )
+            _close_descriptors(target_descriptors)
 
     def _adopt_existing(
-        self, target_fd: int, candidate: str, digest: str
+        self,
+        day: str,
+        identities: tuple[FileIdentity, FileIdentity, FileIdentity],
+        candidate: str,
+        digest: str,
     ) -> tuple[str, FileSnapshot | None]:
         """Examine an existing candidate: adopt it only as a stable, ENVELOPED classified copy.
 
@@ -1228,10 +1773,16 @@ class _Scan:
         the caller must not claim a clean outcome).
         """
 
+        target_descriptors = self._open_matching_chain((_QUARANTINE, day), identities)
+        if target_descriptors is None:
+            return ("unknown", None)
         descriptor: int | None = None
         verdict = "unknown"
         snapshot: FileSnapshot | None = None
+        target_fd = target_descriptors[-1]
         try:
+            if not _descriptors_match(target_descriptors, identities):
+                return ("unknown", None)
             try:
                 descriptor = os.open(candidate, _leaf_probe_flags(), dir_fd=target_fd)
             except FileNotFoundError:
@@ -1264,6 +1815,12 @@ class _Scan:
             os.fsync(target_fd)
             if FileSnapshot.from_stat(os.fstat(descriptor)) != before:
                 return ("unknown", None)  # mutated while being made durable
+            if (
+                not self._quarantine_binding_holds(day, identities)
+                or self._certify_live_target(day, identities, candidate, digest) != before
+                or not _descriptors_match(target_descriptors, identities)
+            ):
+                return ("unknown", None)
             verdict = "adopted"
             snapshot = before
             return (verdict, snapshot)
@@ -1275,6 +1832,7 @@ class _Scan:
                     os.close(descriptor)
                 except OSError:  # pragma: no cover - defensive close failure
                     pass
+            _close_descriptors(target_descriptors)
 
     def _register(self, parsed: ParsedSegment, batch_id: str, day: str) -> None:
         if (

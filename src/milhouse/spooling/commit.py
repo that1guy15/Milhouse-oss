@@ -222,6 +222,12 @@ class DurableSpool:
             observe=_observe,
         )
         if not report.complete:
+            if any(
+                anomaly.kind == "foreign_name"
+                and anomaly.detail in {"spool_root_unsafe", "spool_root_changed"}
+                for anomaly in report.anomalies
+            ):
+                _fail("MH_SPOOL_DIR", "the spool root must be an owned, ACL-free 0o700 directory")
             # A truncated inventory cannot prove orphan absence or batch uniqueness, so mandatory
             # recovery fails closed: neither acquisition nor a commit may proceed on a partial view.
             _fail("MH_SPOOL_INCOMPLETE", "reconciliation was truncated by a scan bound")
