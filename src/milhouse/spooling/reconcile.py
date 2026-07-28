@@ -1448,7 +1448,10 @@ class _Scan:
 
         final_source_chain = self._open_matching_chain((_PENDING, day), source_identities)
         if final_source_chain is None:
-            return "cleanup"
+            # The target is already durable and certified, but the source namespace can no longer
+            # be bound to the inventoried chain. Preserve that validated recovery copy: deleting
+            # it would leave the only known source bytes in a displaced pending namespace.
+            return "uncertain"
         final_source_fd = final_source_chain[-1]
         recovered_candidate = _retirement_candidate(name, source_snapshot)
         already_retired = recovered_candidate is not None
@@ -1488,7 +1491,9 @@ class _Scan:
             # installation account across the bounded reservation-and-rename syscall sequence;
             # the post-retirement proofs below report detected namespace drift as uncertain.
             if not self._pending_binding_holds(day, source_identities):
-                return "cleanup"
+                # Source-namespace uncertainty is not target invalidity. The already durable and
+                # certified quarantine copy is recovery evidence and must survive for retry.
+                return "uncertain"
 
             if not already_retired:
                 reservation_fd = os.open(

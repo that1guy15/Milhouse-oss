@@ -2564,6 +2564,67 @@ def test_quarantine_directory_mode_drift_before_publication_never_reports_succes
 
 
 @pytest.mark.parametrize("swap_level", ["day", "root"])
+def test_pending_chain_displaced_after_publication_preserves_validated_recovery_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap_level: str
+) -> None:
+    """A lost final source chain cannot discard the already durable quarantine copy."""
+
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    _publish_orphan(spool_root, _DAY, "batch-1.jsonl", b"junk\n")
+    pending_root = spool_root / "pending"
+    pending_day = pending_root / _DAY
+    quarantine_day = spool_root / "quarantine" / _DAY
+    displaced = tmp_path / f"pending-after-publication-{swap_level}"
+    real_publish = reconcile_module._Scan._publish_copy
+    swapped: list[bool] = []
+
+    def _displacing_publish(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_publish(self, *args, **kwargs)
+        if not swapped and result[0] == "placed":
+            swapped.append(True)
+            if swap_level == "day":
+                os.rename(pending_day, displaced)
+                os.mkdir(pending_day, 0o700)
+            else:
+                os.rename(pending_root, displaced)
+                os.mkdir(pending_root, 0o700)
+                os.mkdir(pending_day, 0o700)
+        return result
+
+    monkeypatch.setattr(reconcile_module._Scan, "_publish_copy", _displacing_publish)
+    try:
+        report = reconciler.reconcile()
+        assert swapped == [True]
+        assert report.quarantined == ()
+        assert SegmentAnomaly("batch-1", _DAY, "quarantine_uncertain", "io") in report.anomalies
+        displaced_source = (
+            displaced / "batch-1.jsonl"
+            if swap_level == "day"
+            else displaced / _DAY / "batch-1.jsonl"
+        )
+        assert displaced_source.read_bytes() == b"junk\n"
+        recovery_copy = quarantine_day / "batch-1.jsonl"
+        assert recovery_copy.read_bytes() == b"junk\n"
+        assert list(pending_day.iterdir()) == []
+
+        if swap_level == "day":
+            pending_day.rmdir()
+            os.rename(displaced, pending_day)
+        else:
+            pending_day.rmdir()
+            pending_root.rmdir()
+            os.rename(displaced, pending_root)
+        retry = reconciler.reconcile()
+        assert len(retry.quarantined) == 1
+        assert list(pending_day.iterdir()) == []
+        targets = tuple(quarantine_day.iterdir())
+        assert [target.name for target in targets] == ["batch-1.jsonl"]
+        assert targets[0].read_bytes() == b"junk\n"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("swap_level", ["day", "root"])
 def test_pending_chain_displaced_during_final_source_validation_never_unlinks_outside_spool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap_level: str
 ) -> None:
@@ -2607,7 +2668,8 @@ def test_pending_chain_displaced_during_final_source_validation_never_unlinks_ou
             else displaced / _DAY / "batch-1.jsonl"
         )
         assert displaced_source.read_bytes() == b"junk\n"
-        assert not (spool_root / "quarantine" / _DAY / "batch-1.jsonl").exists()
+        recovery_copy = spool_root / "quarantine" / _DAY / "batch-1.jsonl"
+        assert recovery_copy.read_bytes() == b"junk\n"
         if swap_level == "day":
             pending_day.rmdir()
             os.rename(displaced, pending_day)
@@ -3057,12 +3119,11 @@ def test_pending_displaced_during_final_target_certification_is_never_unlinked(
         assert staged[0].read_bytes() == b"junk\n"
         if certify_call == 2:
             assert staged[0].name == "batch-1.jsonl"
-            assert list(quarantine_day.iterdir()) == []
         else:
             assert staged[0].name.startswith(reconcile_module._RETIRE_PREFIX)
-            targets = tuple(quarantine_day.iterdir())
-            assert [target.name for target in targets] == ["batch-1.jsonl"]
-            assert targets[0].read_bytes() == b"junk\n"
+        targets = tuple(quarantine_day.iterdir())
+        assert [target.name for target in targets] == ["batch-1.jsonl"]
+        assert targets[0].read_bytes() == b"junk\n"
         assert list(pending_day.iterdir()) == []
 
         if swap_level == "day":
