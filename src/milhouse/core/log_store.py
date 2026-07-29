@@ -1215,24 +1215,25 @@ def _complete_rotation(directory_fd: int, sequence: int, info: os.stat_result) -
         _fail("MH_LOG_RECOVER", "the interrupted rotation could not be completed")
 
 
-_HEADER_PREFIX = b'{"line":"header"'
+# The invariant leading bytes of every canonical header line (sorted keys ``line``, ``opened_at``,
+# … with no spaces), up to where the first variable value begins. A torn header write can only be
+# a prefix of these bytes; arbitrary trailing content after ``{"line":"header"`` is not.
+_HEADER_PREAMBLE = b'{"line":"header","opened_at":"'
 
 
 def _classify_staging(content: bytes, directory_fd: int) -> bool:
     """Return whether staging bytes are a legitimate ``_publish_fresh_current`` crash artifact.
 
-    A crash can leave the staging file empty (created, unwritten), a single torn partial header
-    line consistent with a canonical header prefix, or exactly one complete header line at a
-    successor sequence above every surviving rotation. Multiple lines, a non-header line, content
-    past a header, an inconsistent partial, or a reused sequence is foreign or ambiguous, never a
-    crash artifact.
+    A crash can leave the staging file empty (created, unwritten), a single torn partial line that
+    is a genuine byte-prefix of the canonical header preamble, or exactly one complete header line
+    at a successor sequence above every surviving rotation. Multiple lines, a non-header line,
+    content past a header, a partial that diverges from the canonical header bytes, or a reused
+    sequence is foreign or ambiguous, never a crash artifact.
     """
 
     if not content.endswith(_LF):
-        # empty or one torn partial line only, and consistent with a canonical header prefix
-        return _LF not in content and (
-            content.startswith(_HEADER_PREFIX) or _HEADER_PREFIX.startswith(content)
-        )
+        # empty or one torn partial line that is a real prefix of the canonical header preamble
+        return _LF not in content and _HEADER_PREAMBLE.startswith(content)
     lines = content.split(_LF)[:-1]
     if len(lines) != 1:
         return False

@@ -215,6 +215,13 @@ def _plant_shaped_but_invalid(staging: Path, tmp_path: Path) -> None:
     os.chmod(staging, 0o600)
 
 
+def _plant_prefix_garbage(staging: Path, tmp_path: Path) -> None:
+    # a header prefix followed by arbitrary bytes with no line feed: not a canonical torn header,
+    # so it must not be classified as a crash artifact merely because it starts like a header
+    staging.write_bytes(b'{"line":"header"' + b"x" * 200)
+    os.chmod(staging, 0o600)
+
+
 _FOREIGN = [
     ("regular", _plant_foreign_regular),
     ("symlink", _plant_symlink),
@@ -222,6 +229,7 @@ _FOREIGN = [
     ("directory", _plant_directory),
     ("fifo", _plant_fifo),
     ("shaped-invalid", _plant_shaped_but_invalid),
+    ("prefix-garbage", _plant_prefix_garbage),
 ]
 
 
