@@ -75,7 +75,6 @@ from milhouse.config.filesystem import (
 from milhouse.core.canonical import MAX_CANONICAL_INT
 from milhouse.core.clock import TimeError, format_timestamp
 from milhouse.core.log_wire import (
-    MAX_EVENT_LINE_BYTES,
     MAX_HEADER_LINE_BYTES,
     MAX_TRAILER_LINE_BYTES,
     StructuredLogHeaderV1,
@@ -83,6 +82,7 @@ from milhouse.core.log_wire import (
     structured_log_event_line,
     structured_log_header_line,
     structured_log_trailer_line,
+    validate_structured_log_event_line,
 )
 from milhouse.core.logging import LoggingError, StructuredLogEventV1
 from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
@@ -331,9 +331,6 @@ def _parse_line_object(line: bytes, code: str) -> dict[str, object]:
 
 
 _HEADER_KEYS = frozenset({"line", "opened_at", "retention_days", "schema", "scope", "sequence"})
-_EVENT_KEYS = frozenset(
-    {"error", "fingerprint", "level", "line", "metrics", "name", "privacy", "schema", "ts"}
-)
 _TRAILER_KEYS = frozenset(
     {
         "closed_at",
@@ -394,20 +391,23 @@ def _parse_header_line(line: bytes) -> StructuredLogHeaderV1:
 
 
 def _validate_event_line(line: bytes) -> datetime:
-    """Structurally validate one complete stored event line; return its timestamp.
+    """Validate one complete stored event line against the exact A05 wire contract; return its ts.
 
-    Complete lines must be well formed — recovery repairs only a torn INCOMPLETE tail, so a
-    malformed complete line fails closed here, per section 4.15.
+    Delegates to the W02 wire validator, which enforces every CanonicalJSONV1/A05 field, enum,
+    machine name, metric, coded error, fingerprint, ordering, and canonical-byte rule and requires
+    an exact round-trip. Recovery repairs only a torn INCOMPLETE tail, so a malformed COMPLETE line
+    fails closed here with a fixed value-free code, per section 4.15.
     """
 
-    if len(line) > MAX_EVENT_LINE_BYTES:
-        _fail("MH_LOG_EVENT", "an event line exceeds its byte bound")
-    payload = _parse_line_object(line, "MH_LOG_EVENT")
-    if frozenset(payload) != _EVENT_KEYS:
-        _fail("MH_LOG_EVENT", "an event line has an unexpected field set")
-    if payload["line"] != "event" or payload["schema"] != 1 or payload["privacy"] != "internal":
-        _fail("MH_LOG_EVENT", "an event line is not a v1 internal event")
-    return _parse_timestamp(payload["ts"], "MH_LOG_EVENT")
+    timestamp: datetime | None = None
+    invalid = False
+    try:
+        timestamp = validate_structured_log_event_line(line)
+    except LoggingError:
+        invalid = True
+    if invalid or timestamp is None:
+        _fail("MH_LOG_EVENT", "an event line is not a valid v1 internal event")
+    return timestamp
 
 
 def _is_trailer_line(line: bytes) -> bool:
