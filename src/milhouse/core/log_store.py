@@ -18,9 +18,10 @@ no-replace rename, directory fsync, next header staged to the temporary, publish
 Sequences are twenty decimal digits, never reused, and overflow fails closed.
 
 :func:`recover_structured_logs` and :func:`retention_preview` / :func:`retention_apply` are
-maintenance operations: they require a live :class:`ExclusiveHold` of the state root's own commit
-barrier (passed through, never reacquired), honoring the lock order — global barrier authority, then
-``structured-log.lock``, then descriptors; this module never acquires the global barrier itself.
+maintenance operations: they require the state root's own :class:`GlobalCommitBarrier` and take its
+*exclusive* side themselves for the whole operation, honoring the lock order — global barrier
+exclusive hold, then ``structured-log.lock``, then descriptors. Authority is the genuine exclusive
+``flock``, never a caller-mintable token, so a barrier bound to any other lock path is refused.
 Recovery truncates a torn incomplete active tail to its last complete line, completes an
 interrupted rotation whose durable trailer authenticates against the exact bytes it certifies, and
 removes a crashed pre-publish temporary — covering every write, fsync, and rename crash boundary —
@@ -84,7 +85,7 @@ from milhouse.core.log_wire import (
     structured_log_trailer_line,
 )
 from milhouse.core.logging import LoggingError, StructuredLogEventV1
-from milhouse.state.barrier import ExclusiveHold
+from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
 
 _LF = b"\n"
 _CURRENT_NAME = "structured-log.current.jsonl"
@@ -481,19 +482,18 @@ def _list_rotated(directory_fd: int) -> dict[int, str]:
     return rotated
 
 
-def _validate_hold(hold: ExclusiveHold, logs_dir: Path) -> None:
-    """Require live exclusive maintenance authority for THIS state root's barrier.
+def _require_logs_barrier(barrier: GlobalCommitBarrier, logs_dir: Path) -> None:
+    """Require the state root's own commit barrier before maintenance takes its exclusive side.
 
     The logs directory is a runtime child of the state root, whose control-plane commit lock is
-    ``<state_root>/control/commit.lock``; a live hold of any other barrier is not authority here.
+    ``<state_root>/control/commit.lock``. Maintenance authority is the genuine exclusive ``flock``
+    of THAT barrier — acquired by the caller of ``barrier.exclusive()`` below, never a mintable
+    token — so a barrier bound to any other lock path, or any non-barrier object, is not authority
+    here and fails closed before a descriptor is opened.
     """
 
     expected = lexical_absolute_path(logs_dir).parent / _CONTROL_DIR / _BARRIER_NAME
-    if (
-        not isinstance(hold, ExclusiveHold)
-        or not hold.active
-        or lexical_absolute_path(hold.barrier_path) != expected
-    ):
+    if not _is_bound_barrier(barrier, expected):
         _fail("MH_LOG_AUTHORITY", "maintenance requires a live exclusive hold of this state root")
 
 
@@ -941,7 +941,7 @@ class LogRecoveryReport:
 def recover_structured_logs(
     *,
     logs_dir: str | Path,
-    hold: ExclusiveHold,
+    barrier: GlobalCommitBarrier,
     monotonic: Callable[[], float],
     sleeper: Callable[[float], None] = time.sleep,
 ) -> LogRecoveryReport:
@@ -963,23 +963,24 @@ def recover_structured_logs(
 
     _require_platform()
     resolved = _resolve_logs_dir(logs_dir)
-    _validate_hold(hold, resolved)
-    directory_fd = _open_logs_dir(resolved)
-    lock = _LogLock(directory_fd, monotonic, sleeper)
-    lock_fd = lock.acquire()
-    try:
-        _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
-        truncated, completed = _repair_active(directory_fd)
-        removed = _remove_staging(directory_fd)
-        return LogRecoveryReport(
-            truncated_bytes=truncated, removed_staging=removed, completed_rotation=completed
-        )
-    finally:
-        lock.release(lock_fd)
+    _require_logs_barrier(barrier, resolved)
+    with barrier.exclusive():
+        directory_fd = _open_logs_dir(resolved)
+        lock = _LogLock(directory_fd, monotonic, sleeper)
+        lock_fd = lock.acquire()
         try:
-            os.close(directory_fd)
-        except OSError:  # pragma: no cover - defensive close failure
-            pass
+            _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+            truncated, completed = _repair_active(directory_fd)
+            removed = _remove_staging(directory_fd)
+            return LogRecoveryReport(
+                truncated_bytes=truncated, removed_staging=removed, completed_rotation=completed
+            )
+        finally:
+            lock.release(lock_fd)
+            try:
+                os.close(directory_fd)
+            except OSError:  # pragma: no cover - defensive close failure
+                pass
 
 
 def _repair_active(directory_fd: int) -> tuple[int, bool]:
@@ -1189,7 +1190,7 @@ class RetentionReport:
 def retention_preview(
     *,
     logs_dir: str | Path,
-    hold: ExclusiveHold,
+    barrier: GlobalCommitBarrier,
     monotonic: Callable[[], float],
     retention_days: int,
     now: datetime,
@@ -1205,20 +1206,21 @@ def retention_preview(
 
     _require_platform()
     resolved = _resolve_logs_dir(logs_dir)
-    _validate_hold(hold, resolved)
-    directory_fd = _open_logs_dir(resolved)
-    lock = _LogLock(directory_fd, monotonic, sleeper)
-    lock_fd = lock.acquire()
-    try:
-        _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
-        report, _validated = _preview_locked(directory_fd, retention_days, now)
-        return report
-    finally:
-        lock.release(lock_fd)
+    _require_logs_barrier(barrier, resolved)
+    with barrier.exclusive():
+        directory_fd = _open_logs_dir(resolved)
+        lock = _LogLock(directory_fd, monotonic, sleeper)
+        lock_fd = lock.acquire()
         try:
-            os.close(directory_fd)
-        except OSError:  # pragma: no cover - defensive close failure
-            pass
+            _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+            report, _validated = _preview_locked(directory_fd, retention_days, now)
+            return report
+        finally:
+            lock.release(lock_fd)
+            try:
+                os.close(directory_fd)
+            except OSError:  # pragma: no cover - defensive close failure
+                pass
 
 
 def _preview_locked(
@@ -1363,7 +1365,7 @@ def _parse_trailer_line(
 def retention_apply(
     *,
     logs_dir: str | Path,
-    hold: ExclusiveHold,
+    barrier: GlobalCommitBarrier,
     monotonic: Callable[[], float],
     retention_days: int,
     now: datetime,
@@ -1380,34 +1382,37 @@ def retention_apply(
 
     _require_platform()
     resolved = _resolve_logs_dir(logs_dir)
-    _validate_hold(hold, resolved)
-    directory_fd = _open_logs_dir(resolved)
-    lock = _LogLock(directory_fd, monotonic, sleeper)
-    lock_fd = lock.acquire()
-    try:
-        _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
-        preview, validated = _preview_locked(directory_fd, retention_days, now)
-        removed: list[RetainedSegment] = []
-        refused = list(preview.refused)
-        for segment in preview.segments:
-            if not segment.expired:
-                continue
-            if _unlink_verified(
-                directory_fd, _rotated_name(segment.sequence), validated[segment.sequence]
-            ):
-                removed.append(segment)
-            else:
-                # the name no longer resolves to the exact object whose expiry was proven: the
-                # replacement is left byte-for-byte intact and the sequence is NOT claimed
-                # removed — reported refused instead
-                refused.append(RefusedSegment(sequence=segment.sequence, code="MH_LOG_RETENTION"))
-        return RetentionReport(segments=tuple(removed), refused=tuple(refused))
-    finally:
-        lock.release(lock_fd)
+    _require_logs_barrier(barrier, resolved)
+    with barrier.exclusive():
+        directory_fd = _open_logs_dir(resolved)
+        lock = _LogLock(directory_fd, monotonic, sleeper)
+        lock_fd = lock.acquire()
         try:
-            os.close(directory_fd)
-        except OSError:  # pragma: no cover - defensive close failure
-            pass
+            _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+            preview, validated = _preview_locked(directory_fd, retention_days, now)
+            removed: list[RetainedSegment] = []
+            refused = list(preview.refused)
+            for segment in preview.segments:
+                if not segment.expired:
+                    continue
+                if _unlink_verified(
+                    directory_fd, _rotated_name(segment.sequence), validated[segment.sequence]
+                ):
+                    removed.append(segment)
+                else:
+                    # the name no longer resolves to the exact object whose expiry was proven: the
+                    # replacement is left byte-for-byte intact and the sequence is NOT claimed
+                    # removed — reported refused instead
+                    refused.append(
+                        RefusedSegment(sequence=segment.sequence, code="MH_LOG_RETENTION")
+                    )
+            return RetentionReport(segments=tuple(removed), refused=tuple(refused))
+        finally:
+            lock.release(lock_fd)
+            try:
+                os.close(directory_fd)
+            except OSError:  # pragma: no cover - defensive close failure
+                pass
 
 
 def _unlink_verified(

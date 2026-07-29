@@ -257,8 +257,7 @@ def test_a_torn_tail_requires_recovery_and_recovery_truncates_it(tmp_path: Path)
     assert refused.value.code == "MH_LOG_RECOVERY_REQUIRED"
 
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        report = recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    report = recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert report == LogRecoveryReport(
         truncated_bytes=26, removed_staging=False, completed_rotation=False
     )
@@ -282,8 +281,7 @@ def test_a_leftover_staging_file_requires_recovery_and_is_removed(tmp_path: Path
         _store(logs)
     assert refused.value.code == "MH_LOG_RECOVERY_REQUIRED"
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        report = recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    report = recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert report.removed_staging is True
     assert not staging.exists()
     healed = _store(logs)
@@ -301,9 +299,8 @@ def test_a_complete_malformed_line_is_not_repairable(tmp_path: Path) -> None:
         _store(logs)
     assert refused.value.code == "MH_LOG_EVENT"
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as unrepaired:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as unrepaired:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert unrepaired.value.code == "MH_LOG_EVENT"
 
 
@@ -324,9 +321,8 @@ def test_a_planted_foreign_trailer_never_completes_a_rotation(tmp_path: Path) ->
         _store(logs)
     assert refused.value.code == "MH_LOG_RECOVERY_REQUIRED"
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as rejected:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as rejected:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert rejected.value.code == "MH_LOG_RECOVER"
     assert current.exists()  # the plant is refused in place; nothing is moved or deleted
     assert not (logs / f"structured-log.{2:020d}.jsonl").exists()
@@ -348,27 +344,25 @@ def test_a_conflicting_active_sequence_fails_closed(tmp_path: Path) -> None:
 
 
 def test_recovery_requires_live_authority_for_this_state_root(tmp_path: Path) -> None:
-    from milhouse.state.barrier import ExclusiveHold
-
-    logs, control = _state_root(tmp_path)
+    logs, _control = _state_root(tmp_path)
     _store(logs).close()
-    with pytest.raises(LoggingError) as inactive:
+    # a non-barrier object carries no exclusive flock, so authority is refused before any I/O
+    with pytest.raises(LoggingError) as invalid:
         recover_structured_logs(
             logs_dir=logs,
-            hold=ExclusiveHold(control / "commit.lock"),  # constructed: never active
+            barrier=object(),  # type: ignore[arg-type]
             monotonic=_monotonic,
         )
-    assert inactive.value.code == "MH_LOG_AUTHORITY"
-    # a live hold of a DIFFERENT state root's barrier is not authority here
+    assert invalid.value.code == "MH_LOG_AUTHORITY"
+    # a barrier bound to a DIFFERENT state root's lock is not authority here
     (tmp_path / "other" / "control").mkdir(parents=True, mode=0o700)
     os.chmod(tmp_path / "other" / "control", 0o700)
     other_database = open_control_database(tmp_path / "other" / "control" / "milhouse.sqlite3")
     other_barrier = GlobalCommitBarrier(tmp_path / "other" / "control" / "commit.lock")
     initialize_control_state(other_database, barrier=other_barrier, applied_at=_NOW)
     other_database.close()
-    with other_barrier.exclusive() as foreign_hold:
-        with pytest.raises(LoggingError) as foreign:
-            recover_structured_logs(logs_dir=logs, hold=foreign_hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as foreign:
+        recover_structured_logs(logs_dir=logs, barrier=other_barrier, monotonic=_monotonic)
     assert foreign.value.code == "MH_LOG_AUTHORITY"
 
 
@@ -454,39 +448,36 @@ def test_retention_preview_and_apply_respect_captured_deadlines(tmp_path: Path) 
     barrier = _hold_for(tmp_path)
 
     # preview under a RELAXED policy: captured deadlines are never extended
-    with barrier.exclusive() as hold:
-        relaxed = retention_preview(
-            logs_dir=logs,
-            hold=hold,
-            monotonic=_monotonic,
-            retention_days=3650,
-            now=_NOW + timedelta(days=15),
-        )
+    relaxed = retention_preview(
+        logs_dir=logs,
+        barrier=barrier,
+        monotonic=_monotonic,
+        retention_days=3650,
+        now=_NOW + timedelta(days=15),
+    )
     assert [segment.expired for segment in relaxed.segments] == [True, True]
     assert all(s.effective_expires_at == s.expires_at for s in relaxed.segments)
     assert relaxed.refused == ()
 
     # preview under a TIGHTENED policy: unexpired deadlines shorten
-    with barrier.exclusive() as hold:
-        tightened = retention_preview(
-            logs_dir=logs,
-            hold=hold,
-            monotonic=_monotonic,
-            retention_days=1,
-            now=_NOW + timedelta(days=2),
-        )
+    tightened = retention_preview(
+        logs_dir=logs,
+        barrier=barrier,
+        monotonic=_monotonic,
+        retention_days=1,
+        now=_NOW + timedelta(days=2),
+    )
     assert [segment.expired for segment in tightened.segments] == [True, True]
     assert all(s.effective_expires_at < s.expires_at for s in tightened.segments)
 
     # apply deletes only the expired closed rotations, never the active segment
-    with barrier.exclusive() as hold:
-        removed = retention_apply(
-            logs_dir=logs,
-            hold=hold,
-            monotonic=_monotonic,
-            retention_days=14,
-            now=_NOW + timedelta(days=15),
-        )
+    removed = retention_apply(
+        logs_dir=logs,
+        barrier=barrier,
+        monotonic=_monotonic,
+        retention_days=14,
+        now=_NOW + timedelta(days=15),
+    )
     assert [segment.sequence for segment in removed.segments] == [1, 2]
     assert removed.refused == ()
     assert not (logs / f"structured-log.{1:020d}.jsonl").exists()
@@ -501,14 +492,13 @@ def test_retention_keeps_unexpired_segments(tmp_path: Path) -> None:
     store.rotate(closed_at=_NOW)
     store.close()
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        removed = retention_apply(
-            logs_dir=logs,
-            hold=hold,
-            monotonic=_monotonic,
-            retention_days=14,
-            now=_NOW + timedelta(days=1),  # well before the 14-day deadline
-        )
+    removed = retention_apply(
+        logs_dir=logs,
+        barrier=barrier,
+        monotonic=_monotonic,
+        retention_days=14,
+        now=_NOW + timedelta(days=1),  # well before the 14-day deadline
+    )
     assert removed.segments == ()
     assert removed.refused == ()
     assert (logs / f"structured-log.{1:020d}.jsonl").exists()
@@ -531,14 +521,13 @@ def test_retention_refuses_a_corrupt_segment_and_still_prunes_valid_expired_ones
     content = corrupted.read_bytes()
     corrupted.write_bytes(content[:-10] + b"tampered!\n")
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        report = retention_apply(
-            logs_dir=logs,
-            hold=hold,
-            monotonic=_monotonic,
-            retention_days=1,
-            now=_NOW + timedelta(days=3650),
-        )
+    report = retention_apply(
+        logs_dir=logs,
+        barrier=barrier,
+        monotonic=_monotonic,
+        retention_days=1,
+        now=_NOW + timedelta(days=3650),
+    )
     assert [segment.sequence for segment in report.segments] == [1]  # the valid one pruned
     assert [(refused.sequence, refused.code) for refused in report.refused] == [
         (2, "MH_LOG_RETENTION")
@@ -783,8 +772,7 @@ def test_append_write_failures_normalize_to_a_fixed_code(
             _store(logs)
         assert torn.value.code == "MH_LOG_RECOVERY_REQUIRED"
         barrier = _hold_for(tmp_path)
-        with barrier.exclusive() as hold:
-            report = recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+        report = recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
         assert report.truncated_bytes > 0
         healed = _store(logs)
         mode.append("error")
@@ -899,8 +887,7 @@ def test_an_out_of_range_expiry_fails_closed(tmp_path: Path) -> None:
 def test_recovery_with_nothing_to_repair_reports_zero(tmp_path: Path) -> None:
     logs, _control = _state_root(tmp_path)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        report = recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    report = recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert report == LogRecoveryReport(
         truncated_bytes=0, removed_staging=False, completed_rotation=False
     )
@@ -912,9 +899,8 @@ def test_recovery_refuses_a_symlinked_current(tmp_path: Path) -> None:
     outside.write_bytes(b"foreign\n")
     os.symlink(outside, logs / "structured-log.current.jsonl")
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
     assert outside.read_bytes() == b"foreign\n"
 
@@ -940,9 +926,8 @@ def test_recovery_refuses_a_trailer_in_the_active_segment(tmp_path: Path) -> Non
     with rotated_like.open("ab") as handle:
         handle.write(trailer)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
 
 
@@ -959,9 +944,8 @@ def test_a_failed_truncation_fails_closed(tmp_path: Path, monkeypatch: pytest.Mo
 
     monkeypatch.setattr(os, "ftruncate", _failing_ftruncate)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
 
 
@@ -978,9 +962,8 @@ def test_an_unexaminable_staging_name_fails_recovery_closed(
         return real_stat(target, *args, **kwargs)
 
     monkeypatch.setattr(os, "stat", _blocked_stat)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
 
 
@@ -1000,9 +983,8 @@ def test_a_failed_staging_removal_fails_closed(
 
     monkeypatch.setattr(os, "unlink", _failing_unlink)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
 
 
@@ -1021,19 +1003,17 @@ def _closed_rotation(tmp_path: Path) -> Path:
 def test_retention_validates_its_policy_input(tmp_path: Path) -> None:
     logs = _closed_rotation(tmp_path)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            retention_preview(
-                logs_dir=logs, hold=hold, monotonic=_monotonic, retention_days=0, now=_NOW
-            )
+    with pytest.raises(LoggingError) as captured:
+        retention_preview(
+            logs_dir=logs, barrier=barrier, monotonic=_monotonic, retention_days=0, now=_NOW
+        )
     assert captured.value.code == "MH_LOG_RETENTION"
 
 
 def _preview(logs, barrier, **overrides):  # type: ignore[no-untyped-def]
     kwargs = {"retention_days": 14, "now": _NOW}
     kwargs.update(overrides)
-    with barrier.exclusive() as hold:
-        return retention_preview(logs_dir=logs, hold=hold, monotonic=_monotonic, **kwargs)
+    return retention_preview(logs_dir=logs, barrier=barrier, monotonic=_monotonic, **kwargs)
 
 
 def test_retention_refuses_a_loose_mode_closed_segment(tmp_path: Path) -> None:
@@ -1138,15 +1118,14 @@ def test_a_failed_expired_unlink_fails_closed(
         return real_unlink(target, *args, **kwargs)
 
     monkeypatch.setattr(os, "unlink", _failing_unlink)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            retention_apply(
-                logs_dir=logs,
-                hold=hold,
-                monotonic=_monotonic,
-                retention_days=14,
-                now=_NOW + timedelta(days=365),
-            )
+    with pytest.raises(LoggingError) as captured:
+        retention_apply(
+            logs_dir=logs,
+            barrier=barrier,
+            monotonic=_monotonic,
+            retention_days=14,
+            now=_NOW + timedelta(days=365),
+        )
     assert captured.value.code == "MH_LOG_RETENTION"
     assert (logs / f"structured-log.{1:020d}.jsonl").exists()  # nothing silently lost
 
@@ -1221,14 +1200,13 @@ def test_reopening_after_a_retention_prune_succeeds(tmp_path: Path) -> None:
     store.rotate(closed_at=_NOW + timedelta(minutes=2))
     store.close()  # rotations {1, 2}, active sequence 3
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        removed = retention_apply(
-            logs_dir=logs,
-            hold=hold,
-            monotonic=_monotonic,
-            retention_days=14,
-            now=_NOW + timedelta(days=15),
-        )
+    removed = retention_apply(
+        logs_dir=logs,
+        barrier=barrier,
+        monotonic=_monotonic,
+        retention_days=14,
+        now=_NOW + timedelta(days=15),
+    )
     assert [segment.sequence for segment in removed.segments] == [1, 2]  # every rotation pruned
     reopened = _store(logs)
     try:
@@ -1290,10 +1268,9 @@ def test_a_second_live_store_conflicts_instead_of_corrupting(tmp_path: Path) -> 
     assert trailer["event_count"] == 2  # exactly the two events on disk — nothing lost
     assert trailer["content_sha256"] == hashlib.sha256(b"\n".join(lines[:-1]) + b"\n").hexdigest()
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        preview = retention_preview(
-            logs_dir=logs, hold=hold, monotonic=_monotonic, retention_days=14, now=_NOW
-        )
+    preview = retention_preview(
+        logs_dir=logs, barrier=barrier, monotonic=_monotonic, retention_days=14, now=_NOW
+    )
     assert [segment.sequence for segment in preview.segments] == [1]  # the segment validates
 
 
@@ -1367,16 +1344,14 @@ def test_recovery_completes_a_rotation_interrupted_before_the_link(
         _store(logs)
     assert reopened.value.code == "MH_LOG_RECOVERY_REQUIRED"
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        report = recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    report = recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert report.completed_rotation
     assert not (logs / "structured-log.current.jsonl").exists()
     rotated = logs / f"structured-log.{1:020d}.jsonl"
     assert rotated.exists()
-    with barrier.exclusive() as hold:
-        preview = retention_preview(
-            logs_dir=logs, hold=hold, monotonic=_monotonic, retention_days=14, now=_NOW
-        )
+    preview = retention_preview(
+        logs_dir=logs, barrier=barrier, monotonic=_monotonic, retention_days=14, now=_NOW
+    )
     assert [segment.sequence for segment in preview.segments] == [1]  # validates post-completion
     healed = _store(logs)
     try:
@@ -1414,8 +1389,7 @@ def test_recovery_completes_a_rotation_interrupted_before_the_unlink(
         _store(logs)
     assert reopened.value.code == "MH_LOG_RECOVERY_REQUIRED"
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        report = recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    report = recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert report.completed_rotation
     assert not current.exists()
     assert os.lstat(rotated).st_nlink == 1
@@ -1435,8 +1409,7 @@ def test_a_torn_tail_after_a_trailer_is_truncated_and_the_rotation_completed(
     with current.open("ab") as handle:
         handle.write(b'{"torn')  # a fragment torn after the durable trailer
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        report = recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    report = recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert report.truncated_bytes == len(b'{"torn')
     assert report.completed_rotation
     rotated = logs / f"structured-log.{1:020d}.jsonl"
@@ -1453,9 +1426,8 @@ def test_recovery_refuses_a_squatted_rotated_name(
     squatter.write_bytes(b"occupied\n")
     os.chmod(squatter, 0o600)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     # a foreign occupant of the active's own rotated name is indistinguishable from forbidden
     # sequence reuse: refused BEFORE any mutation, with the open path's exact identity
     assert captured.value.code == "MH_LOG_SEQUENCE"
@@ -1471,9 +1443,8 @@ def test_a_two_link_active_segment_with_a_mismatched_twin_is_refused(
     current = logs / "structured-log.current.jsonl"
     os.link(current, logs / "aside-name")  # nlink == 2, but the twin is NOT the rotated name
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
     assert current.exists()
 
@@ -1489,9 +1460,8 @@ def test_a_foreign_extra_link_without_a_trailer_is_refused(tmp_path: Path) -> No
         _store(logs)
     assert reopened.value.code == "MH_LOG_RECOVERY_REQUIRED"
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_FILE"
     assert current.exists()
 
@@ -1508,9 +1478,8 @@ def test_a_triply_linked_active_segment_fails_closed(
         _store(logs)
     assert reopened.value.code == "MH_LOG_FILE"
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_FILE"
 
 
@@ -1527,9 +1496,8 @@ def test_data_past_a_trailer_is_ambiguous_and_unrepairable(tmp_path: Path) -> No
         _store(logs)
     assert reopened.value.code == "MH_LOG_AMBIGUOUS"
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     # the SAME identity as the open path, so a caller can code-dispatch "permanently
     # unrepairable" and stop retrying recovery
     assert captured.value.code == "MH_LOG_AMBIGUOUS"
@@ -1556,9 +1524,8 @@ def test_a_mismatched_sequence_trailer_fails_authentication(tmp_path: Path) -> N
     current.write_bytes(header_line + forged)
     os.chmod(current, 0o600)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
     assert current.exists()
 
@@ -1579,13 +1546,11 @@ def test_a_failed_rotation_completion_converges_on_retry(
 
     monkeypatch.setattr(os, "unlink", _failing_unlink)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
     # the rotated name is already durable; the retry adopts the same-inode twin and completes
-    with barrier.exclusive() as hold:
-        report = recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    report = recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert report.completed_rotation
     assert not (logs / "structured-log.current.jsonl").exists()
     assert os.lstat(logs / f"structured-log.{1:020d}.jsonl").st_nlink == 1
@@ -1605,28 +1570,27 @@ def test_an_invalid_logs_dir_path_normalizes_to_a_fixed_code(tmp_path: Path) -> 
             opened_at=_NOW,
         )
     assert constructing.value.code == "MH_LOG_DIR"
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as recovering:
-            recover_structured_logs(logs_dir=12345, hold=hold, monotonic=_monotonic)  # type: ignore[arg-type]
-        assert recovering.value.code == "MH_LOG_DIR"
-        with pytest.raises(LoggingError) as previewing:
-            retention_preview(
-                logs_dir=12345,  # type: ignore[arg-type]
-                hold=hold,
-                monotonic=_monotonic,
-                retention_days=14,
-                now=_NOW,
-            )
-        assert previewing.value.code == "MH_LOG_DIR"
-        with pytest.raises(LoggingError) as applying:
-            retention_apply(
-                logs_dir=12345,  # type: ignore[arg-type]
-                hold=hold,
-                monotonic=_monotonic,
-                retention_days=14,
-                now=_NOW,
-            )
-        assert applying.value.code == "MH_LOG_DIR"
+    with pytest.raises(LoggingError) as recovering:
+        recover_structured_logs(logs_dir=12345, barrier=barrier, monotonic=_monotonic)  # type: ignore[arg-type]
+    assert recovering.value.code == "MH_LOG_DIR"
+    with pytest.raises(LoggingError) as previewing:
+        retention_preview(
+            logs_dir=12345,  # type: ignore[arg-type]
+            barrier=barrier,
+            monotonic=_monotonic,
+            retention_days=14,
+            now=_NOW,
+        )
+    assert previewing.value.code == "MH_LOG_DIR"
+    with pytest.raises(LoggingError) as applying:
+        retention_apply(
+            logs_dir=12345,  # type: ignore[arg-type]
+            barrier=barrier,
+            monotonic=_monotonic,
+            retention_days=14,
+            now=_NOW,
+        )
+    assert applying.value.code == "MH_LOG_DIR"
 
 
 def test_an_acl_probe_failure_on_the_active_segment_fails_closed(
@@ -1672,9 +1636,8 @@ def test_recovery_refuses_a_conflicting_sequence_before_any_mutation(
         _store(logs)
     assert reopened.value.code == "MH_LOG_SEQUENCE"
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as recovering:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as recovering:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert recovering.value.code == "MH_LOG_SEQUENCE"
     assert current.read_bytes() == frozen  # zero mutation
     assert not (logs / f"structured-log.{1:020d}.jsonl").exists()  # nothing was linked
@@ -1696,9 +1659,8 @@ def test_recovery_refuses_to_truncate_under_a_conflicting_sequence(
     survivor.write_bytes(b"{}\n")
     os.chmod(survivor, 0o600)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as recovering:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as recovering:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert recovering.value.code == "MH_LOG_SEQUENCE"
     assert current.read_bytes() == frozen  # the torn tail was NOT truncated
 
@@ -1722,32 +1684,31 @@ def test_a_hostile_pathlike_normalizes_to_a_fixed_code(tmp_path: Path) -> None:
     assert constructing.value.code == "MH_LOG_DIR"
     assert "SECRET" not in repr(constructing.value.args)
     assert constructing.value.__context__ is None and constructing.value.__cause__ is None
-    with barrier.exclusive() as hold:
-        for operation in (
-            lambda h: recover_structured_logs(
-                logs_dir=_HostilePath(),  # type: ignore[arg-type]
-                hold=h,
-                monotonic=_monotonic,
-            ),
-            lambda h: retention_preview(
-                logs_dir=_HostilePath(),  # type: ignore[arg-type]
-                hold=h,
-                monotonic=_monotonic,
-                retention_days=14,
-                now=_NOW,
-            ),
-            lambda h: retention_apply(
-                logs_dir=_HostilePath(),  # type: ignore[arg-type]
-                hold=h,
-                monotonic=_monotonic,
-                retention_days=14,
-                now=_NOW,
-            ),
-        ):
-            with pytest.raises(LoggingError) as refused:
-                operation(hold)
-            assert refused.value.code == "MH_LOG_DIR"
-            assert "SECRET" not in repr(refused.value.args)
+    for operation in (
+        lambda h: recover_structured_logs(
+            logs_dir=_HostilePath(),  # type: ignore[arg-type]
+            barrier=h,
+            monotonic=_monotonic,
+        ),
+        lambda h: retention_preview(
+            logs_dir=_HostilePath(),  # type: ignore[arg-type]
+            barrier=h,
+            monotonic=_monotonic,
+            retention_days=14,
+            now=_NOW,
+        ),
+        lambda h: retention_apply(
+            logs_dir=_HostilePath(),  # type: ignore[arg-type]
+            barrier=h,
+            monotonic=_monotonic,
+            retention_days=14,
+            now=_NOW,
+        ),
+    ):
+        with pytest.raises(LoggingError) as refused:
+            operation(barrier)
+        assert refused.value.code == "MH_LOG_DIR"
+        assert "SECRET" not in repr(refused.value.args)
 
 
 def test_the_live_store_refuses_to_rotate_past_the_rotation_bound(
@@ -1771,14 +1732,13 @@ def test_the_live_store_refuses_to_rotate_past_the_rotation_bound(
     assert reopened.sequence == 3
     reopened.close()
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        removed = retention_apply(
-            logs_dir=logs,
-            hold=hold,
-            monotonic=_monotonic,
-            retention_days=14,
-            now=_NOW + timedelta(days=365),
-        )
+    removed = retention_apply(
+        logs_dir=logs,
+        barrier=barrier,
+        monotonic=_monotonic,
+        retention_days=14,
+        now=_NOW + timedelta(days=365),
+    )
     assert [segment.sequence for segment in removed.segments] == [1, 2]  # the API escape works
     resumed = _store(logs)
     try:
@@ -1794,9 +1754,8 @@ def test_an_empty_active_segment_fails_recovery_with_the_recovery_code(tmp_path:
     current.touch(mode=0o600)
     os.chmod(current, 0o600)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"  # recovery's own identity, not MH_LOG_OPEN
 
 
@@ -1830,9 +1789,8 @@ def test_an_unexaminable_twin_refuses_the_completion(
 
     monkeypatch.setattr(os, "stat", _blocked_stat)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_SEQUENCE"
     assert (logs / "structured-log.current.jsonl").exists()  # zero mutation
 
@@ -1856,8 +1814,7 @@ def test_a_raced_squatter_at_link_time_is_never_replaced(
 
     monkeypatch.setattr(os, "link", _racing_link)
     barrier = _hold_for(tmp_path)
-    with barrier.exclusive() as hold:
-        with pytest.raises(LoggingError) as captured:
-            recover_structured_logs(logs_dir=logs, hold=hold, monotonic=_monotonic)
+    with pytest.raises(LoggingError) as captured:
+        recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
     assert (logs / "structured-log.current.jsonl").exists()  # never unlinked
