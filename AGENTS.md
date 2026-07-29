@@ -41,7 +41,8 @@ select one dependency-ready work package
 -> fix and re-review until no P0/P1 remains
 -> milhouse-compound when an explicitly requested reusable lesson exists
 -> milhouse-oss-maintainer for provenance, status, commit, PR, and authorized merge handling
--> engineering-journal post for a meaningful merged milestone when public messaging is authorized
+-> paired engineering-journal source and unpublished learning-companion draft for a meaningful
+   merged milestone when public messaging is authorized
 ```
 
 `milhouse-feedback` is a normalized evidence input to assigned application work; it is never
@@ -72,6 +73,10 @@ permission to inspect raw telemetry or feedback sources.
 - Engineering-journal authority permits only human-readable GitHub Discussion posts grounded in
   merged public evidence. It does not authorize release claims, availability promises, private
   material, raw evidence, tags, packages, or other announcements.
+- The paired learning companion teaches the same milestone in a beginner-peer voice and remains an
+  unpublished task artifact unless the owner separately approves its destination and publication.
+  Never impersonate expertise, collapse planned work into implemented behavior, or treat a draft as
+  permission to publish to a personal blog or newsletter.
 - Treat `/doh` as a neutral postmortem trigger, not a blame shortcut.
 
 ## Validation

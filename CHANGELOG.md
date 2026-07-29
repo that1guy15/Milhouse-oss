@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Pair each meaningful engineering-journal milestone with an unpublished, beginner-friendly
+  learning companion or a scoped learning-series plan, while keeping personal-blog publication
+  separately authorized.
 - Record owner-approved amendment A06, making the installation-account filesystem-containment
   trust boundary explicit while retaining traversal, symlink, other-user, cooperating-process, and
   namespace-drift defenses and tests.
