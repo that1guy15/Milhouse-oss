@@ -1,7 +1,9 @@
 # Community learning-companion template
 
 Use this template with the [engineering-journal workflow](engineering-journal.md). The result is an
-unpublished personal-content draft, not a release announcement or permission to publish externally.
+unpublished personal-content draft. Every completed blog post derived from an engineering-journal
+Discussion about current work or features also receives the draft-only Substack handoff below. A
+saved draft is not a release announcement or permission to publish, schedule, or send externally.
 
 ## Draft metadata
 
@@ -11,6 +13,7 @@ unpublished personal-content draft, not a release announcement or permission to 
 - **One user benefit:** State the practical outcome without claiming planned behavior exists.
 - **Current boundary:** State what Milhouse cannot yet do.
 - **Series position:** Standalone, or part N of a named sequence.
+- **Substack handoff:** Pending or Saved; keep the personal draft URL in the task handoff, not here.
 
 ## Suggested structure
 
@@ -67,4 +70,23 @@ article rather than extending the current draft.
 - [ ] The Discussion remains the source for engineering detail and verification evidence.
 - [ ] Implemented, in-progress, planned, and unavailable behavior are visibly distinct.
 - [ ] No private data, raw agent content, private paths, provider payloads, or donor material appears.
-- [ ] The draft does not imply permission to publish to Substack or another external destination.
+- [ ] The draft does not imply that saving it grants permission to publish, schedule, or send it.
+
+## Required Substack draft handoff
+
+Apply these steps to every completed blog post derived from a Discussion about current work or
+features. A series plan remains a task artifact, but each completed article in that series follows
+the same handoff.
+
+1. Use the connected Chrome session and the owner's already-authenticated Substack account. Never
+   request, copy, store, or transmit login credentials.
+2. Create a new post and transfer the reviewed title, subtitle, body, headings, lists, and links.
+3. Verify the content boundary and formatting, then wait until the editor reports **Saved**.
+4. Keep the draft editor open for owner review and return the draft URL only in the private task
+   handoff; do not commit personal account or draft metadata.
+5. Stop. Do not publish, schedule, send an email, change account settings, or invoke any final
+   distribution action.
+
+If the authenticated Chrome session is unavailable, leave the reviewed artifact intact and report
+the Substack handoff as pending. Do not substitute an unsigned-in preview browser or broaden the
+request into account recovery.

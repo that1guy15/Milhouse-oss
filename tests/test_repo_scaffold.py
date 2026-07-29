@@ -34,6 +34,8 @@ def test_required_docs_exist() -> None:
         "docs/architecture.md",
         "docs/project-plan.md",
         "docs/agents-and-tools.md",
+        "docs/engineering-journal.md",
+        "docs/community-learning-template.md",
         "docs/feedback-loop.md",
         "docs/skill-evaluations.md",
         "docs/adr/0015-agent-engineering-workflow.md",
@@ -43,6 +45,40 @@ def test_required_docs_exist() -> None:
 
     for relative in required:
         assert (root / relative).is_file(), relative
+
+
+def test_discussion_learning_posts_require_draft_only_substack_handoff() -> None:
+    root = Path(__file__).resolve().parents[1]
+    required_markers = {
+        "AGENTS.md": (
+            "every completed blog post derived from an engineering-journal Discussion",
+            "publishing, scheduling, sending email",
+        ),
+        "docs/agents-and-tools.md": (
+            "draft-only Substack handoff for every completed",
+            "publication, scheduling, email delivery",
+        ),
+        "docs/engineering-journal.md": (
+            "For every completed learning blog derived from a Discussion",
+            "reports **Saved**",
+            "Do not publish, schedule, send an email",
+        ),
+        "docs/community-learning-template.md": (
+            "Required Substack draft handoff",
+            "every completed blog post derived from a Discussion",
+            "Do not publish, schedule, send an email",
+        ),
+        "docs/implementation-status.md": (
+            "save every completed Discussion-derived learning blog as an unpublished "
+            "Substack draft",
+            "publication, scheduling, email delivery",
+        ),
+    }
+
+    for relative, markers in required_markers.items():
+        text = (root / relative).read_text(encoding="utf-8")
+        for marker in markers:
+            assert marker in text, f"{relative}: missing {marker!r}"
 
 
 def test_repository_skill_registry_validates() -> None:
