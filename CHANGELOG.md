@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Record owner-approved amendment A06, making the installation-account filesystem-containment
+  trust boundary explicit while retaining traversal, symlink, other-user, cooperating-process, and
+  namespace-drift defenses and tests.
 - Approve the authoritative Milhouse OSS 1.0 implementation plan and W00-W18 gate model.
 - Establish the public/private source boundary, file-level donor provenance, and pre-alpha status.
 - Ratify locked architecture and engineering-process decisions through ADRs 0001-0015.
@@ -96,4 +99,21 @@
   surface, the CanonicalJSONV1 `StructuredLogEventV1` wire and encoder, a golden vector corpus with
   cross-process/property determinism and adversarial leak-freedom, and a stream sink that emits exact
   event-line bytes, normalizes hostile failures, and refuses partial writes.
-- Assemble the W02 G02 evidence packet (`docs/gate-evidence/G02.md`); G02 acceptance is owner-pending.
+- Assemble and correct the W02 G02 evidence packet (`docs/gate-evidence/G02.md`); the owner accepted
+  G02 on 2026-07-24 at protected `main` `90f8e4b` with green post-merge Required CI.
+- Add the W03 SQLite control-plane foundation: owner-only WAL storage with full synchronous
+  durability, ordered checksum-bound migrations, fenced leases, and the shared/exclusive global
+  commit barrier used by writers and maintenance.
+- Add self-describing v1 spool segments, canonical frame bytes, bounded identifiers and retention,
+  atomic no-overwrite publication, durable segment commit plus SQLite ledger rows, and exporter
+  delivery state.
+- Add secure bounded segment reads and mandatory reconciliation that verifies full filesystem/ledger
+  agreement, safely registers durably published orphan segments, and fails closed on corruption,
+  conflicts, unsafe file shapes, or incomplete inventory.
+- Add descriptor-relative quarantine and recovery hardening for corrupt, conflicted, and exact stale
+  writer artifacts, with no-follow classification, restrictive ownership/mode/link checks,
+  fsynced copy/publication/retirement ordering, and explicit uncertain outcomes that block writer
+  handoff. W03 remains in progress; G03 has not passed.
+- Backfill the checked-in canonical source for Build Journal #2 and add Build Journal #3, a public
+  evidence-linked walkthrough of the durable local-state and spool recovery milestone, while
+  preserving the pre-alpha and no-release boundary.

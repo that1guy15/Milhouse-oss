@@ -120,7 +120,7 @@ def test_each_critical_pattern_must_independently_match_a_measurable_file(
         )
 
 
-def test_critical_pattern_rejects_a_matching_file_without_measurable_branches(
+def test_critical_pattern_accepts_a_fully_covered_branchless_file(
     tmp_path: Path,
 ) -> None:
     summary = {
@@ -136,7 +136,35 @@ def test_critical_pattern_rejects_a_matching_file_without_measurable_branches(
         files={"src/milhouse/privacy/policy.py": {"summary": summary}},
     )
 
-    with pytest.raises(CoverageError, match="no measurable items"):
+    _line, _branch, critical = validate_coverage(path, 90, 85, ("src/milhouse/privacy/*.py",), 95)
+
+    assert critical == (("src/milhouse/privacy/policy.py", 100.0),)
+
+
+@pytest.mark.parametrize(
+    ("covered_lines", "statements", "message"),
+    (
+        (0, 1, "critical branchless file.*line coverage 0.00%.*below 100.00%"),
+        (0, 0, "no measurable line or branch items"),
+    ),
+)
+def test_critical_pattern_rejects_uncovered_or_empty_branchless_files(
+    tmp_path: Path, covered_lines: int, statements: int, message: str
+) -> None:
+    summary = {
+        "covered_lines": covered_lines,
+        "num_statements": statements,
+        "covered_branches": 0,
+        "num_branches": 0,
+    }
+    path = _coverage_file(
+        tmp_path,
+        covered_lines=100,
+        covered_branches=100,
+        files={"src/milhouse/privacy/policy.py": {"summary": summary}},
+    )
+
+    with pytest.raises(CoverageError, match=message):
         validate_coverage(path, 90, 85, ("src/milhouse/privacy/*.py",), 95)
 
 

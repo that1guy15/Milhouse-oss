@@ -2,8 +2,10 @@
 
 Plan section 4.3 and ADR 0004 require every durable writer to hold the *shared* side of one global
 commit barrier while backup, restore, migration, and declared maintenance take the *exclusive* side.
-That is a cross-process readers-writer lock with writer preference: many writers coexist, and once a
-maintainer is queued, new writers wait behind it while existing writers drain.
+Writer acquisition may first reconcile under exclusive recovery authority, then convert the same
+main descriptor to shared before durable publication while the gate remains exclusive across that
+handoff. The result is a cross-process readers-writer lock with writer preference: many writers can
+coexist, and once a maintainer is queued, new writers wait behind it while existing writers drain.
 
 Both sides use ``fcntl.flock`` on a securely opened, read-only, no-follow descriptor validated as an
 owner-only, single-link, regular file (reusing the W02 secure-open machinery). It is never reopened
@@ -20,7 +22,7 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NoReturn
@@ -132,39 +134,24 @@ def _close(descriptor: int) -> None:
         pass
 
 
-class ExclusiveHold:
-    """An authority token proving a live exclusive hold of ONE specific barrier.
+def _is_bound_barrier(barrier: object, lock_path: Path) -> bool:
+    """Return whether an exact initialized barrier owns the expected main and gate paths."""
 
-    Only :meth:`GlobalCommitBarrier.exclusive` activates a hold, and it deactivates the token when
-    the context exits, so code requiring exclusive authority validates both ``hold.active`` and
-    ``hold.barrier_path`` — the canonical lock the token was issued for — at runtime instead of
-    trusting a docstring precondition. A live token is authority ONLY for its own barrier: a
-    consumer must compare ``barrier_path`` against the lock protecting the state it is about to
-    mutate. A directly constructed token is never active, a token captured from a completed hold is
-    stale and inactive, and the active bit is not assignable (name-mangled slot behind a read-only
-    property), so a token cannot be activated by attribute assignment.
-    """
-
-    __slots__ = ("__active", "__barrier_path")
-
-    def __init__(self, barrier_path: Path) -> None:
-        self.__barrier_path = lexical_absolute_path(barrier_path)
-        self.__active = False
-
-    @property
-    def active(self) -> bool:
-        return self.__active
-
-    @property
-    def barrier_path(self) -> Path:
-        return self.__barrier_path
-
-    def _issue(self) -> None:
-        # Called only by GlobalCommitBarrier.exclusive once the lock is genuinely held.
-        self.__active = True
-
-    def _revoke(self) -> None:
-        self.__active = False
+    if type(barrier) is not GlobalCommitBarrier:
+        return False
+    expected = lexical_absolute_path(lock_path)
+    expected_gate = expected.with_name(expected.name + _GATE_SUFFIX)
+    try:
+        actual = object.__getattribute__(barrier, "_path")
+        actual_gate = object.__getattribute__(barrier, "_gate_path")
+    except AttributeError:
+        return False
+    return (
+        type(actual) is type(expected)
+        and type(actual_gate) is type(expected_gate)
+        and actual == expected
+        and actual_gate == expected_gate
+    )
 
 
 class GlobalCommitBarrier:
@@ -209,28 +196,66 @@ class GlobalCommitBarrier:
             _close(main_fd)
 
     @contextmanager
-    def exclusive(self, *, blocking: bool = True) -> Iterator[ExclusiveHold]:
-        """Hold the exclusive side; block new shared entrants and drain existing ones.
-
-        Yields an :class:`ExclusiveHold` authority token that is active only for the lifetime of
-        the hold, so exclusive-only operations can validate their authority at runtime.
-        """
+    def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
+        """Hold the exclusive side; block new shared entrants and drain existing ones."""
 
         main_fd = _secure_lock_descriptor(self._path)
         gate_fd: int | None = None
         gate_held = False
         main_held = False
-        hold = ExclusiveHold(self._path)
         try:
             gate_fd = _secure_lock_descriptor(self._gate_path)
             _acquire(gate_fd, fcntl.LOCK_EX, blocking=blocking)
             gate_held = True
             _acquire(main_fd, fcntl.LOCK_EX, blocking=blocking)
             main_held = True
-            hold._issue()
-            yield hold
+            yield
         finally:
-            hold._revoke()
+            if main_held:
+                _release(main_fd)
+            if gate_held and gate_fd is not None:
+                _release(gate_fd)
+            if gate_fd is not None:
+                _close(gate_fd)
+            _close(main_fd)
+
+    @contextmanager
+    def exclusive_then_shared(self, *, blocking: bool = True) -> Iterator[Callable[[], None]]:
+        """Hold exclusive for recovery, then atomically hand a writer to the shared side.
+
+        The gate remains exclusive while the main descriptor converts from exclusive to shared,
+        so no cooperating barrier entrant can appear in the handoff. The transition then releases
+        the gate and leaves the main lock shared for the durable writer phase. The yielded callback
+        is valid once, only inside this context; it is a phase transition, never authority for an
+        operation outside the lexical hold.
+        """
+
+        main_fd = _secure_lock_descriptor(self._path)
+        gate_fd: int | None = None
+        gate_held = False
+        main_held = False
+        active = True
+        transitioned = False
+
+        def _transition() -> None:
+            nonlocal gate_held, transitioned
+            if not active or transitioned or not gate_held or not main_held:
+                _fail("MH_STATE_BARRIER", "the writer barrier phase transition is unavailable")
+            _acquire(main_fd, fcntl.LOCK_SH, blocking=True)
+            transitioned = True
+            assert gate_fd is not None
+            _release(gate_fd)
+            gate_held = False
+
+        try:
+            gate_fd = _secure_lock_descriptor(self._gate_path)
+            _acquire(gate_fd, fcntl.LOCK_EX, blocking=blocking)
+            gate_held = True
+            _acquire(main_fd, fcntl.LOCK_EX, blocking=blocking)
+            main_held = True
+            yield _transition
+        finally:
+            active = False
             if main_held:
                 _release(main_fd)
             if gate_held and gate_fd is not None:

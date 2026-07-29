@@ -55,6 +55,8 @@ from milhouse.spooling.segment import (
     FRAME_VERSION,
     MAX_FRAME_LINE_BYTES,
     MAX_HEADER_LINE_BYTES,
+    MAX_SEGMENT_FILE_BYTES,
+    MAX_SEGMENT_FRAMES,
     SCHEMA_VERSION,
     SegmentHeaderV1,
     SpoolFrameV1,
@@ -64,11 +66,6 @@ from milhouse.spooling.segment import (
 )
 
 _LF = b"\n"
-# Reader safety bounds. A segment can never exceed these regardless of what its header claims; the
-# file size is checked from the descriptor before any bytes are read, so an oversized file is
-# rejected fast.
-MAX_SEGMENT_FILE_BYTES = 64 * 1024 * 1024
-MAX_SEGMENT_FRAMES = 1_000_000
 _TRUSTED_FILE_MODE = 0o600
 # The same installation-id shape the domain enforces (identity.py InstallationIdV1), validated at
 # the trusted-reader boundary so a malformed value fails closed as a fixed code rather than leaking

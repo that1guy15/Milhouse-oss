@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import NoReturn
 
-from milhouse.config.filesystem import lexical_absolute_path
+from milhouse.config.filesystem import SecureFileError, lexical_absolute_path
 from milhouse.state.errors import StateError
 
 _FILE_MODE = 0o600
@@ -206,6 +206,40 @@ class ControlDatabase:
             self._connection.close()
         except sqlite3.Error:
             pass
+
+
+def _validated_database_path(database: object) -> Path | None:
+    """Return the exact live main-database path for a genuine open control handle.
+
+    ``ControlDatabase.path`` is descriptive metadata, not authority by itself. Bind it back to the
+    live SQLite connection before another subsystem derives a state root or lock path from it, so a
+    caller cannot wrap one database connection with another database's pathname.
+    """
+
+    if type(database) is not ControlDatabase:
+        return None
+    try:
+        if object.__getattribute__(database, "_closed"):
+            return None
+        connection = object.__getattribute__(database, "_connection")
+        claimed = lexical_absolute_path(object.__getattribute__(database, "_path"))
+        if type(connection) is not sqlite3.Connection:
+            return None
+        rows = connection.execute("PRAGMA database_list").fetchall()
+    except (AttributeError, OSError, SecureFileError, sqlite3.Error, TypeError, ValueError):
+        return None
+    main_paths = [
+        row[2]
+        for row in rows
+        if len(row) >= 3 and row[1] == "main" and type(row[2]) is str and row[2]
+    ]
+    if len(main_paths) != 1:
+        return None
+    try:
+        live = lexical_absolute_path(main_paths[0])
+    except SecureFileError:
+        return None
+    return claimed if live == claimed else None
 
 
 def open_control_database(path: str | Path) -> ControlDatabase:

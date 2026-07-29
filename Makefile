@@ -93,6 +93,19 @@ test-coverage:
 		--critical 'src/milhouse/privacy/redact.py' \
 		--critical 'src/milhouse/privacy/render.py' \
 		--critical 'src/milhouse/privacy/sanitize.py' \
+		--critical 'src/milhouse/state/barrier.py' \
+		--critical 'src/milhouse/state/database.py' \
+		--critical 'src/milhouse/state/errors.py' \
+		--critical 'src/milhouse/state/leases.py' \
+		--critical 'src/milhouse/state/migrations.py' \
+		--critical 'src/milhouse/state/schema.py' \
+		--critical 'src/milhouse/spooling/commit.py' \
+		--critical 'src/milhouse/spooling/errors.py' \
+		--critical 'src/milhouse/spooling/ledger.py' \
+		--critical 'src/milhouse/spooling/reader.py' \
+		--critical 'src/milhouse/spooling/reconcile.py' \
+		--critical 'src/milhouse/spooling/segment.py' \
+		--critical 'src/milhouse/spooling/writer.py' \
 		--critical 'scripts/check_artifacts.py' \
 		--critical 'scripts/check_coverage.py' \
 		--critical 'scripts/check_dco.py' \

@@ -80,6 +80,29 @@ and traceback, unchanged from A02. Revised tests: a schema-lock test asserts eac
 literal, scalar type, and optionality rule for the minimal and maximal header, event, non-empty
 trailer, and empty trailer, together with the digest-coverage and the `expires_at` normative vector.
 
+Plan amendment A06, approved by the owner on 2026-07-28 and ratified by an ADR 0004 addendum,
+narrows threat-model security objective 4 from an unconditional filesystem-containment claim to the
+attacker model Milhouse can enforce on its supported POSIX hosts. Milhouse must prevent writes and
+unlinks outside approved state roots or configured `.milhouse/` directories caused by untrusted
+input, traversal, symlinks, other local users, or cooperating Milhouse processes. The
+operating-system account running Milhouse and the host administrator are trusted for filesystem
+containment, and hostile same-UID containment is not claimed. Reason: POSIX cannot atomically bind
+proof that an ancestor pathname still names an opened directory to a later descriptor-relative
+mutation, so hostile same-UID code can rename the ancestor in the adjacent syscall window. Section
+4.8 already treats explicitly installed in-process plugins as trusted code running with the
+Milhouse user's authority, but objective 4 did not state the corresponding filesystem boundary.
+Alternatives considered: keeping the absolute objective (rejected because the supported design
+cannot satisfy or test it honestly) and removing filesystem containment altogether (rejected
+because traversal, symlink, other-user, and cooperating-process containment remains enforceable and
+required). Compatibility and migration: documentation-only, with no source, wire, stored-format,
+retention, egress, product-scope, or migration change. Security impact: A06 explicitly narrows the
+literal attacker model; it retains every containment requirement within the defended boundary,
+requires uncertain outcomes rather than success after detected namespace drift, and recommends a
+dedicated service account. Revised tests retain traversal, symlink, different-user,
+cooperating-writer, deterministic directory-displacement, recovery-copy-preservation, and retry
+coverage; no acceptance test may claim containment against hostile code already executing as the
+Milhouse account.
+
 ## 2. Product contract
 
 ### 2.1 Product definition
