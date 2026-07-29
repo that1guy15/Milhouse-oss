@@ -275,7 +275,12 @@ def test_a_leftover_staging_file_requires_recovery_and_is_removed(tmp_path: Path
     store = _store(logs)
     store.close()
     staging = logs / ".structured-log.next.tmp"
-    staging.write_bytes(b"crashed header")
+    # a torn partial successor-header write — the exact crash artifact _publish_fresh_current
+    # leaves behind — which recovery classifies as a log-protocol crash state and removes
+    header = structured_log_header_line(
+        StructuredLogHeaderV1(sequence=2, opened_at=_NOW, retention_days=14)
+    )
+    staging.write_bytes(header[:24])
     os.chmod(staging, 0o600)
     with pytest.raises(LoggingError) as refused:
         _store(logs)
@@ -955,22 +960,16 @@ def test_a_failed_truncation_fails_closed(tmp_path: Path, monkeypatch: pytest.Mo
     assert captured.value.code == "MH_LOG_RECOVER"
 
 
-def test_an_unexaminable_staging_name_fails_recovery_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_an_unexaminable_staging_name_fails_recovery_closed(tmp_path: Path) -> None:
     logs, _control = _state_root(tmp_path)
     barrier = _hold_for(tmp_path)
-    real_stat = os.stat
-
-    def _blocked_stat(target, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if target == ".structured-log.next.tmp" and kwargs.get("dir_fd") is not None:
-            raise PermissionError(13, "planted stat failure")
-        return real_stat(target, *args, **kwargs)
-
-    monkeypatch.setattr(os, "stat", _blocked_stat)
+    # a symlink at the staging name is not a crash artifact: the no-follow open fails recovery
+    # closed, and the symlink is never followed or removed
+    os.symlink(tmp_path / "outside", logs / ".structured-log.next.tmp")
     with pytest.raises(LoggingError) as captured:
         recover_structured_logs(logs_dir=logs, barrier=barrier, monotonic=_monotonic)
     assert captured.value.code == "MH_LOG_RECOVER"
+    assert (logs / ".structured-log.next.tmp").is_symlink()  # never followed or deleted
 
 
 def test_a_failed_staging_removal_fails_closed(
@@ -1749,11 +1748,15 @@ def test_the_live_store_refuses_to_rotate_past_the_rotation_bound(
         retention_days=14,
         now=_NOW + timedelta(days=365),
     )
-    assert [segment.sequence for segment in removed.segments] == [1, 2]  # the API escape works
+    # reclaiming the closed rotations frees room, so the expired active (3) is retired this pass too
+    assert [segment.sequence for segment in removed.segments] == [1, 2, 3]
+    assert removed.active is not None and removed.active.rotated is True
     resumed = _store(logs)
     try:
-        resumed.rotate(closed_at=_NOW + timedelta(minutes=3))  # rotation resumes post-prune
-        assert resumed.sequence == 4
+        resumed.rotate(
+            closed_at=_NOW + timedelta(days=365, minutes=1)
+        )  # rotation resumes post-prune
+        assert resumed.sequence == 5
     finally:
         resumed.close()
 

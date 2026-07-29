@@ -140,13 +140,18 @@ def _resolve_logs_dir(logs_dir: str | Path) -> Path:
     return resolved
 
 
-def _open_logs_dir(logs_dir: Path) -> int:
-    """Open the logs directory as an owned, exact-0700, ACL-free no-follow descriptor."""
+def _close_fd(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:  # pragma: no cover - defensive close failure
+        pass
+
+
+def _require_logs_envelope(descriptor: int) -> None:
+    """Require an opened logs directory to be an owned, exact-0700, ACL-free directory."""
 
     unsafe = False
-    descriptor: int | None = None
     try:
-        descriptor = os.open(logs_dir, os.O_RDONLY | _NOFOLLOW | _DIRECTORY | _CLOEXEC)
         info = os.fstat(descriptor)
         if (
             not stat.S_ISDIR(info.st_mode)
@@ -159,41 +164,85 @@ def _open_logs_dir(logs_dir: Path) -> int:
     except Exception:
         unsafe = True
     if unsafe:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:  # pragma: no cover - defensive close failure
-                pass
         _fail("MH_LOG_DIR", "the logs directory must be an owned, ACL-free 0o700 directory")
+
+
+def _open_dir_component(parent_fd: int | None, name: str | Path) -> int:
+    """Open one path component as an owned no-follow directory descriptor.
+
+    ``parent_fd`` is None only for the trusted state-root anchor (opened by absolute path, so its
+    own ancestors are the authenticated runtime home); every component beneath it is opened
+    descriptor-relative, so a symlinked ancestor at any depth below the state root fails closed.
+    """
+
+    unsafe = False
+    descriptor: int | None = None
+    flags = os.O_RDONLY | _NOFOLLOW | _DIRECTORY | _CLOEXEC
+    try:
+        descriptor = (
+            os.open(name, flags) if parent_fd is None else os.open(name, flags, dir_fd=parent_fd)
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != _current_uid():
+            unsafe = True
+    except Exception:
+        unsafe = True
+    if unsafe:
+        if descriptor is not None:
+            _close_fd(descriptor)
+        _fail("MH_LOG_DIR", "the logs path must be an owned symlink-free directory chain")
     assert descriptor is not None
     return descriptor
 
 
-def _require_live_directory(directory_fd: int, logs_dir: Path, code: str) -> None:
-    """Require the configured logs path to still name the held directory descriptor.
+def _open_logs_dir(state_root: Path, logs_dir: Path) -> int:
+    """Open the logs directory by walking the state-root-to-logs chain no-follow per component.
 
-    A directory swap after open would otherwise silently redirect every descriptor-relative
-    write outside ``[paths].logs`` while the API reports success — the held descriptor follows
-    the renamed directory. Every mutation and maintenance operation re-proves the live binding
-    under the log lock before touching anything (POSIX offers no bind-and-operate, so the
-    one-syscall residual window is closed to cooperating processes by that lock).
+    The state root's own path is trusted (the A06 authenticated runtime home); every component
+    from the state root down to the logs directory is opened ``O_NOFOLLOW``, so a symlinked
+    ancestor at any depth beneath the state root fails closed and never redirects creation or
+    descriptor-relative writes outside ``[paths].logs``. The logs directory must additionally be an
+    owned, ACL-free ``0o700`` directory and must lie within the state root.
+    """
+
+    root = lexical_absolute_path(state_root)
+    logs = lexical_absolute_path(logs_dir)
+    if logs != root and not logs.is_relative_to(root):
+        _fail("MH_LOG_DIR", "the logs directory must lie within the state root")
+    directory_fd = _open_dir_component(None, root)
+    try:
+        for component in logs.relative_to(root).parts:
+            child_fd = _open_dir_component(directory_fd, component)
+            _close_fd(directory_fd)
+            directory_fd = child_fd
+        _require_logs_envelope(directory_fd)
+    except BaseException:
+        _close_fd(directory_fd)
+        raise
+    return directory_fd
+
+
+def _require_live_directory(directory_fd: int, state_root: Path, logs_dir: Path, code: str) -> None:
+    """Require the configured state-root-to-logs chain to still name the held descriptor.
+
+    A directory swap, or a symlink newly interposed on the chain after open, would otherwise
+    silently redirect every descriptor-relative write outside ``[paths].logs``. Every mutation and
+    maintenance operation re-walks the chain no-follow under the log lock and proves the live logs
+    inode still equals the held descriptor before touching anything.
     """
 
     bound = False
     probe: int | None = None
     try:
-        probe = os.open(logs_dir, os.O_RDONLY | _NOFOLLOW | _DIRECTORY | _CLOEXEC)
+        probe = _open_logs_dir(state_root, logs_dir)
         held = os.fstat(directory_fd)
         live = os.fstat(probe)
         bound = (held.st_dev, held.st_ino) == (live.st_dev, live.st_ino)
-    except OSError:
+    except (LoggingError, OSError):
         bound = False
     finally:
         if probe is not None:
-            try:
-                os.close(probe)
-            except OSError:  # pragma: no cover - defensive close failure
-                bound = False
+            _close_fd(probe)
     if not bound:
         _fail(code, "the configured logs directory no longer names the held descriptor")
 
@@ -575,19 +624,29 @@ def _list_rotated(directory_fd: int) -> dict[int, str]:
     return rotated
 
 
-def _require_logs_barrier(barrier: GlobalCommitBarrier, logs_dir: Path) -> None:
-    """Require the state root's own commit barrier before maintenance takes its exclusive side.
+def _require_logs_barrier(barrier: GlobalCommitBarrier, logs_dir: Path) -> Path:
+    """Require the passed barrier's own state root and that the logs directory lies within it.
 
-    The logs directory is a runtime child of the state root, whose control-plane commit lock is
-    ``<state_root>/control/commit.lock``. Maintenance authority is the genuine exclusive ``flock``
-    of THAT barrier — acquired by the caller of ``barrier.exclusive()`` below, never a mintable
-    token — so a barrier bound to any other lock path, or any non-barrier object, is not authority
-    here and fails closed before a descriptor is opened.
+    The barrier is the maintenance authority; its lock is ``<state_root>/control/commit.lock``, so
+    the state root is derived from the barrier itself rather than assumed to be the logs directory's
+    parent — the latter is wrong for a plan-valid nested ``[paths].logs``. A non-barrier, a barrier
+    whose lock is not a control commit lock, a self-inconsistent (tampered) barrier, or a logs
+    directory outside that state root fails closed before a descriptor is opened. Returns the state
+    root so the caller can open the logs chain no-follow within it.
     """
 
-    expected = lexical_absolute_path(logs_dir).parent / _CONTROL_DIR / _BARRIER_NAME
-    if not _is_bound_barrier(barrier, expected):
-        _fail("MH_LOG_AUTHORITY", "maintenance requires a live exclusive hold of this state root")
+    if type(barrier) is not GlobalCommitBarrier:
+        _fail("MH_LOG_AUTHORITY", "maintenance requires this state root's commit barrier")
+    lock_path = lexical_absolute_path(barrier.path)
+    if lock_path.name != _BARRIER_NAME or lock_path.parent.name != _CONTROL_DIR:
+        _fail("MH_LOG_AUTHORITY", "maintenance requires this state root's commit barrier")
+    if not _is_bound_barrier(barrier, lock_path):
+        _fail("MH_LOG_AUTHORITY", "maintenance requires this state root's commit barrier")
+    state_root = lock_path.parent.parent
+    logs = lexical_absolute_path(logs_dir)
+    if logs != state_root and not logs.is_relative_to(state_root):
+        _fail("MH_LOG_AUTHORITY", "the logs directory is not within the barrier's state root")
+    return state_root
 
 
 class StructuredLogStore:
@@ -616,6 +675,7 @@ class StructuredLogStore:
         "_logs_dir",
         "_retention_days",
         "_size",
+        "_state_root",
     )
 
     def __init__(
@@ -625,15 +685,21 @@ class StructuredLogStore:
         retention_days: int,
         monotonic: Callable[[], float],
         opened_at: datetime,
+        state_root: str | Path | None = None,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         _require_platform()
         if type(retention_days) is not int or not 1 <= retention_days <= 3_650:
             _fail("MH_LOG_RETENTION", "a bounded positive retention is required")
         self._logs_dir = _resolve_logs_dir(logs_dir)
+        # the trusted anchor the logs chain is opened no-follow within; defaults to the logs
+        # parent, but a caller with a nested [paths].logs passes the true state root
+        self._state_root = (
+            _resolve_logs_dir(state_root) if state_root is not None else self._logs_dir.parent
+        )
         self._retention_days = retention_days
         self._closed = False
-        self._directory_fd = _open_logs_dir(self._logs_dir)
+        self._directory_fd = _open_logs_dir(self._state_root, self._logs_dir)
         self._lock = _LogLock(self._directory_fd, monotonic, sleeper)
         lock_fd = self._lock.acquire()
         try:
@@ -774,7 +840,9 @@ class StructuredLogStore:
         never corrupted.
         """
 
-        _require_live_directory(self._directory_fd, self._logs_dir, "MH_LOG_CONFLICT")
+        _require_live_directory(
+            self._directory_fd, self._state_root, self._logs_dir, "MH_LOG_CONFLICT"
+        )
         conflicted = False
         try:
             cached = os.fstat(self._descriptor)
@@ -981,13 +1049,13 @@ def recover_structured_logs(
 
     _require_platform()
     resolved = _resolve_logs_dir(logs_dir)
-    _require_logs_barrier(barrier, resolved)
+    state_root = _require_logs_barrier(barrier, resolved)
     with barrier.exclusive():
-        directory_fd = _open_logs_dir(resolved)
+        directory_fd = _open_logs_dir(state_root, resolved)
         lock = _LogLock(directory_fd, monotonic, sleeper)
         lock_fd = lock.acquire()
         try:
-            _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+            _require_live_directory(directory_fd, state_root, resolved, "MH_LOG_DIR")
             truncated, completed = _repair_active(directory_fd)
             removed = _remove_staging(directory_fd)
             return LogRecoveryReport(
@@ -1147,20 +1215,110 @@ def _complete_rotation(directory_fd: int, sequence: int, info: os.stat_result) -
         _fail("MH_LOG_RECOVER", "the interrupted rotation could not be completed")
 
 
-def _remove_staging(directory_fd: int) -> bool:
-    try:
-        os.stat(_STAGING_NAME, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
+# The invariant leading bytes of every canonical header line (sorted keys ``line``, ``opened_at``,
+# … with no spaces), up to where the first variable value begins. A torn header write can only be
+# a prefix of these bytes; arbitrary trailing content after ``{"line":"header"`` is not.
+_HEADER_PREAMBLE = b'{"line":"header","opened_at":"'
+
+
+def _classify_staging(content: bytes, directory_fd: int) -> bool:
+    """Return whether staging bytes are a legitimate ``_publish_fresh_current`` crash artifact.
+
+    A crash can leave the staging file empty (created, unwritten), a single torn partial line that
+    is a genuine byte-prefix of the canonical header preamble, or exactly one complete header line
+    at a successor sequence above every surviving rotation. Multiple lines, a non-header line,
+    content past a header, a partial that diverges from the canonical header bytes, or a reused
+    sequence is foreign or ambiguous, never a crash artifact.
+    """
+
+    if not content.endswith(_LF):
+        # empty or one torn partial line that is a real prefix of the canonical header preamble
+        return _LF not in content and _HEADER_PREAMBLE.startswith(content)
+    lines = content.split(_LF)[:-1]
+    if len(lines) != 1:
         return False
+    header: StructuredLogHeaderV1 | None = None
+    try:
+        header = _parse_header_line(lines[0] + _LF)
+    except LoggingError:
+        header = None
+    if header is None:
+        return False
+    return header.sequence > max(_list_rotated(directory_fd), default=0)
+
+
+def _remove_staging(directory_fd: int) -> bool:
+    """Remove ONLY a classified log-protocol staging crash artifact; refuse foreign occupants.
+
+    The staging name is opened no-follow and non-blocking (so a planted FIFO cannot hang),
+    required to be an owned, single-link, ACL-free ``0o600`` regular file, read under the header
+    bound, and classified as a legitimate crash artifact before an identity-bound unlink. A
+    symlink, hard link, directory, FIFO, wrong mode/owner, over-long or malformed content, a
+    reused sequence, or an occupant swapped in after classification fails closed with a fixed code
+    and is left exactly in place — recovery never destroys an object it has not proven belongs to
+    the log protocol.
+    """
+
+    descriptor: int | None = None
+    absent = False
+    try:
+        descriptor = _open_regular_at(
+            directory_fd, _STAGING_NAME, flags=os.O_RDONLY | os.O_NONBLOCK
+        )
+    except FileNotFoundError:
+        absent = True
     except OSError:
-        _fail("MH_LOG_RECOVER", "the staging name could not be examined")
+        _fail("MH_LOG_RECOVER", "the staging occupant could not be securely opened")
+    if absent:
+        return False
+    assert descriptor is not None
     failed = False
+    refused = False
+    content = b""
+    identity: tuple[int, int] | None = None
+    try:
+        _require_private_file(descriptor)
+        info = os.fstat(descriptor)
+        identity = (info.st_dev, info.st_ino)
+        content = _read_bounded(descriptor, MAX_HEADER_LINE_BYTES, "MH_LOG_RECOVER")
+    except LoggingError:
+        refused = True
+    except OSError:
+        failed = True
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:  # pragma: no cover - defensive close failure
+            failed = True
+    if failed:
+        _fail("MH_LOG_RECOVER", "the staging occupant could not be read")
+    if refused or identity is None or not _classify_staging(content, directory_fd):
+        _fail("MH_LOG_RECOVER", "the staging occupant is not a log-protocol crash artifact")
+    # identity-bound unlink: the name must still resolve to the exact classified inode
+    verified = False
+    probe: int | None = None
+    try:
+        probe = _open_regular_at(directory_fd, _STAGING_NAME, flags=os.O_RDONLY | os.O_NONBLOCK)
+        live = os.fstat(probe)
+        verified = (live.st_dev, live.st_ino) == identity
+    except OSError:
+        verified = False
+    finally:
+        if probe is not None:
+            try:
+                os.close(probe)
+            except OSError:  # pragma: no cover - defensive close failure
+                verified = False
+    if not verified:
+        _fail("MH_LOG_RECOVER", "the staging occupant changed before removal")
+    removed = False
     try:
         os.unlink(_STAGING_NAME, dir_fd=directory_fd)
         os.fsync(directory_fd)
+        removed = True
     except OSError:
-        failed = True
-    if failed:
+        removed = False
+    if not removed:
         _fail("MH_LOG_RECOVER", "the crashed staging file could not be removed")
     return True
 
@@ -1413,13 +1571,13 @@ def retention_preview(
 
     _require_platform()
     resolved = _resolve_logs_dir(logs_dir)
-    _require_logs_barrier(barrier, resolved)
+    state_root = _require_logs_barrier(barrier, resolved)
     with barrier.exclusive():
-        directory_fd = _open_logs_dir(resolved)
+        directory_fd = _open_logs_dir(state_root, resolved)
         lock = _LogLock(directory_fd, monotonic, sleeper)
         lock_fd = lock.acquire()
         try:
-            _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+            _require_live_directory(directory_fd, state_root, resolved, "MH_LOG_DIR")
             active, _state = _active_status(directory_fd, retention_days, now)
             report, _validated = _preview_locked(directory_fd, retention_days, now)
             return RetentionReport(segments=report.segments, refused=report.refused, active=active)
@@ -1570,6 +1728,67 @@ def _parse_trailer_line(
     return trailer
 
 
+def _prune_expired_closed(
+    directory_fd: int,
+    retention_days: int,
+    now: datetime,
+    removed: list[RetainedSegment],
+    refused: list[RefusedSegment],
+) -> None:
+    """Delete every expired, identity-verified closed rotation; append outcomes to the lists."""
+
+    preview, validated = _preview_locked(directory_fd, retention_days, now)
+    refused.extend(preview.refused)
+    for segment in preview.segments:
+        if not segment.expired:
+            continue
+        if _unlink_verified(
+            directory_fd, _rotated_name(segment.sequence), validated[segment.sequence]
+        ):
+            removed.append(segment)
+        else:
+            # the name no longer resolves to the exact object whose expiry was proven: the
+            # replacement is left byte-for-byte intact and the sequence is NOT claimed removed
+            refused.append(RefusedSegment(sequence=segment.sequence, code="MH_LOG_RETENTION"))
+
+
+def _prune_specific_rotation(
+    directory_fd: int,
+    sequence: int,
+    retention_days: int,
+    now: datetime,
+    removed: list[RetainedSegment],
+    refused: list[RefusedSegment],
+) -> None:
+    """Delete one just-closed rotation when it is expired; defer to the next pass on any drift."""
+
+    code: str | None = None
+    header: StructuredLogHeaderV1 | None = None
+    trailer: StructuredLogTrailerV1 | None = None
+    identity: tuple[int, int, int, int, int] | None = None
+    try:
+        header, trailer, identity = _read_closed_segment(
+            directory_fd, _rotated_name(sequence), sequence
+        )
+    except LoggingError as error:
+        code = error.code  # a fixed MH_LOG_* code, value-safe by construction
+    if code is not None or header is None or trailer is None or identity is None:
+        refused.append(RefusedSegment(sequence=sequence, code=code or "MH_LOG_RETENTION"))
+        return
+    effective = min(trailer.expires_at, header.opened_at + timedelta(days=retention_days))
+    if effective <= now and _unlink_verified(directory_fd, _rotated_name(sequence), identity):
+        removed.append(
+            RetainedSegment(
+                sequence=sequence,
+                expires_at=trailer.expires_at,
+                effective_expires_at=effective,
+                expired=True,
+            )
+        )
+    else:
+        refused.append(RefusedSegment(sequence=sequence, code="MH_LOG_RETENTION"))
+
+
 def retention_apply(
     *,
     logs_dir: str | Path,
@@ -1579,61 +1798,61 @@ def retention_apply(
     now: datetime,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> RetentionReport:
-    """Rotate a due active segment, then delete expired validated closed rotations.
+    """Reclaim expired closed rotations, then retire a due active segment or report it blocked.
 
-    The active segment is authenticated first under the exclusive barrier and log lock: if its
-    effective deadline has passed it is closed with an authenticated trailer and rotated in the
-    fixed crash order, a fresh empty successor is published, and the newly closed segment then
-    flows through the same closed-segment path below — so no acknowledged event outlives the
-    log-class privacy ceiling just because appends stopped. Then only validated closed segments
-    whose effective deadline has passed are deleted, with a descriptor-bound unlink and a parent
-    fsync. A rotation that fails validation is reported in ``refused`` and left exactly in place.
-    An active segment that cannot be cleanly authenticated is left for recovery and reported in
-    ``active`` with a fixed code; closed-segment pruning still proceeds.
+    Expired validated closed rotations are pruned FIRST (descriptor-bound unlink and parent fsync)
+    so a due active segment can rotate even near ``MAX_ROTATIONS``. The active segment is
+    authenticated under the exclusive barrier and log lock; if its effective deadline has passed it
+    is closed with an authenticated trailer, rotated in the fixed crash order, given a fresh empty
+    successor, and the newly closed segment is pruned in the same pass — so no acknowledged event
+    outlives the log-class privacy ceiling once appends stop. If the rotation bound is still pinned
+    after reclamation (for example by refused corrupt rotations), the due active is left in place
+    and reported ``rotated=False`` with a fixed ``MH_LOG_RETENTION_BOUND`` code rather than a silent
+    successful apply. An active segment that cannot be cleanly authenticated is left for recovery
+    with a fixed code; a closed rotation that fails validation is reported ``refused``.
     """
 
     _require_platform()
     resolved = _resolve_logs_dir(logs_dir)
-    _require_logs_barrier(barrier, resolved)
+    state_root = _require_logs_barrier(barrier, resolved)
     with barrier.exclusive():
-        directory_fd = _open_logs_dir(resolved)
+        directory_fd = _open_logs_dir(state_root, resolved)
         lock = _LogLock(directory_fd, monotonic, sleeper)
         lock_fd = lock.acquire()
         try:
-            _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+            _require_live_directory(directory_fd, state_root, resolved, "MH_LOG_DIR")
             active, state = _active_status(directory_fd, retention_days, now)
-            if (
-                active is not None
-                and active.expired
-                and state is not None
-                and len(_list_rotated(directory_fd)) < MAX_ROTATIONS
-            ):
-                # close the due active segment into a rotation; the loop below then prunes it
-                _close_and_rotate_active(directory_fd, state, now)
-                _publish_fresh_current(directory_fd, state.header.sequence + 1, now, retention_days)
-                active = ActiveSegmentStatus(
-                    sequence=active.sequence,
-                    effective_expires_at=active.effective_expires_at,
-                    expired=True,
-                    rotated=True,
-                    code=None,
-                )
-            preview, validated = _preview_locked(directory_fd, retention_days, now)
             removed: list[RetainedSegment] = []
-            refused = list(preview.refused)
-            for segment in preview.segments:
-                if not segment.expired:
-                    continue
-                if _unlink_verified(
-                    directory_fd, _rotated_name(segment.sequence), validated[segment.sequence]
-                ):
-                    removed.append(segment)
+            refused: list[RefusedSegment] = []
+            # reclaim eligible closed rotations FIRST so a due active can rotate near the bound
+            _prune_expired_closed(directory_fd, retention_days, now, removed, refused)
+            if active is not None and active.expired and state is not None:
+                if len(_list_rotated(directory_fd)) < MAX_ROTATIONS:
+                    _close_and_rotate_active(directory_fd, state, now)
+                    _publish_fresh_current(
+                        directory_fd, state.header.sequence + 1, now, retention_days
+                    )
+                    active = ActiveSegmentStatus(
+                        sequence=active.sequence,
+                        effective_expires_at=active.effective_expires_at,
+                        expired=True,
+                        rotated=True,
+                        code=None,
+                    )
+                    # prune the just-closed rotation this pass; deferred to the next pass on drift
+                    _prune_specific_rotation(
+                        directory_fd, state.header.sequence, retention_days, now, removed, refused
+                    )
                 else:
-                    # the name no longer resolves to the exact object whose expiry was proven: the
-                    # replacement is left byte-for-byte intact and the sequence is NOT claimed
-                    # removed — reported refused instead
-                    refused.append(
-                        RefusedSegment(sequence=segment.sequence, code="MH_LOG_RETENTION")
+                    # the bound is still pinned after reclamation (e.g. by refused rotations): the
+                    # expired active cannot be retired now, so report it blocked — never a silent
+                    # successful apply that leaves expired bytes past the ceiling
+                    active = ActiveSegmentStatus(
+                        sequence=active.sequence,
+                        effective_expires_at=active.effective_expires_at,
+                        expired=True,
+                        rotated=False,
+                        code="MH_LOG_RETENTION_BOUND",
                     )
             return RetentionReport(segments=tuple(removed), refused=tuple(refused), active=active)
         finally:

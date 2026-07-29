@@ -22,6 +22,7 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -154,16 +155,30 @@ def _is_bound_barrier(barrier: object, lock_path: Path) -> bool:
     )
 
 
+# In-process record of which barrier instance, in which thread, currently holds each exclusive lock
+# path: ``{lock_path: (barrier, thread_id)}``. Exclusive acquisition is exact-instance reentrant: a
+# nested ``exclusive()`` on the SAME instance in the acquiring thread reuses the held flock, so
+# composed maintenance that receives one already-held barrier never deadlocks. A DIFFERENT instance
+# for the same path IN THE SAME THREAD would deadlock re-acquiring that flock, so it fails closed; a
+# different THREAD (or process) is genuine contention and blocks on the flock as before. A main/gate
+# path mutated during a held hold also fails closed, so one state root's authority never stands in
+# for another.
+_EXCLUSIVE_OWNERS: dict[Path, tuple[GlobalCommitBarrier, int]] = {}
+
+
 class GlobalCommitBarrier:
     """A cross-process, writer-preferring readers-writer commit barrier over one lock file pair."""
 
-    __slots__ = ("_gate_path", "_path")
+    __slots__ = ("_exclusive_depth", "_exclusive_key", "_exclusive_thread", "_gate_path", "_path")
 
     def __init__(self, lock_path: str | Path) -> None:
         if _NOFOLLOW == 0:  # pragma: no cover - Milhouse supports only no-follow POSIX hosts
             _fail("MH_STATE_UNSUPPORTED", "the commit barrier requires no-follow file support")
         self._path = lexical_absolute_path(lock_path)
         self._gate_path = self._path.with_name(self._path.name + _GATE_SUFFIX)
+        self._exclusive_depth = 0
+        self._exclusive_key: tuple[Path, Path] | None = None
+        self._exclusive_thread: int | None = None
 
     @property
     def path(self) -> Path:
@@ -197,20 +212,56 @@ class GlobalCommitBarrier:
 
     @contextmanager
     def exclusive(self, *, blocking: bool = True) -> Iterator[None]:
-        """Hold the exclusive side; block new shared entrants and drain existing ones."""
+        """Hold the exclusive side; block new shared entrants and drain existing ones.
 
+        Acquisition is exact-instance reentrant: a nested ``exclusive()`` on the SAME instance
+        reuses the flock already held (so composed maintenance that receives one already-held
+        barrier never deadlocks), while a different in-process instance for the same lock path, or
+        a main/gate path mutated during a held hold, fails closed rather than deadlocking or letting
+        one state root's authority stand in for another. Cross-process exclusion is unchanged.
+        """
+
+        key = (lexical_absolute_path(self._path), lexical_absolute_path(self._gate_path))
+        me = threading.get_ident()
+        if self._exclusive_depth > 0 and self._exclusive_thread == me:
+            if self._exclusive_key != key:
+                _fail("MH_STATE_BARRIER", "the barrier lock path changed during a held hold")
+            self._exclusive_depth += 1
+            try:
+                yield
+            finally:
+                self._exclusive_depth -= 1
+            return
+        owner = _EXCLUSIVE_OWNERS.get(key[0])
+        if owner is not None and owner[1] == me and owner[0] is not self:
+            # a different instance in THIS thread already holds the flock: re-acquiring it would
+            # deadlock, so fail closed instead of blocking forever
+            _fail("MH_STATE_BARRIER", "another barrier instance already holds this exclusive lock")
         main_fd = _secure_lock_descriptor(self._path)
         gate_fd: int | None = None
         gate_held = False
         main_held = False
+        registered = False
         try:
             gate_fd = _secure_lock_descriptor(self._gate_path)
             _acquire(gate_fd, fcntl.LOCK_EX, blocking=blocking)
             gate_held = True
             _acquire(main_fd, fcntl.LOCK_EX, blocking=blocking)
             main_held = True
+            self._exclusive_key = key
+            self._exclusive_thread = me
+            self._exclusive_depth = 1
+            _EXCLUSIVE_OWNERS[key[0]] = (self, me)
+            registered = True
             yield
         finally:
+            if registered:
+                self._exclusive_depth = 0
+                self._exclusive_key = None
+                self._exclusive_thread = None
+                existing = _EXCLUSIVE_OWNERS.get(key[0])
+                if existing is not None and existing[0] is self:
+                    del _EXCLUSIVE_OWNERS[key[0]]
             if main_held:
                 _release(main_fd)
             if gate_held and gate_fd is not None:
