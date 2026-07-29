@@ -52,7 +52,8 @@ Create a series plan when the draft would teach more than one independent concep
 about 1,600 words, or force a reader to understand one topic before another. A series gives each post
 one reader question, one practical analogy, one Milhouse connection, and one honest availability
 boundary. The Discussion may support several later articles; do not force a one-to-one publication
-schedule.
+schedule. A series plan is not itself a blog post; each completed, dependency-ready article in the
+series receives its own draft-only Substack handoff.
 
 ## Workflow
 
@@ -73,14 +74,25 @@ schedule.
    review, and Required CI path.
 7. Publish the human-readable body in the maintainer-only `Announcements` category using the
    checked-in `announcements.yml` form. Link the source file and exact protected evidence.
-8. Hand the personal draft to the owner for voice review. Substack or any other external publication
-   requires current destination-specific authorization and an authenticated session; a GitHub
-   Discussion authorization does not supply either.
-9. If a factual correction is needed, preserve transparency: add a dated correction to the post and
+8. Complete the learning companion's voice and evidence checks. The owner's final editorial review
+   happens in the saved Substack draft editor.
+9. For every completed learning blog derived from a Discussion about current work or features, use
+   the connected Chrome session and the owner's already-authenticated Substack account. Create a new
+   post, transfer the title, subtitle, body, headings, lists, and links, and verify that the editor
+   reports **Saved**. Keep the draft editor available for owner review and return its draft URL in the
+   task handoff; do not commit personal account or draft metadata to the repository.
+10. Stop at the saved draft. Do not publish, schedule, send an email, change account settings, or
+    request credentials. If authenticated Chrome is unavailable, retain the task artifact, report
+    the Substack handoff as pending, and do not substitute an unsigned-in preview browser.
+11. If a factual correction is needed, preserve transparency: add a dated correction to the post and
    its checked-in source rather than silently changing the historical claim.
 
 Publishing a journal post does not change a work-package state, pass a gate, authorize a release,
 or prove that an unimplemented component works.
+
+The standing Substack authority recorded in the implementation-status E10 register covers creating
+and saving unpublished drafts only. It is not personal-blog publication authority, and it never
+extends GitHub Discussion authorization into distribution through Substack.
 
 ## Discussion structure
 
