@@ -470,7 +470,8 @@ def test_retention_preview_and_apply_respect_captured_deadlines(tmp_path: Path) 
     assert [segment.expired for segment in tightened.segments] == [True, True]
     assert all(s.effective_expires_at < s.expires_at for s in tightened.segments)
 
-    # apply deletes only the expired closed rotations, never the active segment
+    # apply also rotates the expired active segment (sequence 3) into a rotation and prunes it,
+    # then publishes a fresh empty successor: no acknowledged event outlives the ceiling
     removed = retention_apply(
         logs_dir=logs,
         barrier=barrier,
@@ -478,11 +479,14 @@ def test_retention_preview_and_apply_respect_captured_deadlines(tmp_path: Path) 
         retention_days=14,
         now=_NOW + timedelta(days=15),
     )
-    assert [segment.sequence for segment in removed.segments] == [1, 2]
+    assert [segment.sequence for segment in removed.segments] == [1, 2, 3]
     assert removed.refused == ()
+    assert removed.active is not None
+    assert removed.active.sequence == 3 and removed.active.rotated is True
     assert not (logs / f"structured-log.{1:020d}.jsonl").exists()
     assert not (logs / f"structured-log.{2:020d}.jsonl").exists()
-    assert (logs / "structured-log.current.jsonl").exists()
+    assert not (logs / f"structured-log.{3:020d}.jsonl").exists()  # the rotated active pruned
+    assert (logs / "structured-log.current.jsonl").exists()  # a fresh empty successor remains
 
 
 def test_retention_keeps_unexpired_segments(tmp_path: Path) -> None:
@@ -528,7 +532,9 @@ def test_retention_refuses_a_corrupt_segment_and_still_prunes_valid_expired_ones
         retention_days=1,
         now=_NOW + timedelta(days=3650),
     )
-    assert [segment.sequence for segment in report.segments] == [1]  # the valid one pruned
+    # the valid closed rotation (1) and the rotated expired active (3) prune; the corrupt
+    # rotation (2) is refused and left in place
+    assert [segment.sequence for segment in report.segments] == [1, 3]
     assert [(refused.sequence, refused.code) for refused in report.refused] == [
         (2, "MH_LOG_RETENTION")
     ]
@@ -717,12 +723,12 @@ def test_the_append_descriptor_is_validated_and_normalized(tmp_path: Path) -> No
     try:
         os.chmod(current, 0o644)
         with pytest.raises(LoggingError) as loose:
-            store._open_for_append()
+            log_store_module._open_for_append_at(store._directory_fd)
         assert loose.value.code == "MH_LOG_FILE"
         os.chmod(current, 0o600)
         os.unlink(current)
         with pytest.raises(LoggingError) as absent:
-            store._open_for_append()
+            log_store_module._open_for_append_at(store._directory_fd)
         assert absent.value.code == "MH_LOG_OPEN"
     finally:
         store.close()
@@ -1113,7 +1119,9 @@ def test_a_failed_expired_unlink_fails_closed(
     real_unlink = os.unlink
 
     def _failing_unlink(target, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if isinstance(target, str) and target.startswith("structured-log."):
+        # fail only the closed rotation's own unlink, so the failure lands on the verified
+        # expired-segment deletion path (not the active-segment rotation that precedes it)
+        if isinstance(target, str) and target == f"structured-log.{1:020d}.jsonl":
             raise OSError(5, "planted unlink failure")
         return real_unlink(target, *args, **kwargs)
 
@@ -1207,14 +1215,16 @@ def test_reopening_after_a_retention_prune_succeeds(tmp_path: Path) -> None:
         retention_days=14,
         now=_NOW + timedelta(days=15),
     )
-    assert [segment.sequence for segment in removed.segments] == [1, 2]  # every rotation pruned
+    # every closed rotation AND the expired active (3) prune; a fresh empty successor (4) remains
+    assert [segment.sequence for segment in removed.segments] == [1, 2, 3]
+    assert removed.active is not None and removed.active.rotated is True
     reopened = _store(logs)
     try:
-        assert reopened.sequence == 3  # the active history survives the prune
-        reopened.append(_event(records=3))
-        reopened.rotate(closed_at=_NOW + timedelta(minutes=3))
-        assert (logs / f"structured-log.{3:020d}.jsonl").exists()  # no sequence reuse
-        assert reopened.sequence == 4
+        assert reopened.sequence == 4  # the fresh successor survives the prune; no sequence reuse
+        reopened.append(_event(_NOW + timedelta(days=15), records=3))  # same UTC day as successor
+        reopened.rotate(closed_at=_NOW + timedelta(days=15, minutes=1))
+        assert (logs / f"structured-log.{4:020d}.jsonl").exists()  # rotates the successor, no reuse
+        assert reopened.sequence == 5
     finally:
         reopened.close()
 

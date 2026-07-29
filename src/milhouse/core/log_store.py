@@ -26,12 +26,13 @@ Recovery truncates a torn incomplete active tail to its last complete line, comp
 interrupted rotation whose durable trailer authenticates against the exact bytes it certifies, and
 removes a crashed pre-publish temporary — covering every write, fsync, and rename crash boundary —
 while complete malformed lines, conflicting sequences, inauthentic trailers, and data past a
-trailer fail closed. Retention deletes only validated closed
-segments whose effective deadline — the captured trailer deadline, shortened but never extended by
-the current policy — has passed, with a descriptor-bound unlink and a parent fsync; validation is
-per segment, so a rotation that fails it is reported refused and left in place without blocking
-the rest. Retention may prune any subset of rotations: surviving rotated names bound the active
-sequence from below only, and a fully emptied logs directory is a fresh history starting at
+trailer fail closed. Retention first closes and rotates the active segment when its effective
+deadline has passed — so its events cannot outlive the ceiling once appends stop — then deletes
+only validated closed segments whose effective deadline — the captured trailer deadline, shortened
+but never extended by the current policy — has passed, with a descriptor-bound unlink and a parent
+fsync; validation is per segment, so a rotation that fails it is reported refused and left in place
+without blocking the rest. Retention may prune any subset of rotations: surviving rotated names
+bound the active sequence from below only, and a fully emptied logs directory is a fresh history at
 sequence one; the live store refuses to create the rotation that would cross ``MAX_ROTATIONS``,
 so the maintenance path always retains its API escape. The store is a SINGLE live appender: every
 append and rotation revalidates, under the log lock, that its cached descriptor still names the
@@ -251,6 +252,98 @@ def _examine_active_envelope(descriptor: int) -> os.stat_result:
     if unsafe or info is None:
         _fail("MH_LOG_FILE", "a log file must be an owned, single-link, ACL-free 0o600 file")
     return info
+
+
+def _staging_present(directory_fd: int) -> bool:
+    try:
+        os.stat(_STAGING_NAME, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        _fail("MH_LOG_OPEN", "the staging name could not be examined")
+    return True
+
+
+def _open_for_append_at(directory_fd: int) -> int:
+    """Open the active segment for append as a validated owned single-link private file."""
+
+    failed = False
+    descriptor: int | None = None
+    try:
+        descriptor = _open_regular_at(directory_fd, _CURRENT_NAME, flags=os.O_WRONLY | os.O_APPEND)
+        _require_private_file(descriptor)
+    except LoggingError:
+        # _require_private_file is the only LoggingError source, so the descriptor is open
+        assert descriptor is not None
+        try:
+            os.close(descriptor)
+        except OSError:  # pragma: no cover - defensive close failure
+            pass
+        raise
+    except OSError:
+        failed = True
+    if failed or descriptor is None:
+        _fail("MH_LOG_OPEN", "the active segment could not be opened for append")
+    return descriptor
+
+
+def _bounded_expiry(opened_at: datetime, retention_days: int) -> datetime:
+    """Return ``opened_at + retention_days`` as a UTC instant; fail closed if out of range."""
+
+    invalid = False
+    deadline: datetime | None = None
+    try:
+        deadline = opened_at + timedelta(days=retention_days)
+        format_timestamp(deadline)
+    except (OverflowError, TimeError):
+        invalid = True
+    if invalid or deadline is None:
+        _fail("MH_LOG_RETENTION", "the segment expiry is out of range")
+    return deadline
+
+
+def _publish_fresh_current(
+    directory_fd: int, sequence: int, opened_at: datetime, retention_days: int
+) -> StructuredLogHeaderV1:
+    """Publish a fresh empty current segment via the crash-safe staging write, rename, dir fsync.
+
+    A short header write is never published: on any incomplete write the staging file is left for
+    recovery and a fixed error is raised instead of exposing a truncated first line.
+    """
+
+    if sequence > MAX_CANONICAL_INT:
+        _fail("MH_LOG_OVERFLOW", "the log sequence space is exhausted")
+    header = StructuredLogHeaderV1(
+        sequence=sequence, opened_at=opened_at, retention_days=retention_days
+    )
+    header_line = structured_log_header_line(header)
+    failed = False
+    descriptor: int | None = None
+    try:
+        descriptor = _open_regular_at(
+            directory_fd, _STAGING_NAME, flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        )
+        if os.write(descriptor, header_line) != len(header_line):
+            failed = True
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        if not failed:
+            os.rename(
+                _STAGING_NAME, _CURRENT_NAME, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
+            )
+            os.fsync(directory_fd)
+    except OSError:
+        failed = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover - defensive close failure
+                failed = True
+    if failed:
+        _fail("MH_LOG_ROTATE", "a fresh active segment could not be published")
+    return header
 
 
 class _LogLock:
@@ -557,7 +650,7 @@ class StructuredLogStore:
     # -- construction ----------------------------------------------------------------------------
 
     def _open_active(self, opened_at: datetime) -> None:
-        if self._staging_exists():
+        if _staging_present(self._directory_fd):
             _fail("MH_LOG_RECOVERY_REQUIRED", "a staging file is present; run log recovery")
         rotated = _list_rotated(self._directory_fd)
         highest = max(rotated) if rotated else 0
@@ -626,76 +719,13 @@ class StructuredLogStore:
         self._last_event_at = last_event_at
         self._size = len(content)
         self._digest = digest
-        self._descriptor = self._open_for_append()
-
-    def _staging_exists(self) -> bool:
-        try:
-            os.stat(_STAGING_NAME, dir_fd=self._directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return False
-        except OSError:
-            _fail("MH_LOG_OPEN", "the staging name could not be examined")
-        return True
-
-    def _open_for_append(self) -> int:
-        failed = False
-        descriptor: int | None = None
-        try:
-            descriptor = _open_regular_at(
-                self._directory_fd, _CURRENT_NAME, flags=os.O_WRONLY | os.O_APPEND
-            )
-            _require_private_file(descriptor)
-        except LoggingError:
-            # _require_private_file is the only LoggingError source, so the descriptor is open
-            assert descriptor is not None
-            try:
-                os.close(descriptor)
-            except OSError:  # pragma: no cover - defensive close failure
-                pass
-            raise
-        except OSError:
-            failed = True
-        if failed or descriptor is None:
-            _fail("MH_LOG_OPEN", "the active segment could not be opened for append")
-        return descriptor
+        self._descriptor = _open_for_append_at(self._directory_fd)
 
     def _start_segment(self, sequence: int, opened_at: datetime) -> None:
-        if sequence > MAX_CANONICAL_INT:
-            _fail("MH_LOG_OVERFLOW", "the log sequence space is exhausted")
-        header = StructuredLogHeaderV1(
-            sequence=sequence, opened_at=opened_at, retention_days=self._retention_days
+        header = _publish_fresh_current(
+            self._directory_fd, sequence, opened_at, self._retention_days
         )
         header_line = structured_log_header_line(header)
-        failed = False
-        descriptor: int | None = None
-        try:
-            descriptor = _open_regular_at(
-                self._directory_fd, _STAGING_NAME, flags=os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            )
-            if os.write(descriptor, header_line) != len(header_line):
-                # a short header write must never be published as a successful segment
-                failed = True
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
-            if not failed:
-                os.rename(
-                    _STAGING_NAME,
-                    _CURRENT_NAME,
-                    src_dir_fd=self._directory_fd,
-                    dst_dir_fd=self._directory_fd,
-                )
-                os.fsync(self._directory_fd)
-        except OSError:
-            failed = True
-        finally:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:  # pragma: no cover - defensive close failure
-                    failed = True
-        if failed:
-            _fail("MH_LOG_ROTATE", "a fresh active segment could not be published")
         digest = hashlib.sha256()
         digest.update(header_line)
         self._header = header
@@ -703,7 +733,7 @@ class StructuredLogStore:
         self._last_event_at = None
         self._size = len(header_line)
         self._digest = digest
-        self._descriptor = self._open_for_append()
+        self._descriptor = _open_for_append_at(self._directory_fd)
 
     # -- append path -----------------------------------------------------------------------------
 
@@ -820,7 +850,7 @@ class StructuredLogStore:
         # the live store refuses first, leaving retention able to prune
         if len(_list_rotated(self._directory_fd)) >= MAX_ROTATIONS:
             _fail("MH_LOG_ROTATIONS", "the rotation count is at its bound; run retention first")
-        expires_at = self._expiry(self._header.opened_at, self._header.retention_days)
+        expires_at = _bounded_expiry(self._header.opened_at, self._header.retention_days)
         trailer = StructuredLogTrailerV1(
             sequence=self._header.sequence,
             closed_at=closed_at,
@@ -859,18 +889,6 @@ class StructuredLogStore:
         if failed:
             _fail("MH_LOG_ROTATE", "the active segment could not be rotated")
         self._start_segment(self._header.sequence + 1, closed_at)
-
-    def _expiry(self, opened_at: datetime, retention_days: int) -> datetime:
-        invalid = False
-        deadline: datetime | None = None
-        try:
-            deadline = opened_at + timedelta(days=retention_days)
-            format_timestamp(deadline)
-        except (OverflowError, TimeError):
-            invalid = True
-        if invalid or deadline is None:
-            _fail("MH_LOG_RETENTION", "the segment expiry is out of range")
-        return deadline
 
     def flush(self) -> None:
         """Make every appended line crash-durable."""
@@ -1151,6 +1169,33 @@ def _remove_staging(directory_fd: int) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class _ActiveState:
+    """The authenticated live active segment: enough to close it into a rotation."""
+
+    header: StructuredLogHeaderV1
+    info: os.stat_result
+    event_count: int
+    last_event_at: datetime | None
+    digest_hex: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveSegmentStatus:
+    """The active segment's retention status at the start of a pass.
+
+    ``sequence`` and ``effective_expires_at`` are ``None`` and ``code`` is a fixed ``MH_LOG_*``
+    when the active segment could not be authenticated (recovery must repair it first). ``rotated``
+    is True only when :func:`retention_apply` closed a due active segment into a rotation this pass.
+    """
+
+    sequence: int | None
+    effective_expires_at: datetime | None
+    expired: bool
+    rotated: bool
+    code: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class RetainedSegment:
     """One validated closed rotation with its captured and effective deadlines."""
 
@@ -1180,11 +1225,172 @@ class RetentionReport:
 
     ``segments`` holds every VALIDATED rotation (for preview) or exactly the validated expired
     rotations that were removed (for apply); ``refused`` holds the per-segment fixed failure
-    codes for rotations that failed validation and were left untouched.
+    codes for rotations that failed validation and were left untouched. ``active`` reports the
+    active segment's status at the start of the pass (``None`` when there is no active segment):
+    preview only reports it, while apply rotates a due active segment into a rotation — which the
+    same pass then validates and deletes — so no event outlives the log-class privacy ceiling.
     """
 
     segments: tuple[RetainedSegment, ...]
     refused: tuple[RefusedSegment, ...]
+    active: ActiveSegmentStatus | None = None
+
+
+def _read_active_state(directory_fd: int) -> _ActiveState | None:
+    """Authenticate the active segment read-only for maintenance; ``None`` when it is absent.
+
+    Mirrors the open-path invariants (staging file, interrupted rotation, torn tail, data past a
+    trailer, foreign extra link, malformed line, sequence at/below a surviving rotation) and fails
+    closed with the same fixed codes, so retention never rotates a segment recovery must repair.
+    """
+
+    if _staging_present(directory_fd):
+        _fail("MH_LOG_RECOVERY_REQUIRED", "a staging file is present; run log recovery")
+    rotated = _list_rotated(directory_fd)
+    highest = max(rotated, default=0)
+    descriptor: int | None = None
+    absent = False
+    try:
+        descriptor = _open_regular_at(directory_fd, _CURRENT_NAME, flags=os.O_RDONLY)
+    except FileNotFoundError:
+        absent = True
+    except OSError:
+        _fail("MH_LOG_OPEN", "the active segment could not be opened")
+    if absent:
+        return None
+    assert descriptor is not None
+    failed = False
+    content = b""
+    info: os.stat_result | None = None
+    try:
+        info = _examine_active_envelope(descriptor)
+        content = _read_bounded(descriptor, MAX_SEGMENT_BYTES, "MH_LOG_OPEN")
+    except OSError:
+        failed = True
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:  # pragma: no cover - defensive close failure
+            failed = True
+    if failed or info is None:
+        _fail("MH_LOG_OPEN", "the active segment could not be read")
+    if info.st_nlink != 1:
+        _fail(
+            "MH_LOG_RECOVERY_REQUIRED",
+            "an interrupted rotation left a linked active segment; run log recovery",
+        )
+    header_line, event_lines, torn = _split_active(content)
+    if torn is not None:
+        _fail("MH_LOG_RECOVERY_REQUIRED", "the active segment has a torn tail; run recovery")
+    header = _parse_header_line(header_line)
+    if header.sequence <= highest:
+        _fail("MH_LOG_SEQUENCE", "the active sequence conflicts with the rotations")
+    last_event_at: datetime | None = None
+    for index, line in enumerate(event_lines):
+        if _is_trailer_line(line):
+            if index == len(event_lines) - 1:
+                _fail(
+                    "MH_LOG_RECOVERY_REQUIRED",
+                    "an interrupted rotation left a trailer in the active segment; run recovery",
+                )
+            _fail("MH_LOG_AMBIGUOUS", "the active segment carries data past a trailer")
+        last_event_at = _validate_event_line(line)
+    digest = hashlib.sha256()
+    digest.update(header_line)
+    for line in event_lines:
+        digest.update(line)
+    return _ActiveState(
+        header=header,
+        info=info,
+        event_count=len(event_lines),
+        last_event_at=last_event_at,
+        digest_hex=digest.hexdigest(),
+    )
+
+
+def _active_status(
+    directory_fd: int, retention_days: int, now: datetime
+) -> tuple[ActiveSegmentStatus | None, _ActiveState | None]:
+    """Return the active segment's status and, when clean, its authenticated state for rotation.
+
+    The effective deadline is the captured deadline (``opened_at + header.retention_days``)
+    shortened — never extended — by the current policy, so a tightening can retire an active
+    segment early while a later relaxation cannot extend one already opened.
+    """
+
+    state: _ActiveState | None = None
+    code: str | None = None
+    try:
+        state = _read_active_state(directory_fd)
+    except LoggingError as error:
+        code = error.code  # a fixed MH_LOG_* code, value-safe by construction
+    if code is not None:
+        return (
+            ActiveSegmentStatus(
+                sequence=None, effective_expires_at=None, expired=False, rotated=False, code=code
+            ),
+            None,
+        )
+    if state is None:
+        return (None, None)
+    captured = _bounded_expiry(state.header.opened_at, state.header.retention_days)
+    policy_deadline = _bounded_expiry(state.header.opened_at, retention_days)
+    effective = min(captured, policy_deadline)
+    status = ActiveSegmentStatus(
+        sequence=state.header.sequence,
+        effective_expires_at=effective,
+        expired=effective <= now,
+        rotated=False,
+        code=None,
+    )
+    return (status, state)
+
+
+def _close_and_rotate_active(directory_fd: int, state: _ActiveState, now: datetime) -> None:
+    """Close the due active segment with an authenticated trailer, then complete the rotation.
+
+    Writes the trailer as the durable final line (fsync file), then reuses the recovery helper's
+    fixed crash order — no-replace link the rotated name, directory fsync, unlink current,
+    directory fsync — so no crash point loses the only name for the newly closed segment.
+    """
+
+    expires_at = _bounded_expiry(state.header.opened_at, state.header.retention_days)
+    trailer_line = structured_log_trailer_line(
+        StructuredLogTrailerV1(
+            sequence=state.header.sequence,
+            closed_at=now,
+            last_event_at=state.last_event_at,
+            event_count=state.event_count,
+            content_sha256=state.digest_hex,
+            expires_at=expires_at,
+        )
+    )
+    descriptor = _open_for_append_at(directory_fd)
+    failed = False
+    try:
+        os.fsync(descriptor)
+        if os.write(descriptor, trailer_line) != len(trailer_line):
+            failed = True
+        else:
+            os.fsync(descriptor)
+    except OSError:
+        failed = True
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:  # pragma: no cover - defensive close failure
+            failed = True
+    if failed:
+        _fail("MH_LOG_ROTATE", "the expired active segment could not be closed")
+    # reuse recovery's crash-safe link/unlink, but surface a failure as the maintenance-rotation
+    # code rather than the recovery code, raised outside the handler so no cause/context leaks
+    completion_failed = False
+    try:
+        _complete_rotation(directory_fd, state.header.sequence, state.info)
+    except LoggingError:
+        completion_failed = True
+    if completion_failed:
+        _fail("MH_LOG_ROTATE", "the expired active rotation could not be completed")
 
 
 def retention_preview(
@@ -1201,7 +1407,8 @@ def retention_preview(
     The effective deadline is the captured trailer deadline shortened — never extended — by the
     current policy: a tightening may shorten an unexpired deadline, but a later relaxation never
     extends an already captured one. Validation is PER SEGMENT: a rotation that fails it is
-    reported in ``refused`` with its fixed code and never blocks the rest.
+    reported in ``refused`` with its fixed code and never blocks the rest. The active segment's
+    due status is reported in ``active`` for symmetry; preview rotates and deletes nothing.
     """
 
     _require_platform()
@@ -1213,8 +1420,11 @@ def retention_preview(
         lock_fd = lock.acquire()
         try:
             _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+            active, _state = _active_status(directory_fd, retention_days, now)
             report, _validated = _preview_locked(directory_fd, retention_days, now)
-            return report
+            return RetentionReport(
+                segments=report.segments, refused=report.refused, active=active
+            )
         finally:
             lock.release(lock_fd)
             try:
@@ -1371,13 +1581,17 @@ def retention_apply(
     now: datetime,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> RetentionReport:
-    """Delete expired, fully validated closed rotations; return exactly what was removed.
+    """Rotate a due active segment, then delete expired validated closed rotations.
 
-    Only validated closed segments whose effective deadline has passed are deleted, with a
-    descriptor-bound unlink and a parent fsync. A rotation that fails validation is reported in
-    ``refused`` and left exactly in place — never deleted, and never blocking the validated
-    segments around it. The active segment is never deleted here; rotate it first if it must be
-    retired.
+    The active segment is authenticated first under the exclusive barrier and log lock: if its
+    effective deadline has passed it is closed with an authenticated trailer and rotated in the
+    fixed crash order, a fresh empty successor is published, and the newly closed segment then
+    flows through the same closed-segment path below — so no acknowledged event outlives the
+    log-class privacy ceiling just because appends stopped. Then only validated closed segments
+    whose effective deadline has passed are deleted, with a descriptor-bound unlink and a parent
+    fsync. A rotation that fails validation is reported in ``refused`` and left exactly in place.
+    An active segment that cannot be cleanly authenticated is left for recovery and reported in
+    ``active`` with a fixed code; closed-segment pruning still proceeds.
     """
 
     _require_platform()
@@ -1389,6 +1603,25 @@ def retention_apply(
         lock_fd = lock.acquire()
         try:
             _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
+            active, state = _active_status(directory_fd, retention_days, now)
+            if (
+                active is not None
+                and active.expired
+                and state is not None
+                and len(_list_rotated(directory_fd)) < MAX_ROTATIONS
+            ):
+                # close the due active segment into a rotation; the loop below then prunes it
+                _close_and_rotate_active(directory_fd, state, now)
+                _publish_fresh_current(
+                    directory_fd, state.header.sequence + 1, now, retention_days
+                )
+                active = ActiveSegmentStatus(
+                    sequence=active.sequence,
+                    effective_expires_at=active.effective_expires_at,
+                    expired=True,
+                    rotated=True,
+                    code=None,
+                )
             preview, validated = _preview_locked(directory_fd, retention_days, now)
             removed: list[RetainedSegment] = []
             refused = list(preview.refused)
@@ -1406,7 +1639,7 @@ def retention_apply(
                     refused.append(
                         RefusedSegment(sequence=segment.sequence, code="MH_LOG_RETENTION")
                     )
-            return RetentionReport(segments=tuple(removed), refused=tuple(refused))
+            return RetentionReport(segments=tuple(removed), refused=tuple(refused), active=active)
         finally:
             lock.release(lock_fd)
             try:
@@ -1459,6 +1692,7 @@ __all__ = [
     "LOCK_WAIT_SECONDS",
     "MAX_ROTATIONS",
     "MAX_SEGMENT_BYTES",
+    "ActiveSegmentStatus",
     "LogRecoveryReport",
     "RefusedSegment",
     "RetainedSegment",
