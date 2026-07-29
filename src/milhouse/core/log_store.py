@@ -1422,9 +1422,7 @@ def retention_preview(
             _require_live_directory(directory_fd, resolved, "MH_LOG_DIR")
             active, _state = _active_status(directory_fd, retention_days, now)
             report, _validated = _preview_locked(directory_fd, retention_days, now)
-            return RetentionReport(
-                segments=report.segments, refused=report.refused, active=active
-            )
+            return RetentionReport(segments=report.segments, refused=report.refused, active=active)
         finally:
             lock.release(lock_fd)
             try:
@@ -1612,9 +1610,7 @@ def retention_apply(
             ):
                 # close the due active segment into a rotation; the loop below then prunes it
                 _close_and_rotate_active(directory_fd, state, now)
-                _publish_fresh_current(
-                    directory_fd, state.header.sequence + 1, now, retention_days
-                )
+                _publish_fresh_current(directory_fd, state.header.sequence + 1, now, retention_days)
                 active = ActiveSegmentStatus(
                     sequence=active.sequence,
                     effective_expires_at=active.effective_expires_at,

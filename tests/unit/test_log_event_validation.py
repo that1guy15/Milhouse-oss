@@ -85,6 +85,24 @@ def test_an_empty_metrics_array_validates() -> None:
     assert validate_structured_log_event_line(_canonical_line(metrics=[])) == _NOW
 
 
+_VALID_METRIC_SHAPES: list[tuple[str, object]] = [
+    ("flag", True),
+    ("count", 3),
+    ("bytes", 4096),
+    ("duration_milliseconds", 12),
+    ("gauge", 7),
+    ("gauge", 1.5),
+]
+
+
+@pytest.mark.parametrize(
+    "kind,value", _VALID_METRIC_SHAPES, ids=[f"{k}-{v}" for k, v in _VALID_METRIC_SHAPES]
+)
+def test_every_metric_shape_validates(kind: str, value: object) -> None:
+    line = _canonical_line(metrics=[{"kind": kind, "name": "measure", "value": value}])
+    assert validate_structured_log_event_line(line) == _NOW
+
+
 # --- field-value mutations (canonical shape, invalid content) ------------------------------------
 
 _BAD_CANONICAL: list[tuple[str, bytes]] = [
@@ -128,6 +146,20 @@ _BAD_CANONICAL: list[tuple[str, bytes]] = [
             ]
         ),
     ),
+    ("ts-non-string", _canonical_line(ts=123)),
+    ("ts-unparseable", _canonical_line(ts="not-a-timestamp")),
+    (
+        "metric-nonstring-kind",
+        _canonical_line(metrics=[{"kind": 1, "name": "records", "value": 1}]),
+    ),
+    (
+        "metric-bad-name",
+        _canonical_line(metrics=[{"kind": "count", "name": "Bad Name", "value": 1}]),
+    ),
+    (
+        "gauge-non-numeric",
+        _canonical_line(metrics=[{"kind": "gauge", "name": "ratio", "value": "x"}]),
+    ),
     ("error-arbitrary-text", _canonical_line(error=f"{_CANARY}-secret-text")),
     ("fingerprint-numeric", _canonical_line(fingerprint=123)),
     ("fingerprint-bad-pattern", _canonical_line(fingerprint="mh_fp1_bad")),
@@ -160,7 +192,8 @@ _BAD_NONCANONICAL: list[tuple[str, bytes]] = [
 
 
 @pytest.mark.parametrize(
-    "line", [c[1] for c in _BAD_CANONICAL + _BAD_NONCANONICAL],
+    "line",
+    [c[1] for c in _BAD_CANONICAL + _BAD_NONCANONICAL],
     ids=[c[0] for c in _BAD_CANONICAL + _BAD_NONCANONICAL],
 )
 def test_a_complete_invalid_event_line_is_refused_value_free(line: bytes) -> None:
