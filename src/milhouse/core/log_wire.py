@@ -10,16 +10,34 @@ bounded CanonicalJSONV1 UTF-8 JSONL bytes with one trailing line feed, derives t
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Protocol
+from datetime import UTC, datetime
+from typing import NoReturn, Protocol
 
-from milhouse.core.canonical import MAX_CANONICAL_INT, canonical_json_bytes
+from milhouse.core.canonical import (
+    MAX_CANONICAL_INT,
+    MIN_CANONICAL_INT,
+    CanonicalizationError,
+    canonical_json_bytes,
+)
 from milhouse.core.clock import truncate_to_milliseconds
-from milhouse.core.logging import LoggingError, StructuredLogEventV1
+from milhouse.core.errors import _validate_error_code
+from milhouse.core.logging import (
+    _FINGERPRINT_PATTERN,
+    MAX_LOG_EVENT_NAME_BYTES,
+    MAX_LOG_METRIC_NAME_BYTES,
+    MAX_LOG_METRICS,
+    LoggingError,
+    LogLevel,
+    LogMetricKind,
+    StructuredLogEventV1,
+    _validate_machine_name,
+)
 from milhouse.domain.records import PrivacyClassV1
 from milhouse.privacy.egress import EgressDisposition, EgressSurface, require_egress
 
@@ -88,6 +106,180 @@ def structured_log_event_line(event: StructuredLogEventV1) -> bytes:
     # never exceeds the section 4.15 bound.
     encoded = canonical_json_bytes(payload, max_bytes=MAX_EVENT_LINE_BYTES - len(_LINE_FEED))
     return encoded + _LINE_FEED
+
+
+_EVENT_LINE_KEYS = frozenset(
+    {"error", "fingerprint", "level", "line", "metrics", "name", "privacy", "schema", "ts"}
+)
+_METRIC_KEYS = frozenset({"kind", "name", "value"})
+
+
+def _event_fail(message: str) -> NoReturn:
+    """Raise a fixed, value-free stored-event failure; no offending byte reaches the message."""
+
+    raise LoggingError("MH_LOG_WIRE_EVENT", message)
+
+
+def _parse_wire_event_timestamp(value: object) -> datetime:
+    parsed: datetime | None = None
+    if type(value) is str:
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+        except ValueError:
+            parsed = None
+    if type(parsed) is not datetime:
+        _event_fail("an event timestamp is not a canonical UTC millisecond value")
+    return _normalized_utc(parsed, "MH_LOG_WIRE_EVENT")
+
+
+def _require_wire_metric_value(kind: LogMetricKind, value: object) -> None:
+    if kind is LogMetricKind.FLAG:
+        if type(value) is bool:
+            return
+        _event_fail("a flag metric requires a boolean")
+    if kind in {LogMetricKind.COUNT, LogMetricKind.BYTES, LogMetricKind.DURATION_MILLISECONDS}:
+        if type(value) is int and 0 <= value <= MAX_CANONICAL_INT:
+            return
+        _event_fail("a count metric requires a bounded non-negative integer")
+    if type(value) is int and MIN_CANONICAL_INT <= value <= MAX_CANONICAL_INT:
+        return
+    if (
+        type(value) is float
+        and math.isfinite(value)
+        and MIN_CANONICAL_INT <= value <= MAX_CANONICAL_INT
+    ):
+        return
+    _event_fail("a gauge metric requires a bounded finite number")
+
+
+def _validate_wire_event_metrics(value: object) -> list[dict[str, object]]:
+    if type(value) is not list or len(value) > MAX_LOG_METRICS:
+        _event_fail("event metrics are not a bounded array")
+    rebuilt: list[dict[str, object]] = []
+    previous_key: bytes | None = None
+    for item in value:
+        if type(item) is not dict or frozenset(item) != _METRIC_KEYS:
+            _event_fail("an event metric has an unexpected field set")
+        kind_value = item["kind"]
+        kind: LogMetricKind | None = None
+        if type(kind_value) is str:
+            try:
+                kind = LogMetricKind(kind_value)
+            except ValueError:
+                kind = None
+        if kind is None:
+            _event_fail("an event metric kind is not supported")
+        name: str | None = None
+        try:
+            name = _validate_machine_name(item["name"], maximum_bytes=MAX_LOG_METRIC_NAME_BYTES)
+        except LoggingError:
+            name = None
+        if name is None:
+            _event_fail("an event metric name is not a valid machine name")
+        _require_wire_metric_value(kind, item["value"])
+        key = name.encode("ascii")
+        if previous_key is not None and key <= previous_key:
+            _event_fail("event metrics must be sorted by unique name")
+        previous_key = key
+        rebuilt.append({"kind": kind.value, "name": name, "value": item["value"]})
+    return rebuilt
+
+
+def validate_structured_log_event_line(line: bytes) -> datetime:
+    """Validate one complete stored event line against the exact CanonicalJSONV1/A05 contract.
+
+    Enforces the field set, envelope, and every A05 scalar, enum (``LogLevel`` name), machine name,
+    metric shape/type/order, coded nullable error, and nullable keyed fingerprint rule, then
+    requires the line to equal the exact canonical bytes the encoder would produce for the same
+    values — a full round-trip that also proves key order, spacing, and minimal number/timestamp
+    form. Returns the event timestamp. Fails closed with a fixed value-free :class:`LoggingError`;
+    recovery repairs only a torn tail, so a complete malformed line is rejected here, not stored.
+
+    The persistence boundary validates the wire GRAMMAR (a ``LogLevel`` member and a valid machine
+    name), never live-catalog registration: a durable 14-day log is read back across upgrades whose
+    in-memory catalog may differ, so its validity must not depend on mutable runtime state.
+    """
+
+    if type(line) is not bytes:
+        _event_fail("an event line must be bytes")
+    if len(line) > MAX_EVENT_LINE_BYTES:
+        _event_fail("an event line exceeds its byte bound")
+    payload: object = None
+    decoded = False
+    try:
+        payload = json.loads(line.decode("utf-8"))
+        decoded = True
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        decoded = False
+    if not decoded or type(payload) is not dict:
+        _event_fail("an event line must be one JSON object")
+    if frozenset(payload) != _EVENT_LINE_KEYS:
+        _event_fail("an event line has an unexpected field set")
+    if (
+        payload["schema"] != STRUCTURED_LOG_SCHEMA_VERSION
+        or payload["line"] != STRUCTURED_LOG_LINE_EVENT
+        or payload["privacy"] != STRUCTURED_LOG_PRIVACY_CLASS
+    ):
+        _event_fail("an event line is not a v1 internal event")
+
+    timestamp = _parse_wire_event_timestamp(payload["ts"])
+
+    name: str | None = None
+    try:
+        name = _validate_machine_name(payload["name"], maximum_bytes=MAX_LOG_EVENT_NAME_BYTES)
+    except LoggingError:
+        name = None
+    if name is None:
+        _event_fail("an event name is not a valid machine name")
+
+    level_value = payload["level"]
+    level: LogLevel | None = None
+    if type(level_value) is str:
+        try:
+            level = LogLevel[level_value]
+        except KeyError:
+            level = None
+    if level is None:
+        _event_fail("an event level is not a catalog level")
+
+    metrics = _validate_wire_event_metrics(payload["metrics"])
+
+    error_code = payload["error"]
+    if error_code is not None:
+        valid_code: str | None = None
+        if type(error_code) is str:
+            try:
+                valid_code = _validate_error_code(error_code)
+            except ValueError:
+                valid_code = None
+        if valid_code is None:
+            _event_fail("an event error is not a stable code")
+
+    fingerprint = payload["fingerprint"]
+    if fingerprint is not None and (
+        type(fingerprint) is not str or _FINGERPRINT_PATTERN.fullmatch(fingerprint) is None
+    ):
+        _event_fail("an event fingerprint is not a valid keyed token")
+
+    rebuilt: dict[str, object] = {
+        "schema": STRUCTURED_LOG_SCHEMA_VERSION,
+        "line": STRUCTURED_LOG_LINE_EVENT,
+        "privacy": STRUCTURED_LOG_PRIVACY_CLASS,
+        "ts": timestamp,
+        "name": name,
+        "level": level.name,
+        "metrics": metrics,
+        "error": error_code,
+        "fingerprint": fingerprint,
+    }
+    canonical: bytes | None = None
+    try:
+        canonical = canonical_json_bytes(rebuilt, max_bytes=MAX_EVENT_LINE_BYTES - len(_LINE_FEED))
+    except CanonicalizationError:
+        canonical = None
+    if canonical is None or canonical + _LINE_FEED != line:
+        _event_fail("an event line is not canonical")
+    return timestamp
 
 
 def _validate_sequence(value: object) -> None:
@@ -323,4 +515,5 @@ __all__ = [
     "structured_log_event_line",
     "structured_log_header_line",
     "structured_log_trailer_line",
+    "validate_structured_log_event_line",
 ]
