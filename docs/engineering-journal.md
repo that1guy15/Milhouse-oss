@@ -56,5 +56,8 @@ What is not available
 What comes next
 ```
 
-The canonical source for the inaugural post is
-[Building Milhouse in public: foundations before features](engineering-journal/2026-07-22-foundations-before-features.md).
+## Canonical sources
+
+- [Build Journal #1 — Foundations before features](engineering-journal/2026-07-22-foundations-before-features.md)
+- [Build Journal #2 — From privacy contracts to durable storage](engineering-journal/2026-07-24-privacy-contracts-to-durable-storage.md)
+- [Build Journal #3 — When durable storage means recoverable evidence](engineering-journal/2026-07-29-recoverable-evidence.md)
