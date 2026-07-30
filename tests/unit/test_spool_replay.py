@@ -311,5 +311,37 @@ def test_replay_rejects_invalid_arguments(tmp_path: Path) -> None:
                 exporters={},
             )
         assert bad_id.value.code == "MH_SPOOL_IDENTITY"
+        with pytest.raises(SpoolError) as bad_root:  # a spool root not bound to the state root
+            replay_segments(
+                database,
+                barrier,
+                spool_root=tmp_path / "wrong-spool",
+                installation_id=_INSTALLATION_ID,
+                exporters={},
+            )
+        assert bad_root.value.code == "MH_SPOOL_REPLAY"
+        with pytest.raises(SpoolError) as bad_root_type:  # a non-path spool root
+            replay_segments(
+                database,
+                barrier,
+                spool_root=None,  # type: ignore[arg-type]
+                installation_id=_INSTALLATION_ID,
+                exporters={},
+            )
+        assert bad_root_type.value.code == "MH_SPOOL_REPLAY"
     finally:
         database.close()
+
+
+def test_replay_rejects_a_closed_database(tmp_path: Path) -> None:
+    database, barrier, spool_root, _store = _spool(tmp_path)
+    database.close()
+    with pytest.raises(SpoolError) as captured:
+        replay_segments(
+            database,
+            barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+            exporters={},
+        )
+    assert captured.value.code == "MH_SPOOL_REPLAY"

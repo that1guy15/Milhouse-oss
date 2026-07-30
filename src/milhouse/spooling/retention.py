@@ -32,6 +32,7 @@ from typing import NoReturn, cast
 
 from milhouse.config.filesystem import (
     SecureFileError,
+    SecureFileErrorKind,
     lexical_absolute_path,
     remove_regular_file_no_follow,
 )
@@ -49,6 +50,10 @@ _PENDING = "pending"
 _SPOOL = "spool"
 _DELIVERED = "delivered"
 _BARRIER_NAME = "commit.lock"
+
+FILE_REMOVED = "removed"
+FILE_ORPHANED = "orphaned"
+FILE_UNCERTAIN = "uncertain"
 
 STATUS_FULLY_EXPIRED = "fully_expired"
 STATUS_MIXED = "mixed"
@@ -229,18 +234,20 @@ def retention_preview(
 class PrunedSegment:
     """One committed segment removed by a retention apply pass.
 
-    ``file_removed`` is ``False`` when the ledger row was deleted and audited but the durable file
-    could not be unlinked; because the prune is row-first, that leaves a re-registerable orphan the
-    next reconciliation adopts and a later retention pass re-prunes (convergent), never a
-    ledger-row-without-file. ``delivered`` records whether the segment had finished exporting — a
-    pruned undelivered segment is a critical event (data reached its privacy deadline unexported).
+    ``file_outcome`` is tri-state: ``removed`` (the file was unlinked and the removal fsynced),
+    ``orphaned`` (a pre-unlink failure left the file present — because the prune is row-first,
+    reconciliation adopts it and a later pass re-prunes, convergent), or ``uncertain`` (the unlink
+    succeeded but its durability fsync failed, so the entry is gone but may not survive a crash; the
+    operator/reconciler re-inspects rather than asserting an orphan). ``delivered`` records if the
+    segment finished exporting — a pruned undelivered segment is a critical event (data reached its
+    privacy deadline unexported).
     """
 
     batch_id: str
     record_count: int
     byte_size: int
     delivered: bool
-    file_removed: bool
+    file_outcome: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +275,13 @@ class RetentionResult:
     def orphaned_files(self) -> tuple[PrunedSegment, ...]:
         """Pruned segments whose durable file could not be unlinked (a re-registerable orphan)."""
 
-        return tuple(segment for segment in self.pruned if not segment.file_removed)
+        return tuple(segment for segment in self.pruned if segment.file_outcome == FILE_ORPHANED)
+
+    @property
+    def uncertain_files(self) -> tuple[PrunedSegment, ...]:
+        """Pruned segments whose unlink succeeded but whose durability fsync did not confirm."""
+
+        return tuple(segment for segment in self.pruned if segment.file_outcome == FILE_UNCERTAIN)
 
 
 def _validate_barrier(database: ControlDatabase, barrier: object) -> None:
@@ -327,18 +340,22 @@ def _prune_segment(
         failed = True
     if failed:
         return None
-    file_removed = True
+    file_outcome = FILE_REMOVED
     try:
         remove_regular_file_no_follow(path)
-    except SecureFileError:
-        # The ledger row is already gone; the durable file lingers as a re-registerable orphan.
-        file_removed = False
+    except SecureFileError as error:
+        # The ledger row is already gone. Distinguish a pre-unlink failure (the file lingers as a
+        # re-registerable orphan) from a post-unlink durability failure (the entry is gone but its
+        # removal may not survive a crash — commit-uncertain, not an asserted orphan).
+        file_outcome = (
+            FILE_UNCERTAIN if error.kind is SecureFileErrorKind.COMMIT_UNCERTAIN else FILE_ORPHANED
+        )
     return PrunedSegment(
         batch_id=record.batch_id,
         record_count=record.record_count,
         byte_size=record.byte_size,
         delivered=delivered,
-        file_removed=file_removed,
+        file_outcome=file_outcome,
     )
 
 

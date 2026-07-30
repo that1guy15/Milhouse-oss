@@ -2,8 +2,8 @@
 
 A terminal ``delivered`` can never be recorded for the wrong data: delivery binds the barrier to the
 live database, reloads the authoritative ledger row, rejects a supplied record that does not match
-it, and requires the supplied frames to hash to that row's content digest (with matching batch id and
-count) before anything is forwarded. Each exporter object must self-identify, and only a compare-and-
+it, and requires the supplied frames to hash to that row's content digest (matching batch id and
+count) before anything is forwarded. Each exporter object must self-identify; only a compare-and-
 set that actually advances the expected row is reported as a new delivery.
 """
 
@@ -301,7 +301,7 @@ def test_an_unsupplied_exporter_is_reported_without_touching_the_ledger(tmp_path
 
 
 def test_a_wrong_barrier_is_refused(tmp_path: Path) -> None:
-    database, barrier, store = _spool(tmp_path)
+    database, _barrier, store = _spool(tmp_path)
     try:
         record, frames = _commit(store, "batch-a", ("a1",))
         foreign = GlobalCommitBarrier(tmp_path / "unrelated.lock")
@@ -326,7 +326,7 @@ def test_a_zero_row_compare_and_set_is_not_reported_as_a_new_delivery(
             database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}
         )
         # Force the reload to report the exporter as still pending (a stale snapshot); the attempt
-        # succeeds but the compare-and-set affects zero rows because the row is already delivered, so
+        # succeeds but the compare-and-set affects zero rows because the row is already delivered,
         # this pass must NOT claim a new delivery.
         stale = replace(
             record, exporters=(replace(record.exporters[0], delivery_status="pending"),)
@@ -347,7 +347,7 @@ def test_a_broken_delivery_ledger_write_normalizes_to_a_stable_code(
     database, barrier, store = _spool(tmp_path)
     try:
         record, frames = _commit(store, "batch-a", ("a1",))
-        # Bypass the DB reload, then drop the delivery ledger so only the status compare-and-set hits
+        # Bypass the DB reload, then drop the delivery ledger so only the status CAS hits
         # the broken table; the backend fault must normalize to the fixed code.
         monkeypatch.setattr(exporter_module, "_reload_record", lambda database, record: record)
         with database.transaction() as connection:

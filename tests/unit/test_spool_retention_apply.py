@@ -191,7 +191,7 @@ def test_prunes_a_fully_expired_delivered_segment(tmp_path: Path) -> None:
         assert [p.batch_id for p in result.pruned] == ["batch-a"]
         assert result.pruned_records == 2
         assert result.pruned_bytes == record.byte_size
-        assert result.pruned[0].file_removed is True
+        assert result.pruned[0].file_outcome == "removed"
         assert result.pruned[0].delivered is True
         assert _segment_rows(database) == set()  # ledger row gone
         assert not _segment_file(spool_root, "batch-a").exists()  # file gone
@@ -425,7 +425,7 @@ def test_an_interrupted_unlink_leaves_a_re_registerable_orphan_that_reconverges(
         monkeypatch.setattr(retention_module, "remove_regular_file_no_follow", failing_remove)
         first = _apply(database, barrier, spool_root)
         assert len(first.pruned) == 1
-        assert first.pruned[0].file_removed is False  # the durable file lingers as an orphan
+        assert first.pruned[0].file_outcome == "orphaned"  # the durable file lingers
         assert [p.batch_id for p in first.orphaned_files] == ["batch-a"]
         # Row-first: the ledger row is gone but the file remains — NOT a row-without-file.
         assert _segment_rows(database) == set()
@@ -444,7 +444,7 @@ def test_an_interrupted_unlink_leaves_a_re_registerable_orphan_that_reconverges(
         monkeypatch.undo()
         second = _apply(database, barrier, spool_root)
         assert len(second.pruned) == 1
-        assert second.pruned[0].file_removed is True
+        assert second.pruned[0].file_outcome == "removed"
         assert _segment_rows(database) == set()
         assert not _segment_file(spool_root, "batch-a").exists()
     finally:
@@ -509,7 +509,7 @@ def test_a_detached_cursor_survives_crash_reregistration_and_reprune(
 
         monkeypatch.setattr(retention_module, "remove_regular_file_no_follow", failing_remove)
         first = _apply(database, barrier, spool_root)
-        assert first.pruned[0].file_removed is False  # orphan file lingers; ledger row gone
+        assert first.pruned[0].file_outcome == "orphaned"  # orphan file lingers; ledger row gone
         assert _segment_rows(database) == set()
         detached = read_cursor(database, "github")
         assert detached is not None and detached.batch_id is None
@@ -535,5 +535,27 @@ def test_a_detached_cursor_survives_crash_reregistration_and_reprune(
         final = read_cursor(database, "github")
         assert final is not None and final.batch_id is None
         assert (final.position, final.revision) == ("page-7", 1)
+    finally:
+        database.close()
+
+
+def test_a_post_unlink_uncertainty_is_reported_as_uncertain_not_orphaned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D05 P2: an unlink that succeeded but whose durability fsync failed is commit-uncertain, not a
+    # lingering orphan; retention must report it distinctly (the reconciler re-inspects).
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+
+        def uncertain_remove(*args: object, **kwargs: object) -> None:
+            raise SecureFileError(SecureFileErrorKind.COMMIT_UNCERTAIN)
+
+        monkeypatch.setattr(retention_module, "remove_regular_file_no_follow", uncertain_remove)
+        result = _apply(database, barrier, spool_root)
+        assert result.pruned[0].file_outcome == "uncertain"
+        assert [p.batch_id for p in result.uncertain_files] == ["batch-a"]
+        assert result.orphaned_files == ()
+        assert _segment_rows(database) == set()  # the ledger row is still pruned row-first
     finally:
         database.close()

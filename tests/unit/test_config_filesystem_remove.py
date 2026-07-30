@@ -160,14 +160,16 @@ def test_a_value_error_normalizes_to_invalid(
 ) -> None:
     _directory, path = _private_file(tmp_path)
 
-    def raising_stat(*args: object, **kwargs: object) -> os.stat_result:
+    def raising(*args: object, **kwargs: object) -> None:
         raise ValueError("private-value-detail")
 
-    monkeypatch.setattr(config_filesystem.os, "stat", raising_stat)
+    # The leaf ACL check runs after the envelope validation and before the unlink.
+    monkeypatch.setattr(config_filesystem, "_require_no_extended_acl", raising)
     with pytest.raises(SecureFileError) as captured:
         remove_regular_file_no_follow(path)
     assert captured.value.kind is SecureFileErrorKind.INVALID
     assert "private" not in str(captured.value)
+    assert path.exists()  # failed before the unlink
 
 
 def test_an_unexpected_error_normalizes_to_write_failed(
@@ -175,14 +177,61 @@ def test_an_unexpected_error_normalizes_to_write_failed(
 ) -> None:
     _directory, path = _private_file(tmp_path)
 
-    def raising_stat(*args: object, **kwargs: object) -> os.stat_result:
+    def raising(*args: object, **kwargs: object) -> None:
         raise RuntimeError("private-runtime-detail")
 
-    monkeypatch.setattr(config_filesystem.os, "stat", raising_stat)
+    monkeypatch.setattr(config_filesystem, "_require_no_extended_acl", raising)
     with pytest.raises(SecureFileError) as captured:
         remove_regular_file_no_follow(path)
-    assert captured.value.kind is SecureFileErrorKind.WRITE_FAILED
+    assert captured.value.kind is SecureFileErrorKind.WRITE_FAILED  # pre-unlink unexpected fault
     assert "private" not in str(captured.value)
+    assert path.exists()
+
+
+def test_refuses_a_loose_mode_leaf(tmp_path: Path) -> None:
+    _directory, path = _private_file(tmp_path)
+    os.chmod(path, 0o644)  # outside the certified owner-only envelope
+    with pytest.raises(SecureFileError) as captured:
+        remove_regular_file_no_follow(path)
+    assert captured.value.kind is SecureFileErrorKind.NOT_REGULAR
+    assert path.exists()
+
+
+def test_refuses_an_extended_acl_leaf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _directory, path = _private_file(tmp_path)
+    # The ACL check runs on the parent first, then the leaf; fail only the leaf (the second call).
+    calls: list[int] = []
+
+    def acl_check(descriptor: int) -> None:
+        calls.append(descriptor)
+        if len(calls) >= 2:
+            raise SecureFileError(SecureFileErrorKind.ACCESS_CONTROL_UNSAFE)
+
+    monkeypatch.setattr(config_filesystem, "_require_no_extended_acl", acl_check)
+    with pytest.raises(SecureFileError) as captured:
+        remove_regular_file_no_follow(path)
+    assert captured.value.kind is SecureFileErrorKind.ACCESS_CONTROL_UNSAFE
+    assert path.exists()  # never unlinked
+
+
+def test_a_post_unlink_fsync_failure_is_commit_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _directory, path = _private_file(tmp_path)
+    real_fsync = config_filesystem.os.fsync
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError("private-fsync-detail")
+
+    monkeypatch.setattr(config_filesystem.os, "fsync", failing_fsync)
+    with pytest.raises(SecureFileError) as captured:
+        remove_regular_file_no_follow(path)
+    # The unlink itself succeeded; only its durability fsync failed -> commit-uncertain, not orphan.
+    assert captured.value.kind is SecureFileErrorKind.COMMIT_UNCERTAIN
+    assert not path.exists()
+    assert "private" not in str(captured.value)
+    monkeypatch.undo()
+    assert real_fsync is config_filesystem.os.fsync
 
 
 def test_a_close_failure_after_a_successful_unlink_is_unreadable(

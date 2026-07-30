@@ -33,16 +33,40 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, cast
 
+from milhouse.config.filesystem import SecureFileError, lexical_absolute_path
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import SegmentRecord, list_segment_records
 from milhouse.spooling.reader import INSTALLATION_ID_PATTERN, read_trusted_segment
 from milhouse.spooling.reconcile import _agrees
-from milhouse.state.database import ControlDatabase
+from milhouse.state.database import ControlDatabase, _validated_database_path
 
 _PENDING = "pending"
+_SPOOL = "spool"
 _DELIVERED = "delivered"
+
+
+def _require_bound_spool_root(database: ControlDatabase, spool_root: object) -> Path:
+    """Resolve ``spool_root`` and require it to be this database's ``<state_root>/spool``.
+
+    Without this bind, verify would happily certify a *shadow* copy of the spool as intact while the
+    authoritative segment for the selected control database is missing or corrupt, so health could
+    read green over a lost durable record. Fail closed on a mismatch (as retention does).
+    """
+
+    database_path = _validated_database_path(database)
+    if database_path is None:
+        _fail("MH_SPOOL_VERIFY", "a control database is required")
+    if not isinstance(spool_root, (str, os.PathLike)):
+        _fail("MH_SPOOL_VERIFY", "a spool root path is required")
+    try:
+        resolved = lexical_absolute_path(cast("str | Path", spool_root))
+    except SecureFileError:
+        _fail("MH_SPOOL_VERIFY", "a spool root path is required")
+    if resolved != database_path.parent.parent / _SPOOL:
+        _fail("MH_SPOOL_VERIFY", "the spool root must be <state_root>/spool")
+    return resolved
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -126,16 +150,12 @@ def verify_spool(
 
     if type(database) is not ControlDatabase:
         _fail("MH_SPOOL_VERIFY", "a control database is required")
-    if not isinstance(spool_root, (str, os.PathLike)):
-        # Validate symmetrically with the other guards so a non-path argument fails closed with a
-        # fixed code rather than escaping as a bare TypeError from Path().
-        _fail("MH_SPOOL_VERIFY", "a spool root path is required")
+    root = _require_bound_spool_root(database, spool_root)
     if (
         type(installation_id) is not str
         or INSTALLATION_ID_PATTERN.fullmatch(installation_id) is None
     ):
         _fail("MH_SPOOL_IDENTITY", "a well-formed installation id is required")
-    root = Path(spool_root)
 
     records = list_segment_records(database)
     verifications: list[SegmentVerification] = []

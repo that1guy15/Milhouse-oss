@@ -9,6 +9,7 @@ state of the rest.
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -275,5 +276,47 @@ def test_verify_rejects_invalid_arguments(tmp_path: Path) -> None:
         with pytest.raises(SpoolError) as bad_id:
             verify_spool(database, spool_root=spool_root, installation_id="not-an-installation")
         assert bad_id.value.code == "MH_SPOOL_IDENTITY"
+    finally:
+        database.close()
+
+
+def test_verify_refuses_a_shadow_spool_root(tmp_path: Path) -> None:
+    # D05 P2: verify must certify the authoritative spool for the selected database, not a copy at a
+    # different path — otherwise health could read green while the real durable record is missing.
+    database, _barrier, _spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", ("a1",))
+        shadow = tmp_path / "shadow-spool"
+        shutil.copytree(tmp_path / "spool", shadow)
+        with pytest.raises(SpoolError) as captured:
+            verify_spool(database, spool_root=shadow, installation_id=_INSTALLATION_ID)
+        assert captured.value.code == "MH_SPOOL_VERIFY"  # not bound to <state_root>/spool
+    finally:
+        database.close()
+
+
+class _HostilePath:
+    def __fspath__(self) -> str:
+        raise ValueError("hostile fspath")
+
+
+def test_verify_rejects_a_closed_database(tmp_path: Path) -> None:
+    database, _barrier, spool_root, _store = _spool(tmp_path)
+    database.close()
+    with pytest.raises(SpoolError) as captured:
+        verify_spool(database, spool_root=spool_root, installation_id=_INSTALLATION_ID)
+    assert captured.value.code == "MH_SPOOL_VERIFY"
+
+
+def test_verify_rejects_an_unresolvable_spool_root(tmp_path: Path) -> None:
+    database, _barrier, _spool_root, _store = _spool(tmp_path)
+    try:
+        with pytest.raises(SpoolError) as captured:
+            verify_spool(
+                database,
+                spool_root=_HostilePath(),  # a PathLike that cannot be resolved
+                installation_id=_INSTALLATION_ID,
+            )
+        assert captured.value.code == "MH_SPOOL_VERIFY"
     finally:
         database.close()

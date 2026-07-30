@@ -10,13 +10,13 @@ Delivery is integrity-bound so a terminal ``delivered`` can never be recorded fo
 authoritative ledger row and rejects a supplied record that does not match it, and requires the
 supplied frames to hash to that row's ``content_sha256`` (with matching batch id and count) before a
 single byte is forwarded — so a caller cannot forward one segment's frames while certifying another.
-It also requires each exporter object to self-identify as the ledger row it is delivering, and treats
+It also requires each exporter object to self-identify as the row it delivers, and treats
 the final compare-and-set as authoritative: only a CAS that actually advances the expected row to
 ``delivered`` is reported as a new delivery.
 
 The delivery ledger (``_segment_exporters.delivery_status``) is a per-(segment, exporter) state
 machine: ``pending``/``failed`` are retryable, ``delivered`` is terminal. Rule 12 requires the
-exporter checkpoint to advance only after the destination confirms, so delivery is attempted *outside*
+exporter checkpoint to advance only after the destination confirms, so delivery is *outside*
 the barrier and, only once ``deliver`` returns, recorded in one shared-barrier compare-and-set that
 never overwrites a ``delivered`` row. A crash between confirmation and the write leaves the row
 retryable, so delivery is at-least-once and exporters MUST be idempotent. Every SQLite or barrier
@@ -84,13 +84,13 @@ def _require_bound_barrier(database: ControlDatabase, barrier: GlobalCommitBarri
     if database_path is None or not _is_bound_barrier(
         barrier, database_path.parent / _BARRIER_NAME
     ):
-        # Bind the barrier to THIS database's commit lock: the delivery CAS is serialized only if the
+        # Bind the barrier to THIS database's commit lock: the CAS is serialized only if the
         # shared hold is on the same lock the writers use.
         _fail("MH_SPOOL_EXPORT", "the barrier must be the control-plane commit lock")
 
 
 def _reload_record(database: ControlDatabase, record: SegmentRecord) -> SegmentRecord:
-    """Reload the authoritative ledger row for ``record`` and reject a stale or fabricated record."""
+    """Reload the ledger row for ``record`` and reject a stale or fabricated record."""
 
     live = read_segment_record(database, record.batch_id)
     if live is None:
@@ -108,8 +108,8 @@ def _reload_record(database: ControlDatabase, record: SegmentRecord) -> SegmentR
 def _require_frames_belong(record: SegmentRecord, frames: Sequence[SpoolFrameV1]) -> None:
     """Require ``frames`` to be exactly the committed segment's frames, or fail closed.
 
-    The definitive check is that the frames' canonical bytes hash to the ledger's ``content_sha256``;
-    the count and per-frame batch-id checks give a precise failure for the common wrong-segment case.
+    The definitive check is that the frames' canonical bytes hash to ``content_sha256``;
+    the count and batch-id checks give a precise failure for the common wrong-segment case.
     Without this a caller could forward one segment's records while certifying delivery of another.
     """
 
@@ -130,8 +130,8 @@ def _advance_status(
 ) -> int:
     """Compare-and-set the delivery status under the shared barrier; return the affected row count.
 
-    The ``delivery_status != 'delivered'`` guard makes ``delivered`` terminal: a late ``failed`` from
-    a slower attempt cannot overwrite a confirmed delivery, and re-recording ``delivered`` is a no-op.
+    The ``delivery_status != 'delivered'`` guard makes ``delivered`` terminal: a late failure
+    cannot overwrite a confirmed delivery, and re-recording ``delivered`` is a no-op.
     A zero affected-row count means the expected row was already terminal (or gone), so the caller
     does not report a new delivery.
     """
@@ -206,7 +206,7 @@ def deliver_segment(
             or EXPORTER_ID_PATTERN.fullmatch(exporter_id) is None
             or getattr(exporter, "exporter_id", None) != exporter_id
         ):
-            # Unknown, malformed, or a mis-identified exporter object (registered under a key it does
+            # Unknown, malformed, or a mis-identified exporter object (registered under a key
             # not claim as its own id) must never certify delivery.
             attempts.append(ExporterAttempt(live.batch_id, exporter_id, OUTCOME_NO_EXPORTER))
             continue
