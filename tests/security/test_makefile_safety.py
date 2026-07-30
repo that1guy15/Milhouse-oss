@@ -46,6 +46,7 @@ CRITICAL_COVERAGE_FILES = {
     "src/milhouse/spooling/reconcile.py",
     "src/milhouse/spooling/replay.py",
     "src/milhouse/spooling/segment.py",
+    "src/milhouse/spooling/verify.py",
     "src/milhouse/spooling/writer.py",
     "scripts/check_artifacts.py",
     "scripts/check_coverage.py",

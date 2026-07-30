@@ -27,6 +27,7 @@ from milhouse.spooling.segment import (
     spool_frame_line,
     spool_segment_header_line,
 )
+from milhouse.spooling.verify import SegmentVerification, VerifyReport, verify_spool
 from milhouse.spooling.writer import (
     build_segment_bytes,
     publish_segment_bytes,
@@ -46,9 +47,11 @@ __all__ = [
     "SegmentAnomaly",
     "SegmentHeaderV1",
     "SegmentRecord",
+    "SegmentVerification",
     "SpoolError",
     "SpoolFrameV1",
     "SpoolReconciler",
+    "VerifyReport",
     "build_segment_bytes",
     "deliver_segment",
     "parse_segment_bytes",
@@ -59,5 +62,6 @@ __all__ = [
     "spool_content_sha256",
     "spool_frame_line",
     "spool_segment_header_line",
+    "verify_spool",
     "write_spool_segment",
 ]
