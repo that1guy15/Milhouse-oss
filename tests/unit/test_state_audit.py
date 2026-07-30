@@ -161,7 +161,9 @@ def test_an_audit_row_rolls_back_with_a_failed_caller_transaction(tmp_path: Path
         ("reason", ""),
         ("record_count", -1),
         ("record_count", True),
+        ("record_count", 2**63),  # would overflow the signed-64 INTEGER binding at INSERT
         ("byte_size", -1),
+        ("byte_size", 2**63),
         ("action", "x" * 1025),
     ],
 )
@@ -227,6 +229,22 @@ def test_a_read_against_a_broken_store_normalizes_to_a_stable_code(tmp_path: Pat
             connection.execute("DROP TABLE _audit")
         with pytest.raises(StateError) as captured:
             list_audit(database)
+        assert captured.value.code == "MH_STATE_AUDIT"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+    finally:
+        database.close()
+
+
+def test_a_write_against_a_broken_store_normalizes_to_a_stable_code(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    try:
+        with database.transaction() as connection:
+            connection.execute("DROP TABLE _audit")
+        with pytest.raises(StateError) as captured:
+            with database.transaction() as connection:
+                record_audit(connection, now=_NOW, action="prune", actor="m", outcome="ok")
+        # A backend fault on the insert normalizes to the fixed code with no leaked detail.
         assert captured.value.code == "MH_STATE_AUDIT"
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None

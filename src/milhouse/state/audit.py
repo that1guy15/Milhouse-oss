@@ -27,6 +27,7 @@ from milhouse.state.errors import StateError
 
 _AUDIT_TABLE = "_audit"
 _MAX_TEXT = 1024
+_MAX_COUNT = 2**63 - 1  # the largest value SQLite's signed 64-bit INTEGER can store
 _DEFAULT_LIMIT = 1000
 _MAX_LIMIT = 100_000
 
@@ -67,9 +68,11 @@ def _validate_optional_text(value: object, subject: str) -> str | None:
 def _validate_optional_count(value: object, subject: str) -> int | None:
     if value is None:
         return None
-    # ``bool`` is an ``int`` subtype; reject it so a stray flag cannot pose as a count.
-    if type(value) is not int or value < 0:
-        _fail("MH_STATE_AUDIT", f"an audit {subject} must be a whole number >= 0 or absent")
+    # ``bool`` is an ``int`` subtype; reject it so a stray flag cannot pose as a count. The upper
+    # bound keeps a too-large count from overflowing the signed-64 INTEGER binding at INSERT and
+    # escaping as a raw OverflowError instead of the fixed code.
+    if type(value) is not int or not 0 <= value <= _MAX_COUNT:
+        _fail("MH_STATE_AUDIT", f"an audit {subject} must be a whole number in 0..2^63-1 or absent")
     return value
 
 
@@ -107,12 +110,20 @@ def record_audit(
         invalid_time = True
     if invalid_time:
         _fail("MH_STATE_AUDIT", "an audit timestamp must be an aware in-range UTC instant")
-    connection.execute(
-        f"INSERT INTO {_AUDIT_TABLE} "
-        "(recorded_at, action, actor, outcome, resource, reason, record_count, byte_size) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (recorded_at, action, actor, outcome, resource, reason, record_count, byte_size),
-    )
+    failed = False
+    try:
+        connection.execute(
+            f"INSERT INTO {_AUDIT_TABLE} "
+            "(recorded_at, action, actor, outcome, resource, reason, record_count, byte_size) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (recorded_at, action, actor, outcome, resource, reason, record_count, byte_size),
+        )
+    except (sqlite3.Error, OverflowError):
+        # Normalize any residual backend fault to the fixed code raised outside the handler, so no
+        # SQLite/binding detail escapes; the caller's transaction still rolls back.
+        failed = True
+    if failed:
+        _fail("MH_STATE_AUDIT", "the audit row could not be recorded")
 
 
 def _row_to_audit(row: Sequence[Any]) -> AuditRecord:
