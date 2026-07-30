@@ -107,6 +107,7 @@ test-coverage:
 		--critical 'src/milhouse/spooling/ledger.py' \
 		--critical 'src/milhouse/spooling/reader.py' \
 		--critical 'src/milhouse/spooling/reconcile.py' \
+		--critical 'src/milhouse/spooling/replay.py' \
 		--critical 'src/milhouse/spooling/segment.py' \
 		--critical 'src/milhouse/spooling/writer.py' \
 		--critical 'scripts/check_artifacts.py' \
