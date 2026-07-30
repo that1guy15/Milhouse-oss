@@ -153,6 +153,16 @@ def _advance_status(
     return affected
 
 
+def _self_identifies(exporter: Exporter, exporter_id: str) -> bool:
+    # The exporter object is the least-trusted input; contain a misbehaving ``exporter_id`` property
+    # (one that raises anything, not only AttributeError) as a mis-identification rather than
+    # letting a raw exception escape the fixed-code contract.
+    try:
+        return exporter.exporter_id == exporter_id
+    except Exception:
+        return False
+
+
 def _attempt_delivery(
     exporter: Exporter, record: SegmentRecord, frames: Sequence[SpoolFrameV1]
 ) -> bool:
@@ -204,10 +214,10 @@ def deliver_segment(
         if (
             exporter is None
             or EXPORTER_ID_PATTERN.fullmatch(exporter_id) is None
-            or getattr(exporter, "exporter_id", None) != exporter_id
+            or not _self_identifies(exporter, exporter_id)
         ):
-            # Unknown, malformed, or a mis-identified exporter object (registered under a key
-            # not claim as its own id) must never certify delivery.
+            # Unknown, malformed, or a mis-identified exporter object (one registered under a key it
+            # does not claim as its own id) must never certify delivery.
             attempts.append(ExporterAttempt(live.batch_id, exporter_id, OUTCOME_NO_EXPORTER))
             continue
         delivered = _attempt_delivery(exporter, live, frames)

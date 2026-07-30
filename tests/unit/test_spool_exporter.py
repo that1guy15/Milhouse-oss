@@ -381,3 +381,23 @@ def test_invalid_arguments_are_rejected(tmp_path: Path) -> None:
         assert bad_exporters.value.code == "MH_SPOOL_EXPORT"
     finally:
         database.close()
+
+
+def test_an_exporter_whose_id_property_raises_is_contained(tmp_path: Path) -> None:
+    database, barrier, store = _spool(tmp_path)
+    try:
+        record, frames = _commit(store, "batch-a", ("a1",))
+
+        class _RaisingId:
+            @property
+            def exporter_id(self) -> str:
+                raise RuntimeError("hostile id property")
+
+            def deliver(self, record: SegmentRecord, frames: object) -> None:
+                raise AssertionError("must not be called")
+
+        attempts = deliver_segment(database, barrier, record, frames, {"clickhouse": _RaisingId()})
+        assert [a.outcome for a in attempts] == ["no_exporter"]  # contained, not raised
+        assert _status(database, "batch-a", "clickhouse") == "pending"
+    finally:
+        database.close()

@@ -200,3 +200,33 @@ def test_migration_7_makes_the_cursor_batch_id_detachable(tmp_path: Path) -> Non
                 )
     finally:
         database.close()
+
+
+def test_migration_7_preserves_existing_cursor_rows(tmp_path: Path) -> None:
+    # The reviewer's upgrade-with-data path: a v6 database with a populated cursor row must survive
+    # the migration-7 _cursors table recreation verbatim (position/revision intact), not just fresh.
+    from milhouse.state import CONTROL_MIGRATIONS, migrate
+
+    directory = tmp_path / "control"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+    database = open_control_database(directory / "milhouse.sqlite3")
+    barrier = GlobalCommitBarrier(directory / "commit.lock")
+    try:
+        migrate(database, CONTROL_MIGRATIONS[:6], barrier=barrier, applied_at=_NOW)  # to v6
+        assert schema_version(database) == 6
+        batch_id = _insert_committed_segment(database)
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO _cursors (source, position, batch_id, revision, updated_at) "
+                "VALUES ('github', 'page-9', ?, 4, ?)",
+                (batch_id, "2026-07-28T12:00:00.000Z"),
+            )
+        migrate(database, CONTROL_MIGRATIONS, barrier=barrier, applied_at=_NOW)  # apply migration 7
+        assert schema_version(database) == 7
+        row = database.connection.execute(
+            "SELECT source, position, batch_id, revision FROM _cursors WHERE source = 'github'"
+        ).fetchone()
+        assert row == ("github", "page-9", batch_id, 4)  # copied verbatim, no data loss
+    finally:
+        database.close()
