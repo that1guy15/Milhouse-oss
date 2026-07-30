@@ -28,9 +28,13 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, cast
 
-from milhouse.config.filesystem import SecureFileError, remove_regular_file_no_follow
+from milhouse.config.filesystem import (
+    SecureFileError,
+    lexical_absolute_path,
+    remove_regular_file_no_follow,
+)
 from milhouse.core.clock import TimeError, format_timestamp
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import SegmentRecord, list_segment_records
@@ -42,6 +46,7 @@ from milhouse.state.database import ControlDatabase, _validated_database_path
 from milhouse.state.errors import StateError
 
 _PENDING = "pending"
+_SPOOL = "spool"
 _DELIVERED = "delivered"
 _BARRIER_NAME = "commit.lock"
 _ACTOR = "maintenance"
@@ -143,6 +148,18 @@ def _classify(
             delivered=delivered,
             code=error.code,
         )
+    if not _agrees(parsed, record.day, record.batch_id, record):
+        # A readable file that disagrees with its ledger row is never reclaimable; report it as
+        # disagreeing so the preview matches what apply would do (apply skips it) rather than
+        # overstating the reclaimable estimate.
+        return SegmentRetention(
+            batch_id=record.batch_id,
+            status=STATUS_DISAGREEING,
+            record_count=record.record_count,
+            byte_size=record.byte_size,
+            delivered=delivered,
+            code="MH_SPOOL_VERIFY",
+        )
     expiries = [frame.record.expires_at for frame in parsed.frames]
     if not expiries:
         # A segment with a header but no record frames carries no record-class expiry to reason
@@ -165,8 +182,21 @@ def _classify(
 def _validate_common(database: object, spool_root: object, installation_id: object) -> None:
     if type(database) is not ControlDatabase:
         _fail("MH_SPOOL_RETENTION", "a control database is required")
+    database_path = _validated_database_path(database)
+    if database_path is None:
+        _fail("MH_SPOOL_RETENTION", "a control database is required")
     if not isinstance(spool_root, (str, os.PathLike)):
         _fail("MH_SPOOL_RETENTION", "a spool root path is required")
+    try:
+        resolved_spool = lexical_absolute_path(cast("str | Path", spool_root))
+    except SecureFileError:
+        _fail("MH_SPOOL_RETENTION", "a spool root path is required")
+    # Bind the spool root to this database's state root, exactly as commit/reconciliation do.
+    # Without it a misconfigured spool_root would find every segment 'unreadable' and silently prune
+    # nothing, so expired data at the real spool would never be reclaimed while the operator thinks
+    # retention ran. Fail closed instead.
+    if resolved_spool != database_path.parent.parent / _SPOOL:
+        _fail("MH_SPOOL_RETENTION", "the spool root must be <state_root>/spool")
     if (
         type(installation_id) is not str
         or INSTALLATION_ID_PATTERN.fullmatch(installation_id) is None

@@ -307,6 +307,62 @@ def test_rejects_an_unbound_or_invalid_barrier(tmp_path: Path) -> None:
         database.close()
 
 
+def test_rejects_a_spool_root_not_bound_to_the_state_root(tmp_path: Path) -> None:
+    database, barrier, _spool_root, _store = _spool(tmp_path)
+    try:
+        with pytest.raises(SpoolError) as captured:
+            retention_apply(
+                database,
+                barrier,
+                spool_root=tmp_path / "wrong-spool",  # not <state_root>/spool
+                installation_id=_INSTALLATION_ID,
+                now=_APPLY_NOW,
+                confirm=True,
+            )
+        assert captured.value.code == "MH_SPOOL_RETENTION"
+    finally:
+        database.close()
+
+
+class _HostilePath:
+    """A path-like whose __fspath__ raises — an unresolvable spool root."""
+
+    def __fspath__(self) -> str:
+        raise ValueError("hostile fspath")
+
+
+def test_rejects_a_malformed_spool_root_path(tmp_path: Path) -> None:
+    database, barrier, _spool_root, _store = _spool(tmp_path)
+    try:
+        with pytest.raises(SpoolError) as captured:
+            retention_apply(
+                database,
+                barrier,
+                spool_root=_HostilePath(),  # a PathLike that cannot be resolved
+                installation_id=_INSTALLATION_ID,
+                now=_APPLY_NOW,
+                confirm=True,
+            )
+        assert captured.value.code == "MH_SPOOL_RETENTION"
+    finally:
+        database.close()
+
+
+def test_rejects_a_closed_database(tmp_path: Path) -> None:
+    database, barrier, spool_root, _store = _spool(tmp_path)
+    database.close()
+    with pytest.raises(SpoolError) as captured:
+        retention_apply(
+            database,
+            barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+            now=_APPLY_NOW,
+            confirm=True,
+        )
+    assert captured.value.code == "MH_SPOOL_RETENTION"
+
+
 def test_rejects_invalid_common_arguments(tmp_path: Path) -> None:
     database, barrier, spool_root, _store = _spool(tmp_path)
     try:

@@ -32,6 +32,7 @@ from milhouse.spooling import (
 )
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.retention import (
+    STATUS_DISAGREEING,
     STATUS_FULLY_EXPIRED,
     STATUS_LIVE,
     STATUS_MIXED,
@@ -235,6 +236,25 @@ def test_an_unreadable_segment_is_reported_not_prunable(tmp_path: Path) -> None:
         assert segment.code == "MH_SPOOL_NOT_FOUND"
         assert preview.fully_expired == ()  # never treated as reclaimable
         assert [s.batch_id for s in preview.unreadable] == ["batch-a"]
+    finally:
+        database.close()
+
+
+def test_a_ledger_disagreeing_segment_is_not_reclaimable(tmp_path: Path) -> None:
+    database, _barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+        # The durable file is still readable and expired, but the ledger row no longer agrees with
+        # it. Preview must report it disagreeing (matching what apply skips), not fully_expired,
+        # so the reclaimable estimate never overstates.
+        with database.transaction() as connection:
+            connection.execute("UPDATE _segments SET record_count = 99 WHERE batch_id = 'batch-a'")
+        preview = retention_preview(
+            database, spool_root=spool_root, installation_id=_INSTALLATION_ID, now=_PREVIEW_NOW
+        )
+        assert preview.segments[0].status == STATUS_DISAGREEING
+        assert preview.fully_expired == ()
+        assert preview.reclaimable_records == 0
     finally:
         database.close()
 
