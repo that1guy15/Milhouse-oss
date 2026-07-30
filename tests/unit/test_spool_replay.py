@@ -148,6 +148,7 @@ def test_replay_visits_segments_in_deterministic_order(tmp_path: Path) -> None:
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
             exporters={"clickhouse": _FakeExporter("clickhouse")},
+            now=_NOW,
         )
         assert report.segments == ("batch-a", "batch-b")
         assert report.record_count == 3
@@ -170,6 +171,7 @@ def test_replaying_twice_yields_identical_ids_and_counts(tmp_path: Path) -> None
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
             exporters={"clickhouse": exporter},
+            now=_NOW,
         )
         second = replay_segments(
             database,
@@ -177,6 +179,7 @@ def test_replaying_twice_yields_identical_ids_and_counts(tmp_path: Path) -> None
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
             exporters={"clickhouse": exporter},
+            now=_NOW,
         )
 
         assert second.record_ids == first.record_ids  # identical logical id stream
@@ -204,6 +207,7 @@ def test_replay_can_narrow_to_pending_delivery(tmp_path: Path) -> None:
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
             exporters={"clickhouse": exporter},
+            now=_NOW,
         )
         # Now only pending-delivery segments are in scope — there are none left.
         narrowed = replay_segments(
@@ -212,6 +216,7 @@ def test_replay_can_narrow_to_pending_delivery(tmp_path: Path) -> None:
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
             exporters={"clickhouse": exporter},
+            now=_NOW,
             delivery_status="pending",
         )
         assert narrowed.segments == ()
@@ -237,6 +242,7 @@ def test_replay_rejects_a_durable_file_that_drifted_from_the_ledger(tmp_path: Pa
                 spool_root=spool_root,
                 installation_id=_INSTALLATION_ID,
                 exporters={"clickhouse": _FakeExporter("clickhouse")},
+                now=_NOW,
             )
         assert captured.value.code == "MH_SPOOL_REPLAY"
     finally:
@@ -256,6 +262,7 @@ def test_replay_fails_closed_when_a_committed_file_is_missing(tmp_path: Path) ->
                 spool_root=spool_root,
                 installation_id=_INSTALLATION_ID,
                 exporters={"clickhouse": _FakeExporter("clickhouse")},
+                now=_NOW,
             )
         assert (
             captured.value.code == "MH_SPOOL_NOT_FOUND"
@@ -273,6 +280,7 @@ def test_replay_over_an_empty_ledger_is_an_empty_report(tmp_path: Path) -> None:
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
             exporters={},
+            now=_NOW,
         )
         assert report.segments == ()
         assert report.record_ids == ()
@@ -291,6 +299,7 @@ def test_replay_rejects_invalid_arguments(tmp_path: Path) -> None:
                 spool_root=spool_root,
                 installation_id=_INSTALLATION_ID,
                 exporters={},
+                now=_NOW,
             )
         assert bad_db.value.code == "MH_SPOOL_REPLAY"
         with pytest.raises(SpoolError) as bad_barrier:
@@ -300,6 +309,7 @@ def test_replay_rejects_invalid_arguments(tmp_path: Path) -> None:
                 spool_root=spool_root,
                 installation_id=_INSTALLATION_ID,
                 exporters={},
+                now=_NOW,
             )
         assert bad_barrier.value.code == "MH_SPOOL_REPLAY"
         with pytest.raises(SpoolError) as bad_id:
@@ -309,6 +319,7 @@ def test_replay_rejects_invalid_arguments(tmp_path: Path) -> None:
                 spool_root=spool_root,
                 installation_id="not-an-installation",
                 exporters={},
+                now=_NOW,
             )
         assert bad_id.value.code == "MH_SPOOL_IDENTITY"
         with pytest.raises(SpoolError) as bad_root:  # a spool root not bound to the state root
@@ -318,6 +329,7 @@ def test_replay_rejects_invalid_arguments(tmp_path: Path) -> None:
                 spool_root=tmp_path / "wrong-spool",
                 installation_id=_INSTALLATION_ID,
                 exporters={},
+                now=_NOW,
             )
         assert bad_root.value.code == "MH_SPOOL_REPLAY"
         with pytest.raises(SpoolError) as bad_root_type:  # a non-path spool root
@@ -327,6 +339,7 @@ def test_replay_rejects_invalid_arguments(tmp_path: Path) -> None:
                 spool_root=None,  # type: ignore[arg-type]
                 installation_id=_INSTALLATION_ID,
                 exporters={},
+                now=_NOW,
             )
         assert bad_root_type.value.code == "MH_SPOOL_REPLAY"
     finally:
@@ -343,5 +356,6 @@ def test_replay_rejects_a_closed_database(tmp_path: Path) -> None:
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
             exporters={},
+            now=_NOW,
         )
     assert captured.value.code == "MH_SPOOL_REPLAY"

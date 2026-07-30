@@ -9,6 +9,7 @@ and re-pruned on a later pass).
 
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -185,7 +186,7 @@ def test_prunes_a_fully_expired_delivered_segment(tmp_path: Path) -> None:
     try:
         record, frames = _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _EXPIRED_AT)])
         deliver_segment(
-            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}
+            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}, now=_NOW
         )
         result = _apply(database, barrier, spool_root)
         assert [p.batch_id for p in result.pruned] == ["batch-a"]
@@ -204,7 +205,7 @@ def test_prunes_a_fully_expired_delivered_segment(tmp_path: Path) -> None:
         assert (audit[0].action, audit[0].outcome, audit[0].resource) == (
             "retention_prune",
             "pruned",
-            "batch-a",
+            hashlib.sha256(b"batch-a").hexdigest(),  # resource stored as a fingerprint (D05)
         )
         assert (audit[0].record_count, audit[0].byte_size) == (2, record.byte_size)
     finally:
@@ -478,7 +479,7 @@ def test_prunes_a_cursor_referenced_delivered_expired_segment(tmp_path: Path) ->
     try:
         record, frames = _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
         deliver_segment(
-            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}
+            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}, now=_NOW
         )
         advance_cursor(
             database, "github", position="page-7", batch_id="batch-a", now=_NOW, expected_revision=0

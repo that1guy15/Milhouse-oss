@@ -164,7 +164,7 @@ def test_the_delivery_watermark_reflects_completed_delivery(tmp_path: Path) -> N
     try:
         record, frames = _commit(store, "batch-a", ("a-1",))
         deliver_segment(
-            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}
+            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}, now=_NOW
         )
         report = verify_spool(database, spool_root=spool_root, installation_id=_INSTALLATION_ID)
         assert report.intact is True

@@ -6,22 +6,34 @@ concrete ClickHouse exporter is W04. The :class:`Exporter` contract is deliberat
 and a ``deliver`` that returns on destination confirmation and raises on any failure.
 
 Delivery is integrity-bound so a terminal ``delivered`` can never be recorded for the wrong data
-(D05): :func:`deliver_segment` binds the barrier to the live control database, reloads the segment's
-authoritative ledger row and rejects a supplied record that does not match it, and requires the
-supplied frames to hash to that row's ``content_sha256`` (with matching batch id and count) before a
-single byte is forwarded — so a caller cannot forward one segment's frames while certifying another.
-It also requires each exporter object to self-identify as the row it delivers, and treats
-the final compare-and-set as authoritative: only a CAS that actually advances the expected row to
-``delivered`` is reported as a new delivery.
+(D05): :func:`deliver_segment` freezes the caller's frames into one immutable tuple, binds the
+barrier to the live control database, reloads the segment's authoritative ledger row and rejects a
+supplied record that does not match it, and requires that exact frozen tuple to hash to the row's
+``content_sha256`` (with matching batch id and count) before a single byte is forwarded — so a
+caller cannot validate one frame set and forward another, nor forward one segment's frames while
+certifying another. It also requires each exporter object to self-identify as the row it delivers.
+
+Delivery is *fenced* and *expiry-aware* (D05 re-review):
+
+* **Fenced.** The whole reload → forward → checkpoint runs under a single ``barrier.shared()`` hold,
+  so privacy-expiry ``retention_apply`` (which prunes under the *exclusive* side) cannot delete a
+  segment mid-delivery. The shared side is held across the destination round-trip; maintenance waits
+  for in-flight deliveries to drain, exactly as a readers-writer lock requires.
+* **Expiry-aware.** A segment with any expired record is withheld — never forwarded — because
+  record-class privacy expiry is a hard upper bound (plan §§4.8-4.9): expired data must never
+  egress, even if retention has not pruned it yet. A mixed-expiry segment waits for audited
+  compaction (slice 5c) rather than leaking its expired records.
 
 The delivery ledger (``_segment_exporters.delivery_status``) is a per-(segment, exporter) state
 machine: ``pending``/``failed`` are retryable, ``delivered`` is terminal. Rule 12 requires the
-exporter checkpoint to advance only after the destination confirms, so delivery is *outside*
-the barrier and, only once ``deliver`` returns, recorded in one shared-barrier compare-and-set that
-never overwrites a ``delivered`` row. A crash between confirmation and the write leaves the row
-retryable, so delivery is at-least-once and exporters MUST be idempotent. Every SQLite or barrier
-failure normalizes to a fixed ``MH_SPOOL_EXPORT`` error, and a misbehaving exporter that raises is
-contained as a failed delivery.
+exporter checkpoint to advance only after the destination confirms, so delivery is recorded, once
+``deliver`` returns, in one compare-and-set that never overwrites a ``delivered`` row. That CAS is
+authoritative: only a CAS that actually advances the expected row is reported as a new delivery, a
+row that is already ``delivered`` is reported ``already_delivered``, and a row that has *vanished*
+(pruned out from under the delivery) is reported ``segment_gone`` — never conflated with a delivery.
+A crash between confirmation and the write leaves the row retryable, so delivery is at-least-once
+and exporters MUST be idempotent. Every SQLite or barrier failure normalizes to a fixed
+``MH_SPOOL_EXPORT`` error, and a misbehaving exporter that raises is contained as a failed delivery.
 """
 
 from __future__ import annotations
@@ -29,8 +41,10 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import NoReturn, Protocol, runtime_checkable
 
+from milhouse.core.clock import TimeError, format_timestamp
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import SegmentRecord, read_segment_record
 from milhouse.spooling.segment import (
@@ -47,12 +61,19 @@ _DELIVERED = "delivered"
 _FAILED = "failed"
 _BARRIER_NAME = "commit.lock"
 
+# Compare-and-set outcomes of the delivery-status write, under the already-held shared barrier.
+_CAS_ADVANCED = "advanced"
+_CAS_ALREADY = "already"
+_CAS_GONE = "gone"
+
 # Attempt outcomes reported back to the caller. The first two mutate the ledger; the rest explain
 # why no delivery was newly recorded for that exporter on this pass.
 OUTCOME_DELIVERED = "delivered"
 OUTCOME_FAILED = "failed"
 OUTCOME_ALREADY_DELIVERED = "already_delivered"
 OUTCOME_NO_EXPORTER = "no_exporter"
+OUTCOME_EXPIRED = "expired"
+OUTCOME_SEGMENT_GONE = "segment_gone"
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -79,13 +100,23 @@ class ExporterAttempt:
     outcome: str
 
 
+def _require_now(now: object) -> None:
+    invalid = False
+    try:
+        format_timestamp(now)  # type: ignore[arg-type]  # rejects a naive/out-of-range instant
+    except (OverflowError, TimeError, AttributeError, TypeError):
+        invalid = True
+    if invalid:
+        _fail("MH_SPOOL_EXPORT", "the delivery instant must be an aware in-range UTC instant")
+
+
 def _require_bound_barrier(database: ControlDatabase, barrier: GlobalCommitBarrier) -> None:
     database_path = _validated_database_path(database)
     if database_path is None or not _is_bound_barrier(
         barrier, database_path.parent / _BARRIER_NAME
     ):
-        # Bind the barrier to THIS database's commit lock: the CAS is serialized only if the
-        # shared hold is on the same lock the writers use.
+        # Bind the barrier to THIS database's commit lock: the shared hold only fences maintenance
+        # and serializes the CAS if it is on the same lock the writers and retention use.
         _fail("MH_SPOOL_EXPORT", "the barrier must be the control-plane commit lock")
 
 
@@ -111,6 +142,7 @@ def _require_frames_belong(record: SegmentRecord, frames: Sequence[SpoolFrameV1]
     The definitive check is that the frames' canonical bytes hash to ``content_sha256``;
     the count and batch-id checks give a precise failure for the common wrong-segment case.
     Without this a caller could forward one segment's records while certifying delivery of another.
+    ``frames`` is the already-frozen tuple, so this validates the exact object that is forwarded.
     """
 
     if len(frames) != record.record_count:
@@ -121,36 +153,57 @@ def _require_frames_belong(record: SegmentRecord, frames: Sequence[SpoolFrameV1]
         _fail("MH_SPOOL_EXPORT", "the frames do not match the segment content digest")
 
 
-def _advance_status(
-    database: ControlDatabase,
-    barrier: GlobalCommitBarrier,
-    batch_id: str,
-    exporter_id: str,
-    status: str,
-) -> int:
-    """Compare-and-set the delivery status under the shared barrier; return the affected row count.
+def _segment_is_expired(frames: Sequence[SpoolFrameV1], now: datetime) -> bool:
+    """Return whether ANY record in ``frames`` has reached its ``expires_at`` at ``now``.
 
-    The ``delivery_status != 'delivered'`` guard makes ``delivered`` terminal: a late failure
-    cannot overwrite a confirmed delivery, and re-recording ``delivered`` is a no-op.
-    A zero affected-row count means the expected row was already terminal (or gone), so the caller
-    does not report a new delivery.
+    Record-class privacy expiry is a hard upper bound: a fully-live segment (every record still
+    unexpired) may egress; a mixed or fully-expired one must be withheld until audited compaction
+    (slice 5c) can strip the expired records, so no expired record is ever forwarded. An empty frame
+    set carries no record to reason about and is not expired.
     """
 
-    affected = 0
+    if not frames:
+        return False
+    return min(frame.record.expires_at for frame in frames) <= now
+
+
+def _advance_status_locked(
+    database: ControlDatabase, batch_id: str, exporter_id: str, status: str
+) -> str:
+    """Compare-and-set the delivery status; the caller already holds the shared barrier.
+
+    Returns ``_CAS_ADVANCED`` when this call moved the row to ``status`` (affected exactly one row),
+    ``_CAS_ALREADY`` when the row is already terminal ``delivered`` (the CAS matched nothing), or
+    ``_CAS_GONE`` when the row no longer exists. Distinguishing a vanished row from an
+    already-delivered one is what keeps a segment pruned out from under an in-flight delivery from
+    ever being reported as delivered. The barrier is NOT re-acquired here — nesting ``shared()``
+    under a queued exclusive maintainer could deadlock at the turnstile gate — so the single shared
+    hold taken by :func:`deliver_segment` serializes this CAS against maintenance.
+    """
+
     failed = False
+    result = _CAS_GONE
     try:
-        with barrier.shared(), database.transaction() as connection:
+        with database.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE _segment_exporters SET delivery_status = ? "
                 "WHERE batch_id = ? AND exporter_id = ? AND delivery_status != ?",
                 (status, batch_id, exporter_id, _DELIVERED),
             )
-            affected = cursor.rowcount
+            if cursor.rowcount == 1:
+                result = _CAS_ADVANCED
+            else:
+                row = connection.execute(
+                    "SELECT delivery_status FROM _segment_exporters "
+                    "WHERE batch_id = ? AND exporter_id = ?",
+                    (batch_id, exporter_id),
+                ).fetchone()
+                result = _CAS_GONE if row is None else _CAS_ALREADY
     except (sqlite3.Error, StateError):
         failed = True
     if failed:
         _fail("MH_SPOOL_EXPORT", "the exporter delivery status could not be recorded")
-    return affected
+    return result
 
 
 def _self_identifies(exporter: Exporter, exporter_id: str) -> bool:
@@ -175,21 +228,35 @@ def _attempt_delivery(
     return True
 
 
+def _delivered_outcome(cas_result: str) -> str:
+    if cas_result == _CAS_ADVANCED:
+        return OUTCOME_DELIVERED
+    if cas_result == _CAS_ALREADY:
+        return OUTCOME_ALREADY_DELIVERED
+    # The row vanished (pruned) between reload and CAS: never certify a delivery for it.
+    return OUTCOME_SEGMENT_GONE
+
+
 def deliver_segment(
     database: ControlDatabase,
     barrier: GlobalCommitBarrier,
     record: SegmentRecord,
     frames: Sequence[SpoolFrameV1],
     exporters: Mapping[str, Exporter],
+    *,
+    now: datetime,
 ) -> tuple[ExporterAttempt, ...]:
     """Attempt every not-yet-delivered exporter for ``record`` and record each outcome.
 
-    The barrier is bound to the database, the ledger row is reloaded and the supplied record and
-    frames are validated against it before anything is forwarded, and each exporter object must
-    self-identify. Delivery is attempted outside the barrier; only a confirmed delivery that the
-    compare-and-set actually advances to ``delivered`` (affected-row count of one) is reported as a
-    new delivery. Exporters already ``delivered`` are skipped and an unknown or mis-identified
-    exporter is reported ``no_exporter`` without touching the ledger.
+    The caller's ``frames`` are frozen to one immutable tuple up front, and that exact tuple is both
+    validated against the reloaded ledger row and forwarded. The whole reload → forward → checkpoint
+    runs under one ``barrier.shared()`` hold, so privacy-expiry retention cannot prune a segment
+    mid-delivery. A segment with any expired record is withheld (``expired``) and never forwarded.
+    Delivery is attempted while the shared side is held; only a confirmed delivery whose CAS
+    advances the expected row is reported ``delivered``, an already-terminal row is
+    ``already_delivered``, and a row pruned out from under the delivery is ``segment_gone``.
+    Exporters already ``delivered`` are skipped; an unknown or mis-identified exporter is
+    reported ``no_exporter`` without touching the ledger.
     """
 
     if type(database) is not ControlDatabase:
@@ -200,32 +267,57 @@ def deliver_segment(
         _fail("MH_SPOOL_EXPORT", "a segment record is required")
     if not isinstance(exporters, Mapping):
         _fail("MH_SPOOL_EXPORT", "an exporter mapping is required")
+    _require_now(now)
+    # Freeze the caller-owned sequence to one immutable snapshot BEFORE validating or forwarding, so
+    # a sequence that yields different contents on a second read cannot deliver one batch while the
+    # digest check certified another (D05 re-review).
+    frames = tuple(frames)
+    if any(not isinstance(frame, SpoolFrameV1) for frame in frames):
+        _fail("MH_SPOOL_EXPORT", "a segment frame is malformed")
     _require_bound_barrier(database, barrier)
-    live = _reload_record(database, record)
-    _require_frames_belong(live, frames)
 
     attempts: list[ExporterAttempt] = []
-    for exporter_row in live.exporters:
-        exporter_id = exporter_row.exporter_id
-        if exporter_row.delivery_status == _DELIVERED:
-            attempts.append(ExporterAttempt(live.batch_id, exporter_id, OUTCOME_ALREADY_DELIVERED))
-            continue
-        exporter = exporters.get(exporter_id)
-        if (
-            exporter is None
-            or EXPORTER_ID_PATTERN.fullmatch(exporter_id) is None
-            or not _self_identifies(exporter, exporter_id)
-        ):
-            # Unknown, malformed, or a mis-identified exporter object (one registered under a key it
-            # does not claim as its own id) must never certify delivery.
-            attempts.append(ExporterAttempt(live.batch_id, exporter_id, OUTCOME_NO_EXPORTER))
-            continue
-        delivered = _attempt_delivery(exporter, live, frames)
-        status = _DELIVERED if delivered else _FAILED
-        affected = _advance_status(database, barrier, live.batch_id, exporter_id, status)
-        if delivered:
-            outcome = OUTCOME_DELIVERED if affected == 1 else OUTCOME_ALREADY_DELIVERED
-        else:
-            outcome = OUTCOME_FAILED
-        attempts.append(ExporterAttempt(live.batch_id, exporter_id, outcome))
+    with barrier.shared():
+        live = _reload_record(database, record)
+        _require_frames_belong(live, frames)
+        if _segment_is_expired(frames, now):
+            # Hard privacy expiry: withhold the whole segment. Forward nothing; report each exporter
+            # so the caller sees the segment was withheld (not delivered, not failed).
+            return tuple(
+                ExporterAttempt(
+                    live.batch_id,
+                    row.exporter_id,
+                    OUTCOME_ALREADY_DELIVERED
+                    if row.delivery_status == _DELIVERED
+                    else OUTCOME_EXPIRED,
+                )
+                for row in live.exporters
+            )
+        for exporter_row in live.exporters:
+            exporter_id = exporter_row.exporter_id
+            if exporter_row.delivery_status == _DELIVERED:
+                attempts.append(
+                    ExporterAttempt(live.batch_id, exporter_id, OUTCOME_ALREADY_DELIVERED)
+                )
+                continue
+            exporter = exporters.get(exporter_id)
+            if (
+                exporter is None
+                or EXPORTER_ID_PATTERN.fullmatch(exporter_id) is None
+                or not _self_identifies(exporter, exporter_id)
+            ):
+                # Unknown, malformed, or a mis-identified exporter object (one registered under a
+                # key it does not claim as its own id) must never certify delivery.
+                attempts.append(ExporterAttempt(live.batch_id, exporter_id, OUTCOME_NO_EXPORTER))
+                continue
+            delivered = _attempt_delivery(exporter, live, frames)
+            if delivered:
+                cas_result = _advance_status_locked(
+                    database, live.batch_id, exporter_id, _DELIVERED
+                )
+                outcome = _delivered_outcome(cas_result)
+            else:
+                _advance_status_locked(database, live.batch_id, exporter_id, _FAILED)
+                outcome = OUTCOME_FAILED
+            attempts.append(ExporterAttempt(live.batch_id, exporter_id, outcome))
     return tuple(attempts)

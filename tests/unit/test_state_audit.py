@@ -2,13 +2,16 @@
 
 The audit surface is a set of purpose-specific constructors, not a free-text sink: a caller cannot
 put arbitrary text into the action/actor/outcome/reason code fields (they are fixed constants), and
-the only caller-supplied value — the opaque resource id — is validated against an id charset that
-rejects secrets, emails, paths, URLs, prompts, multiline text, and raw payloads before any write.
-Recording is transaction-scoped, so the row commits or rolls back with the mutation it attests.
+the only caller-supplied value — the opaque resource id — is charset-validated (rejecting emails,
+paths, URLs, prompts, multiline text, and raw payloads) AND then stored only as a SHA-256
+fingerprint, so a charset-legal but secret-shaped id (e.g. an access key) is never persisted raw
+(D05 re-review). Recording is transaction-scoped, so the row commits or rolls back with the mutation
+it attests.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +41,19 @@ _RAW_CANARIES = [
     "line one\nline two",  # multiline
     "raw payload {json: true}",  # raw structured payload
 ]
+
+# Secret-shaped strings that are ALSO legal opaque-id charset (so the charset guard cannot reject
+# them): these must be accepted but stored ONLY as a fingerprint, never raw (D05 re-review).
+_CREDENTIAL_CANARIES = [
+    "AKIAIOSFODNN7EXAMPLE",  # AWS access key id — all alphanumeric, a valid batch-id shape
+    "AKIAIOSFODNN7EXAMPLEQQ",  # a longer access-key variant
+    "ghp_0123456789abcdefABCDEF01",  # GitHub-PAT shape (underscore is charset-legal)
+    "0123456789abcdef0123456789abcdef",  # 32-hex secret-shaped identifier
+]
+
+
+def _fp(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _database(tmp_path: Path):
@@ -92,7 +108,7 @@ def test_records_a_delivered_prune_with_fixed_codes(tmp_path: Path) -> None:
                 action="retention_prune",
                 actor="maintenance",
                 outcome="pruned",
-                resource="batch-1",
+                resource=_fp("batch-1"),
                 reason="expired",
                 record_count=3,
                 byte_size=128,
@@ -134,6 +150,24 @@ def test_a_raw_canary_resource_is_rejected_before_any_write(tmp_path: Path, cana
         database.close()
 
 
+@pytest.mark.parametrize("canary", _CREDENTIAL_CANARIES)
+def test_a_secret_shaped_legal_id_is_fingerprinted_never_stored_raw(
+    tmp_path: Path, canary: str
+) -> None:
+    # D05 re-review: the charset guard alone is not a secrecy proof — an access-key-shaped id is a
+    # legal opaque id. It is accepted, but ONLY its fingerprint is persisted, so the raw
+    # secret-shaped value never reaches control state.
+    database = _database(tmp_path)
+    try:
+        _prune(database, now=_NOW, batch_id=canary, record_count=1, byte_size=1, undelivered=False)
+        row = list_audit(database)[0]
+        assert row.resource == _fp(canary)  # stored as a fixed-width fingerprint
+        assert row.resource != canary  # never the raw value
+        assert canary.encode("utf-8") not in _audit_bytes(database)  # not anywhere in the row bytes
+    finally:
+        database.close()
+
+
 def test_the_action_actor_outcome_reason_codes_cannot_be_influenced(tmp_path: Path) -> None:
     # There is no free-text parameter for the code fields — the constructor fixes them — so a caller
     # can only ever produce the fixed retention codes, never arbitrary text.
@@ -164,7 +198,7 @@ def test_ids_are_monotonic_and_append_ordered(tmp_path: Path) -> None:
             )
         rows = list_audit(database)
         assert [r.id for r in rows] == [1, 2, 3]
-        assert [r.resource for r in rows] == ["batch-1", "batch-2", "batch-3"]
+        assert [r.resource for r in rows] == [_fp("batch-1"), _fp("batch-2"), _fp("batch-3")]
     finally:
         database.close()
 
