@@ -646,11 +646,15 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
     # The slice-5a audit surface (verify_spool) is strictly READ-ONLY: it opens durable files and
     # reads ledger rows to report integrity, mutating nothing and holding no barrier.
     # SegmentVerification/VerifyReport are inert value types.
-    # The slice-5b retention_preview is likewise strictly READ-ONLY: it reads each committed
-    # segment's frames and ledger row to classify record-class expiry and report reclaimable
-    # counts/bytes, mutating nothing and holding no barrier. The mutating retention_apply is NOT
-    # part of this surface yet (it is a follow-up that takes exclusive maintenance authority + a
-    # confirm token). RetentionPreview/SegmentRetention are inert value types.
+    # The slice-5b retention_preview is strictly READ-ONLY: it reads each committed segment's frames
+    # and ledger row to classify record-class expiry and report reclaimable counts/bytes, mutating
+    # nothing and holding no barrier. retention_apply DOES delete fully-expired segment rows, but it
+    # is a declared MAINTENANCE operation on the EXCLUSIVE side (the same authority backup,
+    # migration, and reconciliation take): it validates the barrier is the control-plane commit lock
+    # and acquires barrier.exclusive() itself before any deletion, gated on a confirm token, and
+    # records an audit row per prune. It therefore does not bypass the barrier discipline — it IS
+    # that discipline applied to retention.
+    # RetentionPreview/RetentionResult/SegmentRetention/PrunedSegment are inert value types.
     assert set(spooling.__all__) == {
         "DurableSpool",
         "Exporter",
@@ -658,10 +662,12 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "ExporterDelivery",
         "OrphanRegistration",
         "ParsedSegment",
+        "PrunedSegment",
         "QuarantinedFile",
         "ReconciliationReport",
         "ReplayReport",
         "RetentionPreview",
+        "RetentionResult",
         "SegmentAnomaly",
         "SegmentHeaderV1",
         "SegmentRecord",
@@ -678,6 +684,7 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "read_trusted_segment",
         "read_untrusted_segment",
         "replay_segments",
+        "retention_apply",
         "retention_preview",
         "spool_content_sha256",
         "spool_frame_line",
