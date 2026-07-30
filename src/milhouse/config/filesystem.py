@@ -795,6 +795,79 @@ def inspect_regular_file_no_follow(
     return opened.selection
 
 
+def remove_regular_file_no_follow(
+    path: str | Path,
+    *,
+    expected_identity: FileIdentity | None = None,
+) -> None:
+    """Securely unlink one regular file relative to its no-follow-opened private parent, then fsync.
+
+    The parent directory chain is opened no-follow, so no symlinked ancestor can redirect it, and
+    the parent is required to be an owned, ACL-free ``0700`` directory. The leaf is ``lstat``-ed
+    relative to the parent descriptor (a final symlink is never followed) and must be an owner-only,
+    single-link regular file; when ``expected_identity`` is supplied it must also match that exact
+    ``(device, inode)``, so a file swapped in since the caller selected it is refused rather than
+    unlinked. The name is then unlinked relative to the parent descriptor and the parent directory
+    is fsynced so the removal is durable across a crash.
+
+    POSIX cannot atomically bind the identity check to the subsequent unlink-by-name; that
+    one-syscall residual window is excluded for cooperating writers by the exclusive maintenance
+    barrier and, for a hostile same-account process, by the installation-account trust boundary
+    (ADR 0008 / amendment A06). Every failure raises a fixed :class:`SecureFileError` carrying no
+    path or OS detail.
+    """
+
+    normalized = lexical_absolute_path(path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow == 0:
+        raise SecureFileError(SecureFileErrorKind.SECURITY_UNSUPPORTED)
+    effective_user_id = getattr(os, "geteuid", None)
+    if effective_user_id is None:
+        raise SecureFileError(SecureFileErrorKind.SECURITY_UNSUPPORTED)
+
+    parent_descriptor: int | None = None
+    failure: SecureFileError | None = None
+    try:
+        parent_descriptor, leaf = _open_directory_chain(normalized, nofollow=nofollow)
+        _require_private_parent(parent_descriptor, os.fstat(parent_descriptor))
+        metadata = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != effective_user_id()
+            or metadata.st_nlink != 1
+        ):
+            raise SecureFileError(SecureFileErrorKind.NOT_REGULAR)
+        if expected_identity is not None and FileIdentity.from_stat(metadata) != expected_identity:
+            raise SecureFileError(SecureFileErrorKind.CHANGED)
+        os.unlink(leaf, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except FileNotFoundError:
+        failure = SecureFileError(SecureFileErrorKind.NOT_FOUND)
+    except SecureFileError as error:
+        failure = error
+    except ValueError:
+        failure = SecureFileError(SecureFileErrorKind.INVALID)
+    except OSError as exc:
+        kind = (
+            SecureFileErrorKind.NOT_REGULAR
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}
+            else SecureFileErrorKind.WRITE_FAILED
+        )
+        failure = SecureFileError(kind)
+    except Exception:
+        failure = SecureFileError(SecureFileErrorKind.WRITE_FAILED)
+    finally:
+        if parent_descriptor is not None:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                if failure is None:
+                    failure = SecureFileError(SecureFileErrorKind.UNREADABLE)
+
+    if failure is not None:
+        raise failure
+
+
 __all__ = [
     "FileIdentity",
     "FileSelection",
@@ -806,6 +879,7 @@ __all__ = [
     "inspect_regular_file_no_follow",
     "lexical_absolute_path",
     "open_regular_file_no_follow",
+    "remove_regular_file_no_follow",
     "require_no_extended_acl",
     "sync_parent_directory_no_follow",
 ]
