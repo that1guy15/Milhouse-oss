@@ -1,20 +1,26 @@
-"""Append-only maintenance audit trail (W03 slice 5b, plan sections 4.4/4.6/4.9).
+"""Append-only maintenance audit trail (W03 slice 5b, plan sections 4.4/4.6/4.9; D05 privacy fix).
 
 Every deliberate maintenance mutation — retention pruning, compaction, purge, restore — records one
-append-only row in ``_audit`` describing what happened in privacy-safe terms: the action, the actor
-class, an optional opaque resource id, an outcome, a safe coded reason, and safe counts. An audit
-row never carries the acted-on raw payload (plan section 4.6 ``audit``).
+append-only row in ``_audit`` describing what happened in privacy-safe terms: a fixed action code, a
+fixed actor class, a fixed outcome and reason code, an opaque resource identifier, and safe counts.
+An audit row never carries the acted-on raw payload, a secret, a path, a URL, or free text (plan
+section 4.6 ``audit``, ADR 0007).
 
-:func:`record_audit` is transaction-scoped: the caller records the audit row on the SAME open
-connection, inside the SAME transaction, as the mutation it attests (e.g. the ledger prune), so the
-trail and the state it describes commit or roll back together and can never diverge. Inputs are
-fully validated before the insert so a malformed entry fails closed with a fixed ``MH_STATE_AUDIT``
-code rather than tripping a database CHECK; the CHECK constraints remain as defense in depth. The
-read side normalizes any SQLite fault to the same fixed code raised outside the handler.
+The public surface is a set of **purpose-specific constructors** (e.g.
+:func:`record_retention_prune`) rather than a free-text sink: each constructor fixes its own
+action/actor/outcome/reason codes as
+constants, so a caller cannot inject arbitrary text into those fields, and validates the only
+caller-supplied value — an opaque resource identifier — against a strict id charset that admits a
+batch/target id but rejects a path, email, URL, prompt, multiline, secret, or raw payload. Recording
+is transaction-scoped: the caller writes the row on the SAME open connection, in the SAME
+transaction as the mutation it attests, so the trail and the state commit or roll back together.
+Every fault
+normalizes to a fixed ``MH_STATE_AUDIT`` code raised outside the handler.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -26,10 +32,13 @@ from milhouse.state.database import ControlDatabase
 from milhouse.state.errors import StateError
 
 _AUDIT_TABLE = "_audit"
-_MAX_TEXT = 1024
 _MAX_COUNT = 2**63 - 1  # the largest value SQLite's signed 64-bit INTEGER can store
 _DEFAULT_LIMIT = 1000
 _MAX_LIMIT = 100_000
+# An opaque resource identifier: a batch/target id shape. It admits ``[A-Za-z0-9._-]`` starting
+# alphanumeric and so rejects every raw-text canary — a path (``/``), email (``@``), URL (``://``),
+# prompt or multiline (whitespace/newline), and most secret/payload shapes.
+_RESOURCE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", flags=re.ASCII)
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -51,57 +60,40 @@ class AuditRecord:
     byte_size: int | None
 
 
-def _validate_required_text(value: object, subject: str) -> str:
-    if type(value) is not str or not 0 < len(value) <= _MAX_TEXT:
-        _fail("MH_STATE_AUDIT", f"an audit {subject} must be bounded non-empty text")
+def _validate_resource(value: object) -> str:
+    if type(value) is not str or _RESOURCE_PATTERN.fullmatch(value) is None:
+        _fail("MH_STATE_AUDIT", "an audit resource must be an opaque identifier, not free text")
     return value
 
 
-def _validate_optional_text(value: object, subject: str) -> str | None:
-    if value is None:
-        return None
-    if type(value) is not str or not 0 < len(value) <= _MAX_TEXT:
-        _fail("MH_STATE_AUDIT", f"an audit {subject} must be bounded non-empty text or absent")
-    return value
-
-
-def _validate_optional_count(value: object, subject: str) -> int | None:
-    if value is None:
-        return None
+def _validate_count(value: object, subject: str) -> int:
     # ``bool`` is an ``int`` subtype; reject it so a stray flag cannot pose as a count. The upper
-    # bound keeps a too-large count from overflowing the signed-64 INTEGER binding at INSERT and
-    # escaping as a raw OverflowError instead of the fixed code.
+    # bound keeps a too-large count from overflowing the signed-64 INTEGER binding at INSERT.
     if type(value) is not int or not 0 <= value <= _MAX_COUNT:
-        _fail("MH_STATE_AUDIT", f"an audit {subject} must be a whole number in 0..2^63-1 or absent")
+        _fail("MH_STATE_AUDIT", f"an audit {subject} must be a whole number in 0..2^63-1")
     return value
 
 
-def record_audit(
+def _insert_audit(
     connection: sqlite3.Connection,
     *,
     now: datetime,
     action: str,
     actor: str,
     outcome: str,
-    resource: str | None = None,
-    reason: str | None = None,
-    record_count: int | None = None,
-    byte_size: int | None = None,
+    resource: str,
+    reason: str,
+    record_count: int,
+    byte_size: int,
 ) -> None:
-    """Append one audit row on the caller's open transaction connection.
+    """Insert one audit row. Internal: only the typed constructors call it, with fixed codes.
 
-    Call this inside the same transaction as the mutation it describes so the trail and the state
-    commit or roll back atomically together. Every field is validated first; a malformed entry fails
-    closed with ``MH_STATE_AUDIT`` before any write.
+    ``action``/``actor``/``outcome``/``reason`` are code constants owned by the calling constructor,
+    never caller free text; ``resource`` and the counts are the constructor's already-validated
+    caller data. Only the timestamp is validated here before the insert; any residual backend fault
+    normalizes to the fixed code.
     """
 
-    _validate_required_text(action, "action")
-    _validate_required_text(actor, "actor")
-    _validate_required_text(outcome, "outcome")
-    _validate_optional_text(resource, "resource")
-    _validate_optional_text(reason, "reason")
-    _validate_optional_count(record_count, "record count")
-    _validate_optional_count(byte_size, "byte size")
     invalid_time = False
     recorded_at = ""
     try:
@@ -126,6 +118,41 @@ def record_audit(
         _fail("MH_STATE_AUDIT", "the audit row could not be recorded")
 
 
+def record_retention_prune(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime,
+    batch_id: str,
+    record_count: int,
+    byte_size: int,
+    undelivered: bool,
+) -> None:
+    """Record that retention pruned one committed segment, on the caller's open transaction.
+
+    The action/actor/outcome/reason codes are fixed here, so no free text reaches the audit row; the
+    only caller-supplied value is ``batch_id``, validated as an opaque identifier. ``undelivered``
+    distinguishes the critical case where the segment reached its privacy deadline before it was
+    exported. Call inside the same transaction as the prune so the two commit or roll back together.
+    """
+
+    if type(undelivered) is not bool:
+        _fail("MH_STATE_AUDIT", "the undelivered flag must be a boolean")
+    _validate_resource(batch_id)
+    _validate_count(record_count, "record count")
+    _validate_count(byte_size, "byte size")
+    _insert_audit(
+        connection,
+        now=now,
+        action="retention_prune",
+        actor="maintenance",
+        outcome="pruned_undelivered" if undelivered else "pruned",
+        reason="expired_undelivered" if undelivered else "expired",
+        resource=batch_id,
+        record_count=record_count,
+        byte_size=byte_size,
+    )
+
+
 def _row_to_audit(row: Sequence[Any]) -> AuditRecord:
     return AuditRecord(
         id=int(row[0]),
@@ -147,8 +174,8 @@ def list_audit(
 
     if type(limit) is not int or not 0 < limit <= _MAX_LIMIT:
         _fail("MH_STATE_AUDIT", "an audit read limit must be a whole number in 1..100000")
-    if action is not None:
-        _validate_required_text(action, "action")
+    if action is not None and (type(action) is not str or not action):
+        _fail("MH_STATE_AUDIT", "an audit action filter must be non-empty text")
     rows: list[tuple[Any, ...]] = []
     failed = False
     columns = "id, recorded_at, action, actor, outcome, resource, reason, record_count, byte_size"

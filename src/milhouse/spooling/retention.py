@@ -40,7 +40,7 @@ from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import SegmentRecord, list_segment_records
 from milhouse.spooling.reader import INSTALLATION_ID_PATTERN, read_trusted_segment
 from milhouse.spooling.reconcile import _agrees
-from milhouse.state.audit import record_audit
+from milhouse.state.audit import record_retention_prune
 from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
 from milhouse.state.database import ControlDatabase, _validated_database_path
 from milhouse.state.errors import StateError
@@ -49,8 +49,6 @@ _PENDING = "pending"
 _SPOOL = "spool"
 _DELIVERED = "delivered"
 _BARRIER_NAME = "commit.lock"
-_ACTOR = "maintenance"
-_ACTION_PRUNE = "retention_prune"
 
 STATUS_FULLY_EXPIRED = "fully_expired"
 STATUS_MIXED = "mixed"
@@ -307,8 +305,6 @@ def _prune_segment(
     foreign key (D05).
     """
 
-    outcome = "pruned" if delivered else "pruned_undelivered"
-    reason = "expired" if delivered else "expired_undelivered"
     failed = False
     try:
         with database.transaction() as connection:
@@ -319,16 +315,13 @@ def _prune_segment(
                 "DELETE FROM _segment_exporters WHERE batch_id = ?", (record.batch_id,)
             )
             connection.execute("DELETE FROM _segments WHERE batch_id = ?", (record.batch_id,))
-            record_audit(
+            record_retention_prune(
                 connection,
                 now=now,
-                action=_ACTION_PRUNE,
-                actor=_ACTOR,
-                outcome=outcome,
-                resource=record.batch_id,
-                reason=reason,
+                batch_id=record.batch_id,
                 record_count=record.record_count,
                 byte_size=record.byte_size,
+                undelivered=not delivered,
             )
     except (sqlite3.Error, StateError):
         failed = True
