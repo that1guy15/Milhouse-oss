@@ -646,6 +646,11 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
     # The slice-5a audit surface (verify_spool) is strictly READ-ONLY: it opens durable files and
     # reads ledger rows to report integrity, mutating nothing and holding no barrier.
     # SegmentVerification/VerifyReport are inert value types.
+    # The slice-5b retention_preview is likewise strictly READ-ONLY: it reads each committed
+    # segment's frames and ledger row to classify record-class expiry and report reclaimable
+    # counts/bytes, mutating nothing and holding no barrier. The mutating retention_apply is NOT
+    # part of this surface yet (it is a follow-up that takes exclusive maintenance authority + a
+    # confirm token). RetentionPreview/SegmentRetention are inert value types.
     assert set(spooling.__all__) == {
         "DurableSpool",
         "Exporter",
@@ -656,9 +661,11 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "QuarantinedFile",
         "ReconciliationReport",
         "ReplayReport",
+        "RetentionPreview",
         "SegmentAnomaly",
         "SegmentHeaderV1",
         "SegmentRecord",
+        "SegmentRetention",
         "SegmentVerification",
         "SpoolError",
         "SpoolFrameV1",
@@ -671,6 +678,7 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "read_trusted_segment",
         "read_untrusted_segment",
         "replay_segments",
+        "retention_preview",
         "spool_content_sha256",
         "spool_frame_line",
         "spool_segment_header_line",
