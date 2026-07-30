@@ -35,11 +35,16 @@ def _fail(code: str, message: str) -> NoReturn:
 
 @dataclass(frozen=True, slots=True)
 class SourceCursor:
-    """A source ingestion cursor as recorded in the control database."""
+    """A source ingestion cursor as recorded in the control database.
+
+    ``batch_id`` is the committed segment this cursor last advanced against, or ``None`` once that
+    segment has been pruned by retention: the detach preserves the payload-free ``position``/
+    ``revision`` checkpoint while releasing the reference so the expired segment can be removed.
+    """
 
     source: str
     position: str
-    batch_id: str
+    batch_id: str | None
     revision: int
     updated_at: str
 
@@ -61,7 +66,7 @@ def _row_to_cursor(row: Sequence[Any]) -> SourceCursor:
     return SourceCursor(
         source=str(row[0]),
         position=str(row[1]),
-        batch_id=str(row[2]),
+        batch_id=None if row[2] is None else str(row[2]),
         revision=int(row[3]),
         updated_at=str(row[4]),
     )

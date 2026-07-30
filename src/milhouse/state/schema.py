@@ -147,6 +147,35 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "CHECK (byte_size IS NULL OR byte_size >= 0))",
         ),
     ),
+    Migration(
+        7,
+        "detachable_source_cursors",
+        (
+            # D05 privacy-expiry fix: migration 4 gave _cursors.batch_id a NOT NULL foreign key to
+            # _segments, which blocked retention from deleting a privacy-expired segment an idle
+            # source's cursor still referenced (the delete raised a foreign-key error that retention
+            # skipped, so expired payload was retained indefinitely). Recreate _cursors with a
+            # NULLABLE batch_id so retention can DETACH the cursor (set batch_id = NULL, preserving
+            # the payload-free position/revision checkpoint) in the same transaction as the prune,
+            # rather than losing the cursor or silently cascading it. advance_cursor still writes a
+            # non-null batch_id and still requires a committed segment, so 'advance only against a
+            # committed segment' is unchanged at advance time; NULL means 'advanced against a
+            # since-pruned segment'. Rows are copied verbatim, so no cursor state is lost.
+            "CREATE TABLE _cursors_new ("
+            "source TEXT PRIMARY KEY NOT NULL, "
+            "position TEXT NOT NULL, "
+            "batch_id TEXT REFERENCES _segments (batch_id), "
+            "revision INTEGER NOT NULL, "
+            "updated_at TEXT NOT NULL, "
+            "CHECK (length(source) > 0), "
+            "CHECK (length(position) > 0), "
+            "CHECK (revision >= 1))",
+            "INSERT INTO _cursors_new (source, position, batch_id, revision, updated_at) "
+            "SELECT source, position, batch_id, revision, updated_at FROM _cursors",
+            "DROP TABLE _cursors",
+            "ALTER TABLE _cursors_new RENAME TO _cursors",
+        ),
+    ),
 )
 
 

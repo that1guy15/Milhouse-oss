@@ -300,6 +300,11 @@ def _prune_segment(
     file unlinked. A crash or unlink failure after the commit leaves an orphan file (reconciliation
     re-registers it, a later retention re-prunes it — convergent), never a row without a file.
     Returns ``None`` if the transactional deletion itself failed (the segment is left fully intact).
+
+    Any source cursor that references this segment is DETACHED first (batch_id set to NULL) in the
+    same transaction, preserving its payload-free position/revision checkpoint so an idle source's
+    privacy-expired segment can be removed instead of being pinned indefinitely by the cursor
+    foreign key (D05).
     """
 
     outcome = "pruned" if delivered else "pruned_undelivered"
@@ -307,6 +312,9 @@ def _prune_segment(
     failed = False
     try:
         with database.transaction() as connection:
+            connection.execute(
+                "UPDATE _cursors SET batch_id = NULL WHERE batch_id = ?", (record.batch_id,)
+            )
             connection.execute(
                 "DELETE FROM _segment_exporters WHERE batch_id = ?", (record.batch_id,)
             )

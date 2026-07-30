@@ -46,7 +46,7 @@ def _record(database, **kwargs) -> None:
 def test_migration_6_creates_the_audit_table(tmp_path: Path) -> None:
     database = _database(tmp_path)
     try:
-        assert schema_version(database) == 6
+        assert schema_version(database) == 7
         tables = {
             row[0]
             for row in database.connection.execute(

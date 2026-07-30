@@ -173,3 +173,30 @@ def test_a_malformed_checkpoint_row_is_refused(
                 )
     finally:
         database.close()
+
+
+def test_migration_7_makes_the_cursor_batch_id_detachable(tmp_path: Path) -> None:
+    # D05: batch_id becomes nullable so retention can detach a cursor (preserving position/revision)
+    # from a pruned privacy-expired segment, while the foreign key still refuses a non-null bad ref.
+    database = _initialized(tmp_path)
+    try:
+        assert schema_version(database) >= 7
+        batch_id = _insert_committed_segment(database)
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO _cursors (source, position, batch_id, revision, updated_at) "
+                "VALUES ('github', 'p1', ?, 1, ?)",
+                (batch_id, "2026-07-28T12:00:00.000Z"),
+            )
+            connection.execute("UPDATE _cursors SET batch_id = NULL WHERE source = 'github'")
+        row = database.connection.execute(
+            "SELECT batch_id, position, revision FROM _cursors WHERE source = 'github'"
+        ).fetchone()
+        assert row == (None, "p1", 1)  # detached, checkpoint preserved
+        with pytest.raises(sqlite3.IntegrityError):  # a non-null bad reference is still refused
+            with database.transaction() as connection:
+                connection.execute(
+                    "UPDATE _cursors SET batch_id = 'no-such' WHERE source = 'github'"
+                )
+    finally:
+        database.close()

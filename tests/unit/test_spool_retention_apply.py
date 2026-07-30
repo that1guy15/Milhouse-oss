@@ -38,9 +38,11 @@ from milhouse.spooling import retention as retention_module
 from milhouse.spooling.errors import SpoolError
 from milhouse.state import (
     GlobalCommitBarrier,
+    advance_cursor,
     initialize_control_state,
     list_audit,
     open_control_database,
+    read_cursor,
 )
 
 _INSTALLATION_ID = "mh_in1_00000000000040008000000000000000"
@@ -445,5 +447,93 @@ def test_an_interrupted_unlink_leaves_a_re_registerable_orphan_that_reconverges(
         assert second.pruned[0].file_removed is True
         assert _segment_rows(database) == set()
         assert not _segment_file(spool_root, "batch-a").exists()
+    finally:
+        database.close()
+
+
+def test_prunes_a_cursor_referenced_undelivered_expired_segment(tmp_path: Path) -> None:
+    # D05: a privacy-expired segment referenced by an idle source's cursor must still be pruned; the
+    # cursor is detached (batch_id -> NULL) while its resumable position/revision survive.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+        advance_cursor(
+            database, "github", position="page-7", batch_id="batch-a", now=_NOW, expected_revision=0
+        )
+        result = _apply(database, barrier, spool_root)
+        assert [p.batch_id for p in result.pruned] == ["batch-a"]  # NOT skipped by the FK anymore
+        assert _segment_rows(database) == set()
+        assert not _segment_file(spool_root, "batch-a").exists()
+        cursor = read_cursor(database, "github")
+        assert cursor is not None
+        assert cursor.batch_id is None  # detached
+        assert (cursor.position, cursor.revision) == ("page-7", 1)  # resumable state preserved
+        assert list_audit(database)[0].outcome == "pruned_undelivered"
+    finally:
+        database.close()
+
+
+def test_prunes_a_cursor_referenced_delivered_expired_segment(tmp_path: Path) -> None:
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        record, frames = _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+        deliver_segment(
+            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}
+        )
+        advance_cursor(
+            database, "github", position="page-7", batch_id="batch-a", now=_NOW, expected_revision=0
+        )
+        result = _apply(database, barrier, spool_root)
+        assert [p.batch_id for p in result.pruned] == ["batch-a"]
+        assert _segment_rows(database) == set()
+        cursor = read_cursor(database, "github")
+        assert cursor is not None and cursor.batch_id is None
+        assert (cursor.position, cursor.revision) == ("page-7", 1)
+        assert list_audit(database)[0].outcome == "pruned"
+    finally:
+        database.close()
+
+
+def test_a_detached_cursor_survives_crash_reregistration_and_reprune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+        advance_cursor(
+            database, "github", position="page-7", batch_id="batch-a", now=_NOW, expected_revision=0
+        )
+
+        def failing_remove(*args: object, **kwargs: object) -> None:
+            raise SecureFileError(SecureFileErrorKind.WRITE_FAILED)
+
+        monkeypatch.setattr(retention_module, "remove_regular_file_no_follow", failing_remove)
+        first = _apply(database, barrier, spool_root)
+        assert first.pruned[0].file_removed is False  # orphan file lingers; ledger row gone
+        assert _segment_rows(database) == set()
+        detached = read_cursor(database, "github")
+        assert detached is not None and detached.batch_id is None
+        assert (detached.position, detached.revision) == ("page-7", 1)
+
+        # Reconciliation re-registers the orphan; the cursor stays detached (position/revision).
+        DurableSpool(
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
+        assert _segment_rows(database) == {"batch-a"}
+        still = read_cursor(database, "github")
+        assert still is not None and still.batch_id is None
+        assert (still.position, still.revision) == ("page-7", 1)
+
+        # A later pass re-prunes to convergence; the cursor checkpoint stays intact and resumable.
+        monkeypatch.undo()
+        second = _apply(database, barrier, spool_root)
+        assert len(second.pruned) == 1
+        assert _segment_rows(database) == set()
+        final = read_cursor(database, "github")
+        assert final is not None and final.batch_id is None
+        assert (final.position, final.revision) == ("page-7", 1)
     finally:
         database.close()
