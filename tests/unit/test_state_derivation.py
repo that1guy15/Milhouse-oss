@@ -79,6 +79,9 @@ def test_a_stale_expected_revision_is_rejected_without_writing(tmp_path: Path) -
                 database, "alerts", 1, position="rogue", now=_LATER, expected_revision=0
             )
         assert captured.value.code == "MH_STATE_DERIVATION_CONFLICT"
+        # A rejection raised inside the transaction must still leak no chained backend detail.
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
         current = read_checkpoint(database, "alerts", 1)
         assert current is not None
         assert (current.position, current.revision) == ("p1", 1)

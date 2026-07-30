@@ -111,6 +111,9 @@ def test_advancing_against_an_uncommitted_segment_fails_closed(tmp_path: Path) -
                 expected_revision=0,
             )
         assert captured.value.code == "MH_STATE_CURSOR_SEGMENT"
+        # A rejection raised inside the transaction must still leak no chained backend detail.
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
         assert read_cursor(database, "github") is None  # nothing was written
     finally:
         database.close()
@@ -135,6 +138,8 @@ def test_a_stale_expected_revision_is_rejected_without_writing(tmp_path: Path) -
                 expected_revision=0,
             )
         assert captured.value.code == "MH_STATE_CURSOR_CONFLICT"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
         current = read_cursor(database, "github")
         assert current is not None
         assert (current.position, current.revision) == ("p1", 1)  # the winner is untouched

@@ -288,5 +288,8 @@ def test_invalid_arguments_are_rejected(tmp_path: Path) -> None:
         with pytest.raises(SpoolError) as bad_record:
             deliver_segment(database, barrier, object(), frames, {})  # type: ignore[arg-type]
         assert bad_record.value.code == "MH_SPOOL_EXPORT"
+        with pytest.raises(SpoolError) as bad_exporters:
+            deliver_segment(database, barrier, record, frames, None)  # type: ignore[arg-type]
+        assert bad_exporters.value.code == "MH_SPOOL_EXPORT"
     finally:
         database.close()

@@ -129,6 +129,10 @@ def deliver_segment(
         _fail("MH_SPOOL_EXPORT", "a commit barrier is required")
     if not isinstance(record, SegmentRecord):
         _fail("MH_SPOOL_EXPORT", "a segment record is required")
+    if not isinstance(exporters, Mapping):
+        # Fail closed symmetrically with the other guards: a non-mapping must not reach ``.get`` and
+        # escape the fixed-code contract as a raw AttributeError.
+        _fail("MH_SPOOL_EXPORT", "an exporter mapping is required")
 
     attempts: list[ExporterAttempt] = []
     for exporter_row in record.exporters:
