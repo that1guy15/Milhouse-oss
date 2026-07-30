@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from milhouse.state.barrier import GlobalCommitBarrier
+from milhouse.state.cursors import SourceCursor, advance_cursor, read_cursor
 from milhouse.state.database import ControlDatabase, open_control_database
 from milhouse.state.errors import StateError
 from milhouse.state.leases import (
@@ -21,11 +22,14 @@ __all__ = [
     "GlobalCommitBarrier",
     "Lease",
     "Migration",
+    "SourceCursor",
     "StateError",
     "acquire_lease",
+    "advance_cursor",
     "initialize_control_state",
     "migrate",
     "open_control_database",
+    "read_cursor",
     "release_lease",
     "renew_lease",
     "require_current_lease",

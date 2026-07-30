@@ -94,6 +94,7 @@ test-coverage:
 		--critical 'src/milhouse/privacy/render.py' \
 		--critical 'src/milhouse/privacy/sanitize.py' \
 		--critical 'src/milhouse/state/barrier.py' \
+		--critical 'src/milhouse/state/cursors.py' \
 		--critical 'src/milhouse/state/database.py' \
 		--critical 'src/milhouse/state/errors.py' \
 		--critical 'src/milhouse/state/leases.py' \
