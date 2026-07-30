@@ -10,11 +10,18 @@ Crucially, verify differs from replay in its failure posture. Replay fails close
 segment because it is about to reprocess trusted state; verify instead EXAMINES EVERY segment and
 RECORDS which are unhealthy, so one corrupt or missing file never hides the state of the rest. For
 each committed segment it opens the durable file through :func:`read_trusted_segment` (no-follow,
-owner-only, canonical, record-authentic) and cross-checks it against the ledger's recorded digests
-(``file_sha256``, ``byte_size``, ``content_sha256``, ``record_count``); any failure is captured as
-that segment's fixed ``MH_SPOOL_*`` code rather than raised. It also reports the destination
-delivery watermark — whether every required exporter is delivered. Backup watermarks are a W16
-concern and are out of scope here.
+owner-only, canonical, record-authentic) and cross-checks it against the ledger row using
+reconciliation's canonical agreement predicate — every file-attestable immutable field (batch id,
+day, config generation, scope/target, privacy/retention class, required exporters, count) plus both
+digests and byte size — so a post-commit ledger edit of a policy field with intact bytes is caught,
+not just digest drift. Any failure is captured as that segment's fixed ``MH_SPOOL_*`` code rather
+than raised. It also reports the destination delivery watermark — whether every required exporter is
+delivered. Backup watermarks are a W16 concern and are out of scope here.
+
+The report-don't-raise resilience is scoped to the durable *files*: a malformed ledger *row* (one
+that fails ledger-row validation) surfaces as a single fixed ``MH_SPOOL_LEDGER`` from the ledger
+read and stops the pass, exactly as it does for replay — a corrupt control row is a harder fault
+than a bad file and is not something an audit silently rides over.
 
 Verify never writes and never holds the barrier across the pass (that would block maintenance while
 auditing every segment); the trusted reader's own mutation detection classifies a file that changes
@@ -23,13 +30,15 @@ mid-read. Only an argument-validation fault raises a fixed ``MH_SPOOL_*`` error 
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import SegmentRecord, list_segment_records
-from milhouse.spooling.reader import INSTALLATION_ID_PATTERN, ParsedSegment, read_trusted_segment
+from milhouse.spooling.reader import INSTALLATION_ID_PATTERN, read_trusted_segment
+from milhouse.spooling.reconcile import _agrees
 from milhouse.state.database import ControlDatabase
 
 _PENDING = "pending"
@@ -81,18 +90,6 @@ class VerifyReport:
         return tuple(segment for segment in self.segments if not segment.intact)
 
 
-def _matches_ledger(parsed: ParsedSegment, record: SegmentRecord) -> bool:
-    # The exact ledger-agreement check: identical bytes, both digests, and count. Kept in step with
-    # replay's equivalent cross-check — a durable file that drifted from its committing row is not a
-    # verified segment even though the trusted reader accepted it as canonical and authentic.
-    return (
-        parsed.file_sha256 == record.file_sha256
-        and parsed.byte_size == record.byte_size
-        and parsed.header.content_sha256 == record.content_sha256
-        and len(parsed.frames) == record.record_count
-    )
-
-
 def _verify_segment(record: SegmentRecord, spool_root: Path, installation_id: str) -> str | None:
     """Return ``None`` if the segment is intact, else the fixed ``MH_SPOOL_*`` classification."""
 
@@ -103,7 +100,13 @@ def _verify_segment(record: SegmentRecord, spool_root: Path, installation_id: st
         # The reader classifies every corruption/absence/provenance failure into a fixed code;
         # record it as this segment's status and keep auditing the rest.
         return error.code
-    if not _matches_ledger(parsed, record):
+    # Reuse reconciliation's canonical ledger-agreement predicate — the single source of truth for
+    # "does this durable file match its committing row" — so verify checks every file-attestable
+    # immutable field (batch id, day, config generation, scope/target, privacy/retention class,
+    # required exporters, count, and both digests), not just the digests. A post-commit ledger edit
+    # of a policy field with intact bytes is therefore caught, and verify can never diverge from
+    # what reconciliation would accept.
+    if not _agrees(parsed, record.day, record.batch_id, record):
         return "MH_SPOOL_VERIFY"
     return None
 
@@ -123,6 +126,10 @@ def verify_spool(
 
     if type(database) is not ControlDatabase:
         _fail("MH_SPOOL_VERIFY", "a control database is required")
+    if not isinstance(spool_root, (str, os.PathLike)):
+        # Validate symmetrically with the other guards so a non-path argument fails closed with a
+        # fixed code rather than escaping as a bare TypeError from Path().
+        _fail("MH_SPOOL_VERIFY", "a spool root path is required")
     if (
         type(installation_id) is not str
         or INSTALLATION_ID_PATTERN.fullmatch(installation_id) is None

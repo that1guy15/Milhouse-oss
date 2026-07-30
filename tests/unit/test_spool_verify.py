@@ -191,15 +191,30 @@ def test_a_missing_file_is_reported_without_hiding_the_rest(tmp_path: Path) -> N
         database.close()
 
 
-def test_a_ledger_digest_drift_is_classified_as_a_verify_mismatch(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("file_sha256", "'" + "d" * 64 + "'"),  # whole-file digest drift
+        ("content_sha256", "'" + "e" * 64 + "'"),  # frame-bytes digest drift
+        ("byte_size", "999999"),  # size drift
+        ("record_count", "99"),  # count drift
+        ("privacy_class", "'public'"),  # policy-field drift with intact bytes
+        ("retention_days", "3650"),  # policy-field drift with intact bytes
+        ("config_generation", "'" + "b" * 64 + "'"),  # policy-field drift with intact bytes
+    ],
+)
+def test_any_ledger_field_drift_is_classified_as_a_verify_mismatch(
+    tmp_path: Path, column: str, value: str
+) -> None:
     database, _barrier, spool_root, store = _spool(tmp_path)
     try:
         _commit(store, "batch-a", ("a-1",))
-        # The durable file is still valid and authentic; only the ledger's recorded digest is wrong,
-        # so the trusted reader passes but the ledger-agreement cross-check fails.
+        # The durable file stays valid and authentic; only one ledger column is edited. verify uses
+        # reconciliation's full agreement predicate, so a policy-field edit with intact bytes is
+        # caught, not merely a digest change.
         with database.transaction() as connection:
             connection.execute(
-                "UPDATE _segments SET file_sha256 = ? WHERE batch_id = 'batch-a'", ("d" * 64,)
+                f"UPDATE _segments SET {column} = {value} WHERE batch_id = 'batch-a'"
             )
         report = verify_spool(database, spool_root=spool_root, installation_id=_INSTALLATION_ID)
         assert report.segments[0].intact is False
@@ -254,6 +269,9 @@ def test_verify_rejects_invalid_arguments(tmp_path: Path) -> None:
         with pytest.raises(SpoolError) as bad_db:
             verify_spool(object(), spool_root=spool_root, installation_id=_INSTALLATION_ID)  # type: ignore[arg-type]
         assert bad_db.value.code == "MH_SPOOL_VERIFY"
+        with pytest.raises(SpoolError) as bad_root:
+            verify_spool(database, spool_root=None, installation_id=_INSTALLATION_ID)  # type: ignore[arg-type]
+        assert bad_root.value.code == "MH_SPOOL_VERIFY"
         with pytest.raises(SpoolError) as bad_id:
             verify_spool(database, spool_root=spool_root, installation_id="not-an-installation")
         assert bad_id.value.code == "MH_SPOOL_IDENTITY"
