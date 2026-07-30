@@ -96,6 +96,7 @@ test-coverage:
 		--critical 'src/milhouse/state/barrier.py' \
 		--critical 'src/milhouse/state/cursors.py' \
 		--critical 'src/milhouse/state/database.py' \
+		--critical 'src/milhouse/state/derivation.py' \
 		--critical 'src/milhouse/state/errors.py' \
 		--critical 'src/milhouse/state/leases.py' \
 		--critical 'src/milhouse/state/migrations.py' \
