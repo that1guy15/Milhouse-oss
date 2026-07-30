@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from milhouse.spooling.commit import DurableSpool
 from milhouse.spooling.errors import SpoolError
+from milhouse.spooling.exporter import Exporter, ExporterAttempt, deliver_segment
 from milhouse.spooling.ledger import ExporterDelivery, SegmentRecord
 from milhouse.spooling.reader import (
     ParsedSegment,
@@ -33,6 +34,8 @@ from milhouse.spooling.writer import (
 
 __all__ = [
     "DurableSpool",
+    "Exporter",
+    "ExporterAttempt",
     "ExporterDelivery",
     "OrphanRegistration",
     "ParsedSegment",
@@ -45,6 +48,7 @@ __all__ = [
     "SpoolFrameV1",
     "SpoolReconciler",
     "build_segment_bytes",
+    "deliver_segment",
     "parse_segment_bytes",
     "publish_segment_bytes",
     "read_trusted_segment",
