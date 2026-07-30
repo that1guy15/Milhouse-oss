@@ -80,6 +80,46 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "CHECK (origin IN ('committed', 'reconciled'))",
         ),
     ),
+    Migration(
+        4,
+        "create_source_cursors",
+        (
+            # A source cursor advances only in a transaction that references an existing committed
+            # segment ledger row (plan section 3.4 rule 9): the ``batch_id`` foreign key makes that
+            # invariant structural — a cursor can never be written ahead of a committed segment. The
+            # opaque ``position`` carries no raw provider payload, only a resumable coordinate.
+            "CREATE TABLE _cursors ("
+            "source TEXT PRIMARY KEY NOT NULL, "
+            "position TEXT NOT NULL, "
+            "batch_id TEXT NOT NULL REFERENCES _segments (batch_id), "
+            "revision INTEGER NOT NULL, "
+            "updated_at TEXT NOT NULL, "
+            "CHECK (length(source) > 0), "
+            "CHECK (length(position) > 0), "
+            "CHECK (revision >= 1))",
+        ),
+    ),
+    Migration(
+        5,
+        "create_derivation_checkpoints",
+        (
+            # Per-rule/version derivation checkpoints (plan section 3.4 rule 10). Derivation is
+            # restartable and idempotent: a rule advances its checkpoint only via a compare-and-set
+            # against the exact prior position, so a concurrent or replayed pass cannot fork the
+            # projection. The (rule, rule_version) key keeps a rule-logic revision from silently
+            # inheriting a prior version's checkpoint. ``position`` carries no raw payload.
+            "CREATE TABLE _derivation_checkpoints ("
+            "rule TEXT NOT NULL, "
+            "rule_version INTEGER NOT NULL, "
+            "position TEXT NOT NULL, "
+            "revision INTEGER NOT NULL, "
+            "updated_at TEXT NOT NULL, "
+            "PRIMARY KEY (rule, rule_version), "
+            "CHECK (length(rule) > 0), "
+            "CHECK (rule_version >= 1), "
+            "CHECK (revision >= 1))",
+        ),
+    ),
 )
 
 

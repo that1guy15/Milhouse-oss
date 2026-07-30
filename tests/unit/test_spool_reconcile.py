@@ -638,13 +638,21 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
     # the next reconciliation registers). The raw mutating scan is NOT exported: a barrier-less
     # reconciliation entrypoint was the re-review's P1 bypass. Widening this surface is a
     # deliberate, reviewed change.
+    # The slice-4 delivery surface (deliver_segment, replay_segments) mutates ONLY the delivery-side
+    # checkpoint (_segment_exporters.delivery_status), never a segment row or reconciliation state,
+    # and only under the shared barrier over segments already committed (hence already reconciled).
+    # It therefore cannot bypass mandatory reconciliation. Exporter/ExporterAttempt/ReplayReport are
+    # inert protocol/value types.
     assert set(spooling.__all__) == {
         "DurableSpool",
+        "Exporter",
+        "ExporterAttempt",
         "ExporterDelivery",
         "OrphanRegistration",
         "ParsedSegment",
         "QuarantinedFile",
         "ReconciliationReport",
+        "ReplayReport",
         "SegmentAnomaly",
         "SegmentHeaderV1",
         "SegmentRecord",
@@ -652,10 +660,12 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "SpoolFrameV1",
         "SpoolReconciler",
         "build_segment_bytes",
+        "deliver_segment",
         "parse_segment_bytes",
         "publish_segment_bytes",
         "read_trusted_segment",
         "read_untrusted_segment",
+        "replay_segments",
         "spool_content_sha256",
         "spool_frame_line",
         "spool_segment_header_line",
