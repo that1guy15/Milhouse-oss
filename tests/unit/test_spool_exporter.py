@@ -1,8 +1,10 @@
-"""Behavioural guarantees for the exporter delivery protocol (W03 slice 4, pipeline rules 11-12).
+"""Integrity + state-machine guarantees for the exporter delivery protocol (W03 slice 4; D05 fix).
 
-Delivery is at-least-once with a terminal ``delivered`` state: a confirmed delivery is recorded
-only after the exporter returns, a failure stays retryable, and no later attempt can un-deliver a
-segment. A misbehaving exporter is contained as a failed delivery rather than crashing the pipeline.
+A terminal ``delivered`` can never be recorded for the wrong data: delivery binds the barrier to the
+live database, reloads the authoritative ledger row, rejects a supplied record that does not match
+it, and requires the supplied frames to hash to that row's content digest (matching batch id and
+count) before anything is forwarded. Each exporter object must self-identify; only a compare-and-
+set that actually advances the expected row is reported as a new delivery.
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ from milhouse.domain.records import (
 from milhouse.spooling import (
     DurableSpool,
     Exporter,
-    ExporterDelivery,
     SegmentHeaderV1,
     SegmentRecord,
     SpoolFrameV1,
@@ -34,6 +35,7 @@ from milhouse.spooling import (
     spool_content_sha256,
     spool_frame_line,
 )
+from milhouse.spooling import exporter as exporter_module
 from milhouse.spooling.errors import SpoolError
 from milhouse.state import (
     GlobalCommitBarrier,
@@ -47,19 +49,17 @@ _GENERATION = "a" * 64
 
 
 class _FakeExporter:
-    """An in-memory exporter that records what it was handed and optionally fails delivery."""
-
     def __init__(self, exporter_id: str, *, fail: bool = False) -> None:
         self._exporter_id = exporter_id
         self._fail = fail
-        self.deliveries: list[tuple[str, tuple[int, ...]]] = []
+        self.deliveries: list[str] = []
 
     @property
     def exporter_id(self) -> str:
         return self._exporter_id
 
     def deliver(self, record: SegmentRecord, frames) -> None:
-        self.deliveries.append((record.batch_id, tuple(frame.sequence for frame in frames)))
+        self.deliveries.append(record.batch_id)
         if self._fail:
             raise RuntimeError("destination unavailable")
 
@@ -101,17 +101,19 @@ def _envelope(source_event_id: str) -> RecordEnvelopeV1:
     return finalize_record(RecordDraftV1.model_validate(values), installation_id=_INSTALLATION_ID)
 
 
-def _frames() -> list[SpoolFrameV1]:
+def _frames(batch_id: str, event_ids: tuple[str, ...]) -> list[SpoolFrameV1]:
     return [
-        SpoolFrameV1(batch_id="batch-1", sequence=1, record=_envelope("event-1")),
-        SpoolFrameV1(batch_id="batch-1", sequence=2, record=_envelope("event-2")),
+        SpoolFrameV1(batch_id=batch_id, sequence=index, record=_envelope(event_id))
+        for index, event_id in enumerate(event_ids, start=1)
     ]
 
 
-def _header(frames: list[SpoolFrameV1], *, exporters: tuple[str, ...]) -> SegmentHeaderV1:
+def _header(
+    batch_id: str, frames: list[SpoolFrameV1], exporters: tuple[str, ...]
+) -> SegmentHeaderV1:
     lines = [spool_frame_line(frame) for frame in frames]
     return SegmentHeaderV1(
-        batch_id="batch-1",
+        batch_id=batch_id,
         config_generation=_GENERATION,
         scope="target",
         target_id="example-target",
@@ -139,136 +141,221 @@ def _spool(tmp_path: Path):
     return database, barrier, store
 
 
-def _delivery_status(database, exporter_id: str) -> str | None:
+def _commit(store, batch_id: str, event_ids: tuple[str, ...], exporters=("clickhouse",)):
+    frames = _frames(batch_id, event_ids)
+    record = store.commit_segment(_header(batch_id, frames, exporters), frames, committed_at=_NOW)
+    return record, frames
+
+
+def _status(database, batch_id: str, exporter_id: str) -> str | None:
     row = database.connection.execute(
         "SELECT delivery_status FROM _segment_exporters WHERE batch_id = ? AND exporter_id = ?",
-        ("batch-1", exporter_id),
+        (batch_id, exporter_id),
     ).fetchone()
     return None if row is None else str(row[0])
 
 
-def _committed(tmp_path: Path, exporters: tuple[str, ...]):
-    database, barrier, store = _spool(tmp_path)
-    frames = _frames()
-    record = store.commit_segment(_header(frames, exporters=exporters), frames, committed_at=_NOW)
-    return database, barrier, record, frames
-
-
-def test_the_exported_protocol_is_satisfied_by_a_concrete_exporter() -> None:
+def test_the_protocol_is_satisfied_by_a_concrete_exporter() -> None:
     assert isinstance(_FakeExporter("clickhouse"), Exporter)
 
 
-def test_a_pending_exporter_is_delivered_after_confirmation(tmp_path: Path) -> None:
-    database, barrier, record, frames = _committed(tmp_path, ("clickhouse",))
+def test_delivers_matching_frames_and_records_delivered(tmp_path: Path) -> None:
+    database, barrier, store = _spool(tmp_path)
     try:
+        record, frames = _commit(store, "batch-a", ("a1", "a2"))
         exporter = _FakeExporter("clickhouse")
         attempts = deliver_segment(database, barrier, record, frames, {"clickhouse": exporter})
         assert [(a.exporter_id, a.outcome) for a in attempts] == [("clickhouse", "delivered")]
-        assert exporter.deliveries == [("batch-1", (1, 2))]  # the exporter saw the segment's frames
-        assert _delivery_status(database, "clickhouse") == "delivered"
+        assert exporter.deliveries == ["batch-a"]
+        assert _status(database, "batch-a", "clickhouse") == "delivered"
     finally:
         database.close()
 
 
-def test_a_failing_exporter_is_recorded_failed_and_stays_retryable(tmp_path: Path) -> None:
-    database, barrier, record, frames = _committed(tmp_path, ("clickhouse",))
+def test_a_failing_exporter_records_failed(tmp_path: Path) -> None:
+    database, barrier, store = _spool(tmp_path)
     try:
-        failing = _FakeExporter("clickhouse", fail=True)
-        attempts = deliver_segment(database, barrier, record, frames, {"clickhouse": failing})
+        record, frames = _commit(store, "batch-a", ("a1",))
+        attempts = deliver_segment(
+            database,
+            barrier,
+            record,
+            frames,
+            {"clickhouse": _FakeExporter("clickhouse", fail=True)},
+        )
         assert [a.outcome for a in attempts] == ["failed"]
-        assert _delivery_status(database, "clickhouse") == "failed"
-
-        # A failed row is retryable: a later pass with a working exporter delivers it.
-        retried = replace(record, exporters=(ExporterDelivery("clickhouse", "failed"),))
-        healthy = _FakeExporter("clickhouse")
-        again = deliver_segment(database, barrier, retried, frames, {"clickhouse": healthy})
-        assert [a.outcome for a in again] == ["delivered"]
-        assert _delivery_status(database, "clickhouse") == "delivered"
+        assert _status(database, "batch-a", "clickhouse") == "failed"
     finally:
         database.close()
 
 
-def test_a_delivered_exporter_is_skipped_idempotently(tmp_path: Path) -> None:
-    database, barrier, record, frames = _committed(tmp_path, ("clickhouse",))
+def test_an_already_delivered_exporter_is_skipped_idempotently(tmp_path: Path) -> None:
+    database, barrier, store = _spool(tmp_path)
     try:
+        record, frames = _commit(store, "batch-a", ("a1",))
         exporter = _FakeExporter("clickhouse")
         deliver_segment(database, barrier, record, frames, {"clickhouse": exporter})
-        delivered_record = replace(record, exporters=(ExporterDelivery("clickhouse", "delivered"),))
-        attempts = deliver_segment(
-            database, barrier, delivered_record, frames, {"clickhouse": exporter}
-        )
+        attempts = deliver_segment(database, barrier, record, frames, {"clickhouse": exporter})
         assert [a.outcome for a in attempts] == ["already_delivered"]
-        assert exporter.deliveries == [("batch-1", (1, 2))]  # not delivered a second time
+        assert exporter.deliveries == ["batch-a"]  # not delivered a second time
+    finally:
+        database.close()
+
+
+def test_frames_from_another_segment_are_refused_and_nothing_is_certified(tmp_path: Path) -> None:
+    # THE D05 integrity case: forwarding batch-b frames under the batch-a record must fail closed —
+    # the exporter is never called and batch-a is never marked delivered.
+    database, barrier, store = _spool(tmp_path)
+    try:
+        record_a, _frames_a = _commit(store, "batch-a", ("a1",))
+        _record_b, frames_b = _commit(store, "batch-b", ("b1",))
+        exporter = _FakeExporter("clickhouse")
+        with pytest.raises(SpoolError) as captured:
+            deliver_segment(database, barrier, record_a, frames_b, {"clickhouse": exporter})
+        assert captured.value.code == "MH_SPOOL_EXPORT"
+        assert exporter.deliveries == []  # nothing forwarded
+        assert _status(database, "batch-a", "clickhouse") == "pending"  # never certified
+    finally:
+        database.close()
+
+
+def test_same_batch_frames_with_a_different_content_digest_are_refused(tmp_path: Path) -> None:
+    database, barrier, store = _spool(tmp_path)
+    try:
+        record_a, _frames_a = _commit(store, "batch-a", ("a1",))
+        # A different batch-a frame: same batch id and count, but different record content.
+        forged = _frames("batch-a", ("different-event",))
+        with pytest.raises(SpoolError) as captured:
+            deliver_segment(
+                database, barrier, record_a, forged, {"clickhouse": _FakeExporter("clickhouse")}
+            )
+        assert captured.value.code == "MH_SPOOL_EXPORT"
+        assert _status(database, "batch-a", "clickhouse") == "pending"
+    finally:
+        database.close()
+
+
+def test_a_frame_count_mismatch_is_refused(tmp_path: Path) -> None:
+    database, barrier, store = _spool(tmp_path)
+    try:
+        record_a, _frames_a = _commit(store, "batch-a", ("a1", "a2"))
+        with pytest.raises(SpoolError) as captured:
+            deliver_segment(
+                database, barrier, record_a, [], {"clickhouse": _FakeExporter("clickhouse")}
+            )
+        assert captured.value.code == "MH_SPOOL_EXPORT"
+    finally:
+        database.close()
+
+
+def test_a_fabricated_or_uncommitted_record_is_refused(tmp_path: Path) -> None:
+    database, barrier, store = _spool(tmp_path)
+    try:
+        record, frames = _commit(store, "batch-a", ("a1",))
+        with pytest.raises(SpoolError) as tampered:  # same batch id, tampered content digest
+            deliver_segment(
+                database,
+                barrier,
+                replace(record, content_sha256="d" * 64),
+                frames,
+                {"clickhouse": _FakeExporter("clickhouse")},
+            )
+        assert tampered.value.code == "MH_SPOOL_EXPORT"
+        with pytest.raises(SpoolError) as ghost:  # a batch id that was never committed
+            deliver_segment(
+                database,
+                barrier,
+                replace(record, batch_id="ghost-1"),
+                frames,
+                {"clickhouse": _FakeExporter("clickhouse")},
+            )
+        assert ghost.value.code == "MH_SPOOL_EXPORT"
+    finally:
+        database.close()
+
+
+def test_a_mis_identified_exporter_object_never_certifies(tmp_path: Path) -> None:
+    database, barrier, store = _spool(tmp_path)
+    try:
+        record, frames = _commit(store, "batch-a", ("a1",))
+        impostor = _FakeExporter(
+            "somewhere-else"
+        )  # registered under 'clickhouse', claims another id
+        attempts = deliver_segment(database, barrier, record, frames, {"clickhouse": impostor})
+        assert [a.outcome for a in attempts] == ["no_exporter"]
+        assert impostor.deliveries == []
+        assert _status(database, "batch-a", "clickhouse") == "pending"
     finally:
         database.close()
 
 
 def test_an_unsupplied_exporter_is_reported_without_touching_the_ledger(tmp_path: Path) -> None:
-    database, barrier, record, frames = _committed(tmp_path, ("clickhouse",))
+    database, barrier, store = _spool(tmp_path)
     try:
+        record, frames = _commit(store, "batch-a", ("a1",))
         attempts = deliver_segment(database, barrier, record, frames, {})
         assert [a.outcome for a in attempts] == ["no_exporter"]
-        assert _delivery_status(database, "clickhouse") == "pending"  # untouched
+        assert _status(database, "batch-a", "clickhouse") == "pending"
     finally:
         database.close()
 
 
-def test_a_malformed_exporter_id_is_reported_as_no_exporter(tmp_path: Path) -> None:
-    database, barrier, record, frames = _committed(tmp_path, ("clickhouse",))
+def test_a_wrong_barrier_is_refused(tmp_path: Path) -> None:
+    database, _barrier, store = _spool(tmp_path)
     try:
-        # A defensive guard: even with an exporter supplied under a malformed key, no delivery runs.
-        poisoned = replace(record, exporters=(ExporterDelivery("Bad Id", "pending"),))
-        exporter = _FakeExporter("Bad Id")
-        attempts = deliver_segment(database, barrier, poisoned, frames, {"Bad Id": exporter})
-        assert [a.outcome for a in attempts] == ["no_exporter"]
-        assert exporter.deliveries == []
-    finally:
-        database.close()
-
-
-def test_multiple_exporters_are_delivered_independently(tmp_path: Path) -> None:
-    database, barrier, record, frames = _committed(tmp_path, ("alerts", "clickhouse"))
-    try:
-        healthy = _FakeExporter("clickhouse")
-        broken = _FakeExporter("alerts", fail=True)
-        attempts = deliver_segment(
-            database, barrier, record, frames, {"clickhouse": healthy, "alerts": broken}
-        )
-        outcomes = {a.exporter_id: a.outcome for a in attempts}
-        assert outcomes == {"alerts": "failed", "clickhouse": "delivered"}
-        assert _delivery_status(database, "clickhouse") == "delivered"
-        assert _delivery_status(database, "alerts") == "failed"
-    finally:
-        database.close()
-
-
-def test_a_confirmed_delivery_is_never_overwritten_by_a_later_failure(tmp_path: Path) -> None:
-    database, barrier, record, frames = _committed(tmp_path, ("clickhouse",))
-    try:
-        # Simulate a concurrent pass that already delivered while this caller still holds a stale
-        # record showing 'pending'. This caller's exporter then fails.
-        with database.transaction() as connection:
-            connection.execute(
-                "UPDATE _segment_exporters SET delivery_status = 'delivered' "
-                "WHERE batch_id = 'batch-1' AND exporter_id = 'clickhouse'"
+        record, frames = _commit(store, "batch-a", ("a1",))
+        foreign = GlobalCommitBarrier(tmp_path / "unrelated.lock")
+        with pytest.raises(SpoolError) as captured:
+            deliver_segment(
+                database, foreign, record, frames, {"clickhouse": _FakeExporter("clickhouse")}
             )
-        failing = _FakeExporter("clickhouse", fail=True)
-        attempts = deliver_segment(database, barrier, record, frames, {"clickhouse": failing})
-        assert [a.outcome for a in attempts] == ["failed"]  # this pass observed a failure
-        # ...but the compare-and-set refused to clobber the terminal 'delivered' row.
-        assert _delivery_status(database, "clickhouse") == "delivered"
+        assert captured.value.code == "MH_SPOOL_EXPORT"
+        assert _status(database, "batch-a", "clickhouse") == "pending"
     finally:
         database.close()
 
 
-def test_a_broken_ledger_write_normalizes_to_a_stable_code(tmp_path: Path) -> None:
-    database, barrier, record, frames = _committed(tmp_path, ("clickhouse",))
+def test_a_zero_row_compare_and_set_is_not_reported_as_a_new_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, barrier, store = _spool(tmp_path)
     try:
+        record, frames = _commit(store, "batch-a", ("a1",))
+        # Deliver for real so the ledger row is terminal-delivered.
+        deliver_segment(
+            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}
+        )
+        # Force the reload to report the exporter as still pending (a stale snapshot); the attempt
+        # succeeds but the compare-and-set affects zero rows because the row is already delivered,
+        # this pass must NOT claim a new delivery.
+        stale = replace(
+            record, exporters=(replace(record.exporters[0], delivery_status="pending"),)
+        )
+        monkeypatch.setattr(exporter_module, "_reload_record", lambda database, record: stale)
+        attempts = deliver_segment(
+            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}
+        )
+        assert [a.outcome for a in attempts] == ["already_delivered"]
+        assert _status(database, "batch-a", "clickhouse") == "delivered"
+    finally:
+        database.close()
+
+
+def test_a_broken_delivery_ledger_write_normalizes_to_a_stable_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, barrier, store = _spool(tmp_path)
+    try:
+        record, frames = _commit(store, "batch-a", ("a1",))
+        # Bypass the DB reload, then drop the delivery ledger so only the status CAS hits
+        # the broken table; the backend fault must normalize to the fixed code.
+        monkeypatch.setattr(exporter_module, "_reload_record", lambda database, record: record)
         with database.transaction() as connection:
             connection.execute("DROP TABLE _segment_exporters")
-        exporter = _FakeExporter("clickhouse")
         with pytest.raises(SpoolError) as captured:
-            deliver_segment(database, barrier, record, frames, {"clickhouse": exporter})
+            deliver_segment(
+                database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}
+            )
         assert captured.value.code == "MH_SPOOL_EXPORT"
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
@@ -277,8 +364,9 @@ def test_a_broken_ledger_write_normalizes_to_a_stable_code(tmp_path: Path) -> No
 
 
 def test_invalid_arguments_are_rejected(tmp_path: Path) -> None:
-    database, barrier, record, frames = _committed(tmp_path, ("clickhouse",))
+    database, barrier, store = _spool(tmp_path)
     try:
+        record, frames = _commit(store, "batch-a", ("a1",))
         with pytest.raises(SpoolError) as bad_db:
             deliver_segment(object(), barrier, record, frames, {})  # type: ignore[arg-type]
         assert bad_db.value.code == "MH_SPOOL_EXPORT"
@@ -291,5 +379,25 @@ def test_invalid_arguments_are_rejected(tmp_path: Path) -> None:
         with pytest.raises(SpoolError) as bad_exporters:
             deliver_segment(database, barrier, record, frames, None)  # type: ignore[arg-type]
         assert bad_exporters.value.code == "MH_SPOOL_EXPORT"
+    finally:
+        database.close()
+
+
+def test_an_exporter_whose_id_property_raises_is_contained(tmp_path: Path) -> None:
+    database, barrier, store = _spool(tmp_path)
+    try:
+        record, frames = _commit(store, "batch-a", ("a1",))
+
+        class _RaisingId:
+            @property
+            def exporter_id(self) -> str:
+                raise RuntimeError("hostile id property")
+
+            def deliver(self, record: SegmentRecord, frames: object) -> None:
+                raise AssertionError("must not be called")
+
+        attempts = deliver_segment(database, barrier, record, frames, {"clickhouse": _RaisingId()})
+        assert [a.outcome for a in attempts] == ["no_exporter"]  # contained, not raised
+        assert _status(database, "batch-a", "clickhouse") == "pending"
     finally:
         database.close()

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
+from milhouse.config.filesystem import SecureFileError, lexical_absolute_path
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.exporter import Exporter, ExporterAttempt, deliver_segment
 from milhouse.spooling.ledger import SegmentRecord, list_segment_records
@@ -36,9 +37,10 @@ from milhouse.spooling.reader import (
     read_trusted_segment,
 )
 from milhouse.state.barrier import GlobalCommitBarrier
-from milhouse.state.database import ControlDatabase
+from milhouse.state.database import ControlDatabase, _validated_database_path
 
 _PENDING = "pending"
+_SPOOL = "spool"
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -101,7 +103,17 @@ def replay_segments(
         or INSTALLATION_ID_PATTERN.fullmatch(installation_id) is None
     ):
         _fail("MH_SPOOL_IDENTITY", "a well-formed installation id is required")
-    root = Path(spool_root)
+    # Bind the spool root to this database's state root so replay reprocesses the authoritative
+    # durable spool, never a shadow copy (D05 P2).
+    database_path = _validated_database_path(database)
+    if database_path is None:
+        _fail("MH_SPOOL_REPLAY", "a control database is required")
+    try:
+        root = lexical_absolute_path(spool_root)
+    except SecureFileError:
+        _fail("MH_SPOOL_REPLAY", "a spool root path is required")
+    if root != database_path.parent.parent / _SPOOL:
+        _fail("MH_SPOOL_REPLAY", "the spool root must be <state_root>/spool")
 
     records = list_segment_records(database, delivery_status=delivery_status)
     segments: list[str] = []
