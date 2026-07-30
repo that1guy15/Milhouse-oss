@@ -20,6 +20,11 @@ from milhouse.spooling.reconcile import (
     SpoolReconciler,
 )
 from milhouse.spooling.replay import ReplayReport, replay_segments
+from milhouse.spooling.retention import (
+    RetentionPreview,
+    SegmentRetention,
+    retention_preview,
+)
 from milhouse.spooling.segment import (
     SegmentHeaderV1,
     SpoolFrameV1,
@@ -44,9 +49,11 @@ __all__ = [
     "QuarantinedFile",
     "ReconciliationReport",
     "ReplayReport",
+    "RetentionPreview",
     "SegmentAnomaly",
     "SegmentHeaderV1",
     "SegmentRecord",
+    "SegmentRetention",
     "SegmentVerification",
     "SpoolError",
     "SpoolFrameV1",
@@ -59,6 +66,7 @@ __all__ = [
     "read_trusted_segment",
     "read_untrusted_segment",
     "replay_segments",
+    "retention_preview",
     "spool_content_sha256",
     "spool_frame_line",
     "spool_segment_header_line",

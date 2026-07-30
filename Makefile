@@ -93,6 +93,7 @@ test-coverage:
 		--critical 'src/milhouse/privacy/redact.py' \
 		--critical 'src/milhouse/privacy/render.py' \
 		--critical 'src/milhouse/privacy/sanitize.py' \
+		--critical 'src/milhouse/state/audit.py' \
 		--critical 'src/milhouse/state/barrier.py' \
 		--critical 'src/milhouse/state/cursors.py' \
 		--critical 'src/milhouse/state/database.py' \
@@ -108,6 +109,7 @@ test-coverage:
 		--critical 'src/milhouse/spooling/reader.py' \
 		--critical 'src/milhouse/spooling/reconcile.py' \
 		--critical 'src/milhouse/spooling/replay.py' \
+		--critical 'src/milhouse/spooling/retention.py' \
 		--critical 'src/milhouse/spooling/segment.py' \
 		--critical 'src/milhouse/spooling/verify.py' \
 		--critical 'src/milhouse/spooling/writer.py' \

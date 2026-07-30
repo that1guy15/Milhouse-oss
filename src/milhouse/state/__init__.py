@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from milhouse.state.audit import AuditRecord, list_audit, record_audit
 from milhouse.state.barrier import GlobalCommitBarrier
 from milhouse.state.cursors import SourceCursor, advance_cursor, read_cursor
 from milhouse.state.database import ControlDatabase, open_control_database
@@ -23,6 +24,7 @@ from milhouse.state.schema import CONTROL_MIGRATIONS, initialize_control_state
 
 __all__ = [
     "CONTROL_MIGRATIONS",
+    "AuditRecord",
     "ControlDatabase",
     "DerivationCheckpoint",
     "GlobalCommitBarrier",
@@ -34,10 +36,12 @@ __all__ = [
     "advance_checkpoint",
     "advance_cursor",
     "initialize_control_state",
+    "list_audit",
     "migrate",
     "open_control_database",
     "read_checkpoint",
     "read_cursor",
+    "record_audit",
     "release_lease",
     "renew_lease",
     "require_current_lease",

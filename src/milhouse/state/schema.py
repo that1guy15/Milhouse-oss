@@ -120,6 +120,33 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "CHECK (revision >= 1))",
         ),
     ),
+    Migration(
+        6,
+        "create_audit",
+        (
+            # Append-only audit trail for maintenance actions (plan sections 4.4/4.9). An audit row
+            # records only the action, the actor class, an optional opaque resource id, an outcome,
+            # a safe coded reason, and safe counts — never the acted-on raw payload (plan section
+            # 4.6 'audit'). ``INTEGER PRIMARY KEY AUTOINCREMENT`` gives a monotonic, never-reused
+            # sequence so the trail cannot silently lose or reorder an entry. Retention (slice 5b)
+            # is the first writer; compaction (5c), purge, and backup reuse this table.
+            "CREATE TABLE _audit ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "recorded_at TEXT NOT NULL, "
+            "action TEXT NOT NULL, "
+            "actor TEXT NOT NULL, "
+            "outcome TEXT NOT NULL, "
+            "resource TEXT, "
+            "reason TEXT, "
+            "record_count INTEGER, "
+            "byte_size INTEGER, "
+            "CHECK (length(action) > 0), "
+            "CHECK (length(actor) > 0), "
+            "CHECK (length(outcome) > 0), "
+            "CHECK (record_count IS NULL OR record_count >= 0), "
+            "CHECK (byte_size IS NULL OR byte_size >= 0))",
+        ),
+    ),
 )
 
 
