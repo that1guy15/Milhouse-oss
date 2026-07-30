@@ -643,6 +643,9 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
     # and only under the shared barrier over segments already committed (hence already reconciled).
     # It therefore cannot bypass mandatory reconciliation. Exporter/ExporterAttempt/ReplayReport are
     # inert protocol/value types.
+    # The slice-5a audit surface (verify_spool) is strictly READ-ONLY: it opens durable files and
+    # reads ledger rows to report integrity, mutating nothing and holding no barrier.
+    # SegmentVerification/VerifyReport are inert value types.
     assert set(spooling.__all__) == {
         "DurableSpool",
         "Exporter",
@@ -656,9 +659,11 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "SegmentAnomaly",
         "SegmentHeaderV1",
         "SegmentRecord",
+        "SegmentVerification",
         "SpoolError",
         "SpoolFrameV1",
         "SpoolReconciler",
+        "VerifyReport",
         "build_segment_bytes",
         "deliver_segment",
         "parse_segment_bytes",
@@ -669,6 +674,7 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "spool_content_sha256",
         "spool_frame_line",
         "spool_segment_header_line",
+        "verify_spool",
         "write_spool_segment",
     }
     assert "insert_segment_row" not in spooling.__all__
