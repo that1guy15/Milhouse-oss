@@ -51,7 +51,9 @@ def _insert_committed_segment(database, batch_id: str = "batch-1") -> str:
 def test_slice4_migrations_create_the_cursor_and_checkpoint_tables(tmp_path: Path) -> None:
     database = _initialized(tmp_path)
     try:
-        assert schema_version(database) >= 5  # slice-4 migrations applied (later slices append more)
+        assert (
+            schema_version(database) >= 5
+        )  # slice-4 migrations applied (later slices append more)
         tables = {
             row[0]
             for row in database.connection.execute(
