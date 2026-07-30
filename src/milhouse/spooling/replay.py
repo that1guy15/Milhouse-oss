@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 
@@ -84,6 +85,7 @@ def replay_segments(
     spool_root: str | Path,
     installation_id: str,
     exporters: Mapping[str, Exporter],
+    now: datetime,
     delivery_status: str | None = None,
 ) -> ReplayReport:
     """Replay committed segments deterministically, driving idempotent exporter delivery.
@@ -91,7 +93,8 @@ def replay_segments(
     ``delivery_status`` optionally narrows the pass to segments with an exporter in that state (e.g.
     ``"pending"`` to drive only undelivered work); with ``None`` every committed segment is
     replayed, which is the shape the recovery/rebuild path and the G03 double-replay evidence use.
-    The returned record-id stream is identical across runs over an unchanged ledger.
+    The returned record-id stream is identical across runs over an unchanged ledger. ``now`` drives
+    delivery's hard-expiry gate, so replay never re-egresses a segment whose records have expired.
     """
 
     if type(database) is not ControlDatabase:
@@ -125,7 +128,9 @@ def replay_segments(
         _verify_against_ledger(parsed, record)
         segments.append(record.batch_id)
         record_ids.extend(frame.record.record_id for frame in parsed.frames)
-        attempts.extend(deliver_segment(database, barrier, record, parsed.frames, exporters))
+        attempts.extend(
+            deliver_segment(database, barrier, record, parsed.frames, exporters, now=now)
+        )
     return ReplayReport(
         segments=tuple(segments),
         record_ids=tuple(record_ids),

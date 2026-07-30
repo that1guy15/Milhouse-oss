@@ -884,7 +884,12 @@ def remove_regular_file_no_follow(
                     os.close(descriptor)
                 except OSError:
                     if failure is None:
-                        failure = SecureFileError(SecureFileErrorKind.UNREADABLE)
+                        # Reaching the close with no prior failure means the whole body — including
+                        # the unlink — succeeded, so the entry is already gone. A descriptor-close
+                        # failure then leaves durability unconfirmed, never a lingering orphan:
+                        # report commit-uncertain so retention re-inspects rather than asserting the
+                        # file is still present.
+                        failure = SecureFileError(SecureFileErrorKind.COMMIT_UNCERTAIN)
 
     if failure is not None:
         raise failure

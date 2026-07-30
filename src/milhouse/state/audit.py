@@ -2,24 +2,26 @@
 
 Every deliberate maintenance mutation — retention pruning, compaction, purge, restore — records one
 append-only row in ``_audit`` describing what happened in privacy-safe terms: a fixed action code, a
-fixed actor class, a fixed outcome and reason code, an opaque resource identifier, and safe counts.
+fixed actor class, a fixed outcome and reason code, an opaque resource FINGERPRINT, and safe counts.
 An audit row never carries the acted-on raw payload, a secret, a path, a URL, or free text (plan
 section 4.6 ``audit``, ADR 0007).
 
 The public surface is a set of **purpose-specific constructors** (e.g.
 :func:`record_retention_prune`) rather than a free-text sink: each constructor fixes its own
-action/actor/outcome/reason codes as
-constants, so a caller cannot inject arbitrary text into those fields, and validates the only
-caller-supplied value — an opaque resource identifier — against a strict id charset that admits a
-batch/target id but rejects a path, email, URL, prompt, multiline, secret, or raw payload. Recording
-is transaction-scoped: the caller writes the row on the SAME open connection, in the SAME
-transaction as the mutation it attests, so the trail and the state commit or roll back together.
-Every fault
-normalizes to a fixed ``MH_STATE_AUDIT`` code raised outside the handler.
+action/actor/outcome/reason codes as constants, so a caller cannot inject arbitrary text into those
+fields. The one caller-supplied value — the resource id — is charset-validated AND then stored only
+as a SHA-256 fingerprint, so the resource column is structurally incapable of holding a raw string:
+the charset guard alone is not a secrecy proof (a *legal* opaque id can still be secret-shaped, e.g.
+an access key), so fingerprinting is what guarantees no path, email, URL, prompt, secret, or raw
+payload is ever persisted. Recording is transaction-scoped: the caller writes the row on the SAME
+open connection, in the SAME transaction as the mutation it attests, so the trail and the state
+commit or roll back together. Every fault normalizes to a fixed ``MH_STATE_AUDIT`` code raised
+outside the handler.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 from collections.abc import Sequence
@@ -66,6 +68,19 @@ def _validate_resource(value: object) -> str:
     return value
 
 
+def _resource_fingerprint(value: str) -> str:
+    """Return a stable SHA-256 hex fingerprint of ``value`` for storage in the audit resource.
+
+    The charset guard rejects a path/URL/email/multiline, but a *legal* opaque id can still be a
+    secret-shaped string (an access key like ``AKIAIOSFODNN7EXAMPLE`` is a valid batch-id shape), so
+    the audit trail never stores the caller's raw string — only this fixed-width fingerprint. The
+    stored value is thus structurally incapable of carrying a raw secret, path, or payload, while an
+    operator who holds the real id can still correlate by re-fingerprinting it.
+    """
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _validate_count(value: object, subject: str) -> int:
     # ``bool`` is an ``int`` subtype; reject it so a stray flag cannot pose as a count. The upper
     # bound keeps a too-large count from overflowing the signed-64 INTEGER binding at INSERT.
@@ -89,9 +104,9 @@ def _insert_audit(
     """Insert one audit row. Internal: only the typed constructors call it, with fixed codes.
 
     ``action``/``actor``/``outcome``/``reason`` are code constants owned by the calling constructor,
-    never caller free text; ``resource`` and the counts are the constructor's already-validated
-    caller data. Only the timestamp is validated here before the insert; any residual backend fault
-    normalizes to the fixed code.
+    never caller free text; ``resource`` is the already-fingerprinted id and the counts are its
+    already-validated caller data. Only the timestamp is validated here before the insert; any
+    residual backend fault normalizes to the fixed code.
     """
 
     invalid_time = False
@@ -129,10 +144,12 @@ def record_retention_prune(
 ) -> None:
     """Record that retention pruned one committed segment, on the caller's open transaction.
 
-    The action/actor/outcome/reason codes are fixed here, so no free text reaches the audit row; the
-    only caller-supplied value is ``batch_id``, validated as an opaque identifier. ``undelivered``
-    distinguishes the critical case where the segment reached its privacy deadline before it was
-    exported. Call inside the same transaction as the prune so the two commit or roll back together.
+    The action/actor/outcome/reason codes are fixed here, so no free text reaches the audit row. The
+    only caller-supplied value is ``batch_id``: it is charset-validated as an opaque identifier and
+    then stored ONLY as a SHA-256 fingerprint, so the audit trail never persists the caller's raw
+    string even if a legal id is secret-shaped. ``undelivered`` distinguishes the critical case
+    where the segment reached its privacy deadline before it was exported. Call inside the same
+    transaction as the prune so the two commit or roll back together.
     """
 
     if type(undelivered) is not bool:
@@ -147,7 +164,7 @@ def record_retention_prune(
         actor="maintenance",
         outcome="pruned_undelivered" if undelivered else "pruned",
         reason="expired_undelivered" if undelivered else "expired",
-        resource=batch_id,
+        resource=_resource_fingerprint(batch_id),
         record_count=record_count,
         byte_size=byte_size,
     )

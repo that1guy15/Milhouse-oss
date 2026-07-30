@@ -197,6 +197,7 @@ def test_an_expired_but_undelivered_segment_is_flagged(tmp_path: Path) -> None:
             delivered_record,
             delivered_frames,
             {"clickhouse": _FakeExporter("clickhouse")},
+            now=_NOW,
         )
         _commit(store, "batch-b", [("b1", _EXPIRED_AT)])  # left undelivered
         preview = retention_preview(

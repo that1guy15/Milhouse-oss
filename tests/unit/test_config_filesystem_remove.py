@@ -234,9 +234,12 @@ def test_a_post_unlink_fsync_failure_is_commit_uncertain(
     assert real_fsync is config_filesystem.os.fsync
 
 
-def test_a_close_failure_after_a_successful_unlink_is_unreadable(
+def test_a_close_failure_after_a_successful_unlink_is_commit_uncertain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # D05 re-review P2: reaching the close with no prior failure means the whole body (including the
+    # unlink) succeeded, so the file is GONE. A descriptor-close failure then leaves only durability
+    # unconfirmed — commit-uncertain — never a lingering orphan, so retention must not re-adopt it.
     _directory, path = _private_file(tmp_path)
     real_chain = config_filesystem._open_directory_chain
     real_close = config_filesystem.os.close
@@ -256,8 +259,8 @@ def test_a_close_failure_after_a_successful_unlink_is_unreadable(
     monkeypatch.setattr(config_filesystem.os, "close", failing_close)
     with pytest.raises(SecureFileError) as captured:
         remove_regular_file_no_follow(path)
-    assert captured.value.kind is SecureFileErrorKind.UNREADABLE
-    assert not path.exists()  # the unlink itself still succeeded
+    assert captured.value.kind is SecureFileErrorKind.COMMIT_UNCERTAIN
+    assert not path.exists()  # the unlink itself still succeeded — the entry is gone, not orphaned
     assert "private" not in str(captured.value)
 
 
