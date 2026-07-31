@@ -747,33 +747,169 @@ def _exporter_states(database, batch_id: str) -> dict[str, str]:
     )
 
 
-def test_a_foreign_segment_at_the_derived_id_is_refused_and_the_old_survives(
+def test_a_foreign_segment_at_the_derived_id_is_probed_past_and_the_segment_is_compacted(
     tmp_path: Path,
 ) -> None:
-    # P1 (review): the derived successor id is predictable and the batch id space is caller-chosen,
-    # so an UNRELATED committed segment can occupy it. Compaction must not retire the mixed segment
-    # (and lose its live record) against that foreign segment.
+    # P1 (review): the primary derived id is predictable and the batch id space is caller-chosen, so
+    # an UNRELATED committed segment can occupy it. Compaction must NOT strand the mixed segment's
+    # expired frames — it probes a deterministic alternative id and compacts there, keeping the
+    # foreign and surviving records while removing the expired frame before its privacy deadline.
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
         _record, frames = _commit(
             store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
         )
         live_record_id = str(frames[1].record.record_id)
-        derived = compaction_module._derive_batch_id([frames[1]])
-        # An unrelated committed segment occupies the derived id (different content).
-        _commit(store, derived, [("foreign-live", _LIVE_AT)])
+        primary = compaction_module._derive_batch_id([frames[1]])  # probe 0 — occupied below
+        alternate = compaction_module._derive_batch_id([frames[1]], 1)  # probe 1
+        _commit(store, primary, [("foreign-live", _LIVE_AT)])  # foreign at the primary id
 
         result = _compact(database, barrier, spool_root)
 
-        assert result.compacted == ()  # nothing was rewritten
-        assert ("batch-a", "verify_failed") in [(s.batch_id, s.status) for s in result.skipped]
-        # The mixed segment, its file, and its live record are all untouched...
-        assert "batch-a" in _segment_rows(database)
-        assert _segment_file(spool_root, "batch-a").exists()
-        assert live_record_id in _record_ids(spool_root, "batch-a")
-        # ...and the foreign segment is untouched too.
-        assert derived in _segment_rows(database)
-        assert _record_ids(spool_root, derived) != [live_record_id]
+        # Compacted at the alternate id, not stranded.
+        assert [c.old_batch_id for c in result.compacted] == ["batch-a"]
+        assert result.compacted[0].new_batch_id == alternate
+        assert result.compacted[0].dropped_records == 1  # the expired frame was removed
+        rows = _segment_rows(database)
+        assert "batch-a" not in rows  # old retired
+        assert alternate in rows and primary in rows  # successor + untouched foreign
+        assert not _segment_file(spool_root, "batch-a").exists()
+        assert _record_ids(spool_root, alternate) == [live_record_id]  # surviving record preserved
+        assert _record_ids(spool_root, primary) != [live_record_id]  # foreign untouched
+
+        # Crash-idempotent: a re-run probes past the still-foreign primary, finds the alternate
+        # successor already committed, and changes nothing (both remaining segments are all-live).
+        second = _compact(database, barrier, spool_root)
+        assert second.compacted == ()
+        assert {s.status for s in second.skipped} == {"live"}
+    finally:
+        database.close()
+
+
+def test_compaction_probes_past_a_foreign_id_and_reconverges_after_an_interrupted_swap(
+    tmp_path: Path,
+) -> None:
+    # The reviewer's exact regression: preoccupy the first candidate, interrupt publication+swap,
+    # restart, and prove the foreign and surviving records remain while the expired frame is gone.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _record, frames = _commit(
+            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
+        )
+        live_record_id = str(frames[1].record.record_id)
+        primary = compaction_module._derive_batch_id([frames[1]])
+        alternate = compaction_module._derive_batch_id([frames[1]], 1)
+        _commit(store, primary, [("foreign-live", _LIVE_AT)])
+
+        # Interrupt the swap (drop _audit): the alternate successor file is published as an orphan,
+        # the old segment stays fully intact.
+        with database.transaction() as connection:
+            connection.execute("DROP TABLE _audit")
+        first = _compact(database, barrier, spool_root)
+        assert first.compacted == ()
+        assert "batch-a" in _segment_rows(database)  # old intact
+        assert _segment_file(spool_root, alternate).exists()  # orphan successor at the alternate id
+
+        # Restart: reconciliation adopts the alternate orphan, then a retry probes past the foreign
+        # primary, reuses the alternate successor, and retires the old segment.
+        _recreate_audit_table(database)
+        _reconcile(database, barrier, spool_root)
+        second = _compact(database, barrier, spool_root)
+        assert [c.new_batch_id for c in second.compacted] == [alternate]
+        rows = _segment_rows(database)
+        assert "batch-a" not in rows and alternate in rows and primary in rows
+        assert _record_ids(spool_root, alternate) == [live_record_id]  # surviving record kept
+        assert _record_ids(spool_root, primary) != [live_record_id]  # foreign kept
+    finally:
+        database.close()
+
+
+def test_compaction_reports_a_collision_when_every_candidate_is_foreign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With a tiny probe bound, occupy every candidate with a foreign segment: compaction reports a
+    # bounded collision (never silently strands) and leaves the mixed segment intact for a retry.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _record, frames = _commit(
+            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
+        )
+        monkeypatch.setattr(compaction_module, "_MAX_PROBE", 2)
+        for probe in (0, 1):
+            occupied = compaction_module._derive_batch_id([frames[1]], probe)
+            _commit(store, occupied, [(f"foreign-{probe}", _LIVE_AT)])
+
+        result = _compact(database, barrier, spool_root)
+        assert result.compacted == ()
+        assert ("batch-a", "collision_bound") in [(s.batch_id, s.status) for s in result.skipped]
+        assert "batch-a" in _segment_rows(database)  # untouched — retryable later
+    finally:
+        database.close()
+
+
+def test_compaction_probes_past_an_unreadable_orphan_file(tmp_path: Path) -> None:
+    # A file occupies the primary id with NO ledger row and is not a readable successor (a garbage
+    # crash artifact or foreign file): compaction probes past it to a free alternate.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _record, frames = _commit(
+            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
+        )
+        primary = compaction_module._derive_batch_id([frames[1]])
+        alternate = compaction_module._derive_batch_id([frames[1]], 1)
+        primary_path = _segment_file(spool_root, primary)
+        primary_path.write_bytes(b"{ not a valid segment\n")
+        os.chmod(primary_path, 0o600)
+
+        result = _compact(database, barrier, spool_root)
+        assert result.compacted[0].new_batch_id == alternate  # probed past the unreadable orphan
+        assert "batch-a" not in _segment_rows(database)
+    finally:
+        database.close()
+
+
+def test_compaction_probes_past_a_valid_foreign_orphan_file(tmp_path: Path) -> None:
+    # A VALID segment file (not garbage) occupies the primary id with no ledger row and is NOT this
+    # compaction's successor: it verifies as disagreeing and the probe walks past it.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _record, frames = _commit(
+            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
+        )
+        primary = compaction_module._derive_batch_id([frames[1]])
+        alternate = compaction_module._derive_batch_id([frames[1]], 1)
+        # Commit a valid foreign segment at the primary id, then drop only its ledger rows so a
+        # valid foreign FILE (different content) remains without a row.
+        _commit(store, primary, [("foreign-live", _LIVE_AT)])
+        with database.transaction() as connection:
+            connection.execute("DELETE FROM _segment_exporters WHERE batch_id = ?", (primary,))
+            connection.execute("DELETE FROM _segments WHERE batch_id = ?", (primary,))
+
+        result = _compact(database, barrier, spool_root)
+        assert result.compacted[0].new_batch_id == alternate  # probed past the valid foreign orphan
+        assert "batch-a" not in _segment_rows(database)
+    finally:
+        database.close()
+
+
+def test_a_compacted_segment_uses_reconciled_provenance_for_its_reconstructed_instant(
+    tmp_path: Path,
+) -> None:
+    # P2 (review): the compacted segment's exact commit instant is unknown and must stay within the
+    # records' own day, so it uses a reconstructed day-start committed_at and origin="reconciled"
+    # (the ledger's marker for a reconstructed instant) even though compaction runs on a later day.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)])
+        assert _APPLY_NOW.date().isoformat() != _DAY  # compaction runs on a later UTC day
+        result = _compact(database, barrier, spool_root)  # default now = _APPLY_NOW
+        new_batch_id = result.compacted[0].new_batch_id
+        committed_at, origin, day = database.connection.execute(
+            "SELECT committed_at, origin, day FROM _segments WHERE batch_id = ?", (new_batch_id,)
+        ).fetchone()
+        assert committed_at == f"{_DAY}T00:00:00.000Z"  # reconstructed day-start, within the day
+        assert origin == "reconciled"  # truthful marker for a reconstructed instant
+        assert day == _DAY
     finally:
         database.close()
 

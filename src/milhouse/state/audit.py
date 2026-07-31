@@ -73,6 +73,12 @@ def _validate_resource(value: object) -> str:
 
 
 _RESOURCE_KIND = "batch"
+_MAX_RESOURCE_BYTES = 128
+# A keyed fingerprint for kind "batch" is exactly ``mh_fp1_e{epoch}_batch_{base32}``: an epoch of
+# 1..2^31-1 and the lowercase base32 (52 chars) of the 32-byte SHA-256 HMAC digest. The audit
+# boundary validates the pseudonymizer's output against this canonical grammar so a hostile or buggy
+# Pseudonymizer cannot persist a secret-shaped, wrong-kind, or overlong value.
+_FINGERPRINT_TOKEN = re.compile(r"mh_fp1_e[1-9][0-9]{0,9}_batch_[a-z2-7]{52}", flags=re.ASCII)
 
 
 def _keyed_resource(pseudonymizer: Pseudonymizer | None, batch_id: str) -> str | None:
@@ -82,12 +88,25 @@ def _keyed_resource(pseudonymizer: Pseudonymizer | None, batch_id: str) -> str |
     HMAC pseudonym, never a public unsalted hash. The pseudonym key is created by ``init`` (W06) and
     is not yet wired into the control plane, so when no pseudonymizer is supplied the derivative is
     OMITTED rather than persisted as a reversible hash — the precedent ``spooling/reconcile`` sets.
-    When a key is wired, the same call yields a keyed ``mh_fp1_`` token, no schema change.
+    When a key is wired, the same call yields a keyed ``mh_fp1_`` token, no schema change. The
+    pseudonymizer is untrusted at this boundary: its output is validated against the exact canonical
+    ``mh_fp1_..._batch_...`` grammar (and length bound), and any deviation fails closed with a fixed
+    code so a hostile or buggy implementation can never persist a raw or secret-shaped value.
     """
 
     if pseudonymizer is None:
         return None
-    return pseudonymizer.fingerprint(_RESOURCE_KIND, batch_id)
+    try:
+        token = pseudonymizer.fingerprint(_RESOURCE_KIND, batch_id)
+    except Exception:
+        token = None
+    if (
+        not isinstance(token, str)
+        or len(token) > _MAX_RESOURCE_BYTES
+        or _FINGERPRINT_TOKEN.fullmatch(token) is None
+    ):
+        _fail("MH_STATE_AUDIT", "the audit pseudonym is not a valid keyed token")
+    return token
 
 
 def _validate_count(value: object, subject: str) -> int:
