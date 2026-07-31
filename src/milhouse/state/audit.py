@@ -170,6 +170,59 @@ def record_retention_prune(
     )
 
 
+def record_compaction(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime,
+    old_batch_id: str,
+    new_batch_id: str,
+    old_record_count: int,
+    old_byte_size: int,
+    new_record_count: int,
+    new_byte_size: int,
+) -> None:
+    """Record a mixed-expiry compaction as a linked pair of append-only audit rows.
+
+    The ``_audit`` table carries one resource fingerprint per row, so old→new lineage is expressed
+    as two rows written on the caller's transaction: a ``compacted_from`` row fingerprinting the
+    superseded old segment and a ``compacted_into`` row fingerprinting the new segment. They share
+    ``action="compaction"`` and ``recorded_at``, and their adjacent ids preserve the from→into
+    order. Each batch id is charset-validated and stored ONLY as a SHA-256 fingerprint, never raw.
+    The dropped (expired) record count is the difference of the two ``record_count`` values. Call
+    inside the same transaction as the ledger swap so the lineage and the state commit or roll back
+    together.
+    """
+
+    _validate_resource(old_batch_id)
+    _validate_resource(new_batch_id)
+    _validate_count(old_record_count, "record count")
+    _validate_count(old_byte_size, "byte size")
+    _validate_count(new_record_count, "record count")
+    _validate_count(new_byte_size, "byte size")
+    _insert_audit(
+        connection,
+        now=now,
+        action="compaction",
+        actor="maintenance",
+        outcome="compacted_from",
+        reason="mixed_expiry",
+        resource=_resource_fingerprint(old_batch_id),
+        record_count=old_record_count,
+        byte_size=old_byte_size,
+    )
+    _insert_audit(
+        connection,
+        now=now,
+        action="compaction",
+        actor="maintenance",
+        outcome="compacted_into",
+        reason="mixed_expiry",
+        resource=_resource_fingerprint(new_batch_id),
+        record_count=new_record_count,
+        byte_size=new_byte_size,
+    )
+
+
 def _row_to_audit(row: Sequence[Any]) -> AuditRecord:
     return AuditRecord(
         id=int(row[0]),
