@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from milhouse.state.audit import AuditRecord, list_audit, record_retention_prune
+from milhouse.state.audit import (
+    AuditRecord,
+    list_audit,
+    record_compaction,
+    record_retention_prune,
+)
 from milhouse.state.barrier import GlobalCommitBarrier
 from milhouse.state.cursors import SourceCursor, advance_cursor, read_cursor
 from milhouse.state.database import ControlDatabase, open_control_database
@@ -41,6 +46,7 @@ __all__ = [
     "open_control_database",
     "read_checkpoint",
     "read_cursor",
+    "record_compaction",
     "record_retention_prune",
     "release_lease",
     "renew_lease",

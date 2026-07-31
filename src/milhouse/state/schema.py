@@ -176,6 +176,21 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE _cursors_new RENAME TO _cursors",
         ),
     ),
+    Migration(
+        8,
+        "redact_unkeyed_audit_resource",
+        (
+            # Privacy fix (plan section 4.7): a persisted identifier derivative must be a keyed
+            # installation-local HMAC pseudonym, never a public unsalted hash — a plain SHA-256 of a
+            # low-entropy batch id is dictionary-recoverable and correlates across installations.
+            # Slice 5b's retention audit stored such plain digests in resource. The keyed pseudonym
+            # key is created by `init` (W06), not yet wired into the control plane, so the audit
+            # writers now OMIT the derivative (store NULL) until keying is available. This clears
+            # any already-written unsalted resource so no reversible id survives the upgrade;
+            # keyed tokens written later carry an mh_fp1_ prefix and are never produced before this.
+            "UPDATE _audit SET resource = NULL WHERE resource IS NOT NULL",
+        ),
+    ),
 )
 
 

@@ -103,6 +103,7 @@ test-coverage:
 		--critical 'src/milhouse/state/migrations.py' \
 		--critical 'src/milhouse/state/schema.py' \
 		--critical 'src/milhouse/spooling/commit.py' \
+		--critical 'src/milhouse/spooling/compaction.py' \
 		--critical 'src/milhouse/spooling/errors.py' \
 		--critical 'src/milhouse/spooling/exporter.py' \
 		--critical 'src/milhouse/spooling/ledger.py' \

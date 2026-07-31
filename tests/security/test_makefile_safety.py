@@ -40,6 +40,7 @@ CRITICAL_COVERAGE_FILES = {
     "src/milhouse/state/migrations.py",
     "src/milhouse/state/schema.py",
     "src/milhouse/spooling/commit.py",
+    "src/milhouse/spooling/compaction.py",
     "src/milhouse/spooling/errors.py",
     "src/milhouse/spooling/exporter.py",
     "src/milhouse/spooling/ledger.py",

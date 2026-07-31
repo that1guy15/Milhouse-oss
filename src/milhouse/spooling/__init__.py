@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from milhouse.spooling.commit import DurableSpool
+from milhouse.spooling.compaction import (
+    CompactedSegment,
+    CompactionResult,
+    SkippedSegment,
+    compact_apply,
+)
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.exporter import Exporter, ExporterAttempt, deliver_segment
 from milhouse.spooling.ledger import ExporterDelivery, SegmentRecord
@@ -43,6 +49,8 @@ from milhouse.spooling.writer import (
 )
 
 __all__ = [
+    "CompactedSegment",
+    "CompactionResult",
     "DurableSpool",
     "Exporter",
     "ExporterAttempt",
@@ -60,11 +68,13 @@ __all__ = [
     "SegmentRecord",
     "SegmentRetention",
     "SegmentVerification",
+    "SkippedSegment",
     "SpoolError",
     "SpoolFrameV1",
     "SpoolReconciler",
     "VerifyReport",
     "build_segment_bytes",
+    "compact_apply",
     "deliver_segment",
     "parse_segment_bytes",
     "publish_segment_bytes",
