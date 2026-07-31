@@ -26,9 +26,24 @@ from milhouse.state import (
     initialize_control_state,
     list_audit,
     open_control_database,
+    record_compaction,
     record_retention_prune,
     schema_version,
 )
+
+
+class _HostilePseudonymizer:
+    """A pseudonymizer whose fingerprint() returns caller-controlled output (untrusted at the audit
+    boundary), used to prove the boundary validates the token grammar before persisting."""
+
+    def __init__(self, output: object) -> None:
+        self._output = output
+
+    def fingerprint(self, kind: str, value: str) -> object:
+        if isinstance(self._output, BaseException):
+            raise self._output
+        return self._output
+
 
 _KEY_A = b"\xa1" * 32
 _KEY_B = b"\xb2" * 32
@@ -419,5 +434,95 @@ def test_a_write_against_a_broken_store_normalizes_to_a_stable_code(tmp_path: Pa
         assert captured.value.code == "MH_STATE_AUDIT"
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
+    finally:
+        database.close()
+
+
+_HOSTILE_TOKENS = [
+    "AKIAIOSFODNN7EXAMPLE",  # a secret-shaped canary — not a keyed token
+    "mh_fp1_e1_batch_" + "!" * 52,  # right prefix, invalid base32 body
+    "mh_fp1_e1_secret_" + "a" * 52,  # wrong kind
+    "mh_ps1_e1_batch_" + "a" * 52,  # a pseudonym, not a fingerprint
+    "mh_fp1_e1_batch_" + "a" * 200,  # overlong
+    "",  # empty
+]
+
+
+@pytest.mark.parametrize("bad", _HOSTILE_TOKENS)
+def test_a_hostile_pseudonymizer_output_is_rejected_and_nothing_is_persisted(
+    tmp_path: Path, bad: str
+) -> None:
+    # PR #72 review: the pseudonymizer is untrusted at the audit boundary. Output that is not the
+    # exact canonical keyed-token grammar fails closed with a fixed code and persists nothing.
+    database = _database(tmp_path)
+    try:
+        with pytest.raises(StateError) as captured:
+            _prune(
+                database,
+                now=_NOW,
+                batch_id="batch-1",
+                record_count=1,
+                byte_size=1,
+                undelivered=False,
+                pseudonymizer=_HostilePseudonymizer(bad),  # type: ignore[arg-type]
+            )
+        assert captured.value.code == "MH_STATE_AUDIT"
+        assert list_audit(database) == ()  # nothing persisted at all
+        if bad:  # (the empty token is vacuously a substring of everything)
+            assert bad.encode("utf-8") not in _audit_bytes(database)
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("output", [None, RuntimeError("boom")])
+def test_a_pseudonymizer_that_misbehaves_is_contained(tmp_path: Path, output: object) -> None:
+    # A pseudonymizer that returns a non-string or raises is contained: fixed code, nothing stored.
+    database = _database(tmp_path)
+    try:
+        with pytest.raises(StateError) as captured:
+            _prune(
+                database,
+                now=_NOW,
+                batch_id="batch-1",
+                record_count=1,
+                byte_size=1,
+                undelivered=False,
+                pseudonymizer=_HostilePseudonymizer(output),  # type: ignore[arg-type]
+            )
+        assert captured.value.code == "MH_STATE_AUDIT"
+        assert list_audit(database) == ()
+    finally:
+        database.close()
+
+
+def test_record_compaction_with_a_key_stores_keyed_lineage_for_both_segments(
+    tmp_path: Path,
+) -> None:
+    # PR #72 review: when a keyed pseudonymizer is supplied, compaction records an attributable
+    # old->new lineage as two keyed identifiers — never a raw id or a public SHA-256.
+    database = _database(tmp_path)
+    try:
+        pseudonymizer = Pseudonymizer(_KEY_A)
+        old_id, new_id = "batch-old", "c" + "0" * 64
+        with database.transaction() as connection:
+            record_compaction(
+                connection,
+                now=_NOW,
+                old_batch_id=old_id,
+                new_batch_id=new_id,
+                old_record_count=2,
+                old_byte_size=200,
+                new_record_count=1,
+                new_byte_size=100,
+                pseudonymizer=pseudonymizer,
+            )
+        rows = list_audit(database, action="compaction")
+        assert [r.outcome for r in rows] == ["compacted_from", "compacted_into"]
+        assert rows[0].resource == pseudonymizer.fingerprint("batch", old_id)
+        assert rows[1].resource == pseudonymizer.fingerprint("batch", new_id)
+        assert all(r.resource is not None and r.resource.startswith("mh_fp1_") for r in rows)
+        blob = _audit_bytes(database)
+        assert old_id.encode("utf-8") not in blob and new_id.encode("utf-8") not in blob
+        assert _fp(old_id).encode("utf-8") not in blob and _fp(new_id).encode("utf-8") not in blob
     finally:
         database.close()

@@ -45,7 +45,7 @@ from milhouse.domain.identity import ScopeV1
 from milhouse.domain.records import PrivacyClassV1
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
-    ORIGIN_COMMITTED,
+    ORIGIN_RECONCILED,
     ExporterDelivery,
     SegmentRecord,
     insert_segment_row,
@@ -70,12 +70,15 @@ from milhouse.state.errors import StateError
 _PENDING = "pending"
 _SPOOL = "spool"
 _BARRIER_NAME = "commit.lock"
-_EXISTS_CODE = "MH_SPOOL_EXISTS"
 _DELIVERED = "delivered"
 
 # The compacted segment's batch id is this prefix plus the SHA-256 hex of the surviving records'
-# ordered ids, so it is deterministic (re-runs are idempotent) and cannot collide with a batch id.
+# ordered ids (and, for a collision probe, a salt), so it is deterministic (re-runs are idempotent).
 _COMPACTED_PREFIX = "c"
+# Batch ids are caller-chosen, so a derived successor id can be occupied by an unrelated segment.
+# When it is, compaction probes this many deterministic alternatives before reporting a collision,
+# so a mixed-expiry segment's expired frames are never silently stranded past its privacy deadline.
+_MAX_PROBE = 1024
 
 STATUS_LIVE = "live"
 STATUS_FULLY_EXPIRED = "fully_expired"
@@ -84,6 +87,7 @@ STATUS_DISAGREEING = "disagreeing"
 STATUS_VERIFY_FAILED = "verify_failed"
 STATUS_PUBLISH_FAILED = "publish_failed"
 STATUS_COMMIT_FAILED = "commit_failed"
+STATUS_COLLISION = "collision_bound"
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -189,11 +193,15 @@ def _validate_barrier(database: ControlDatabase, barrier: object) -> None:
         _fail("MH_SPOOL_COMPACTION", "the barrier must be the control-plane commit lock")
 
 
-def _derive_batch_id(live_frames: list[SpoolFrameV1]) -> str:
+def _derive_batch_id(live_frames: list[SpoolFrameV1], probe: int = 0) -> str:
     # Deterministic in the surviving records' ids (independent of the old batch id and of which
     # frames expired), so re-compacting the same survivors yields the same new segment identity —
-    # the property that makes an interrupted pass converge idempotently.
+    # the property that makes an interrupted pass converge idempotently. ``probe`` salts the id so
+    # that, when the primary candidate is occupied by an unrelated segment, compaction can walk a
+    # deterministic sequence of alternatives; probe 0 (the common case) is unsalted and unchanged.
     material = "\n".join(str(frame.record.record_id) for frame in live_frames)
+    if probe:
+        material = f"{material}\n#{probe}"
     return _COMPACTED_PREFIX + hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -204,8 +212,12 @@ def _build_new_segment(
 
     The new segment inherits every immutable policy field and the per-exporter delivery status of
     the old segment (its live records already had that state), and re-stamps the frames with the
-    new batch id and contiguous sequences. ``committed_at`` is the day-start stamp reconciliation
-    would assign a re-registered orphan, so a crash-re-registered new row is byte-identical here.
+    new batch id and contiguous sequences. The exact commit instant of the compacted subset is not
+    the old segment's, and it must stay within the records' own ``day`` (a later compaction day
+    cannot be the ``committed_at`` prefix), so ``committed_at`` is the reconstructed day-start stamp
+    and ``origin`` is ``reconciled`` — the ledger's truthful marker for a reconstructed instant, and
+    the value reconciliation assigns a re-registered orphan, so a crash-re-registered new row is
+    byte-identical here.
     """
 
     new_frames = [
@@ -244,7 +256,7 @@ def _build_new_segment(
         byte_size=len(content),
         file_sha256=hashlib.sha256(content).hexdigest(),
         committed_at=f"{record.day}T00:00:00.000Z",
-        origin=ORIGIN_COMMITTED,
+        origin=ORIGIN_RECONCILED,
         exporters=tuple(ExporterDelivery(eid, status_by_id[eid]) for eid in exporter_ids),
     )
     return new_record, content
@@ -355,6 +367,47 @@ def _swap_ledger(
     return not failed
 
 
+def _resolve_successor(
+    database: ControlDatabase,
+    root: Path,
+    installation_id: str,
+    record: SegmentRecord,
+    live_frames: list[SpoolFrameV1],
+) -> tuple[str, SegmentRecord, bytes, bool, bool] | None:
+    """Probe deterministic candidate ids for a usable successor slot.
+
+    Returns ``(batch_id, new_record, content, needs_publish, insert_new)`` for the first candidate
+    that is free (publish a new file and insert a row), already holds this compaction's intended
+    successor as a committed row (reuse it — crash recovery), or holds it as an unrecorded orphan
+    file (adopt it — insert the row). A candidate occupied by a FOREIGN committed row or a
+    foreign/unreadable orphan file advances the probe, so a colliding id can never strand a
+    mixed-expiry segment's expired frames past their privacy deadline. Returns ``None`` if every
+    candidate up to ``_MAX_PROBE`` is foreign-occupied (the caller reports it; never silent).
+    """
+
+    for probe in range(_MAX_PROBE):
+        candidate = _derive_batch_id(live_frames, probe)
+        new_record, content = _build_new_segment(record, live_frames, candidate)
+        existing = read_segment_record(database, candidate)
+        if existing is not None:
+            if _is_intended_successor(existing, new_record):
+                return candidate, new_record, content, False, False  # reuse committed successor
+            continue  # a foreign committed row occupies this id — try the next candidate
+        candidate_path = root / _PENDING / record.day / f"{candidate}.jsonl"
+        if not os.path.lexists(candidate_path):
+            return candidate, new_record, content, True, True  # free slot — publish and insert
+        # A name exists with no ledger row (a crash orphan or a foreign file). Adopt it only if it
+        # is exactly this compaction's intended successor; otherwise walk to the next candidate.
+        try:
+            parsed = read_trusted_segment(candidate_path, installation_id=installation_id)
+        except SpoolError:
+            continue  # unreadable/foreign orphan — next candidate
+        if _agrees(parsed, new_record.day, candidate, new_record):
+            return candidate, new_record, content, False, True  # our orphan — adopt (insert row)
+        continue  # a foreign orphan file occupies this id — next candidate
+    return None
+
+
 def _compact_one(
     database: ControlDatabase,
     root: Path,
@@ -385,36 +438,29 @@ def _compact_one(
             STATUS_FULLY_EXPIRED, None
         )  # all expired — retention prunes it, not compaction
 
-    new_batch_id = _derive_batch_id(live_frames)
+    # Resolve a usable successor id, probing past any foreign occupant of the derived id so a
+    # collision can never strand the expired frames. A build failure leaves the old segment intact.
     try:
-        new_record, content = _build_new_segment(record, live_frames, new_batch_id)
+        resolved = _resolve_successor(database, root, installation_id, record, live_frames)
     except SpoolError as error:
-        return _skip(
-            STATUS_VERIFY_FAILED, error.code
-        )  # could not build the new segment; old intact
+        return _skip(STATUS_VERIFY_FAILED, error.code)
+    if resolved is None:
+        return _skip(STATUS_COLLISION, "MH_SPOOL_COMPACTION")  # every candidate foreign-occupied
+    new_batch_id, new_record, content, needs_publish, insert_new = resolved
     new_path = root / _PENDING / record.day / f"{new_batch_id}.jsonl"
 
-    existing = read_segment_record(database, new_batch_id)
-    if existing is None:
+    if needs_publish:
+        # The resolver only returns needs_publish for a slot with no name present, so publication
+        # onto that free slot under the exclusive hold cannot collide; any failure (including a
+        # surprise existing name) leaves the old segment fully intact.
         try:
             publish_segment_bytes(new_path, content)
         except SpoolError as error:
-            # A leftover orphan file from a prior interrupted pass is adopted (verified below); any
-            # other publish failure leaves the old segment fully intact.
-            if error.code != _EXISTS_CODE:
-                return _skip(STATUS_PUBLISH_FAILED, error.code)
-        insert_new = True
-    elif _is_intended_successor(existing, new_record):
-        insert_new = False
-    else:
-        # The derived id is occupied by a row that is NOT this compaction's intended successor (a
-        # foreign or colliding segment). Retiring the old segment against it would lose the live
-        # records, so refuse and leave the old segment fully intact.
-        return _skip(STATUS_VERIFY_FAILED, "MH_SPOOL_VERIFY")
+            return _skip(STATUS_PUBLISH_FAILED, error.code)
 
     # Verify the on-disk file agrees with the INTENDED successor (``new_record``) — never with a
     # pre-existing row — BEFORE the old segment is retired, so a foreign or corrupt file at the
-    # derived name can never cause the live data to be lost.
+    # chosen name can never cause the live data to be lost.
     try:
         parsed_new = read_trusted_segment(new_path, installation_id=installation_id)
     except SpoolError as error:
