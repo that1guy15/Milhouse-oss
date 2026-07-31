@@ -187,6 +187,15 @@ def _record_ids(spool_root: Path, batch_id: str) -> list[str]:
     return [str(frame.record.record_id) for frame in parsed.frames]
 
 
+def _audit_bytes(database) -> bytes:
+    return b"".join(
+        bytes(str(cell), "utf-8")
+        for row in database.connection.execute("SELECT * FROM _audit").fetchall()
+        for cell in row
+        if cell is not None
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # Guards
 # --------------------------------------------------------------------------------------------------
@@ -431,9 +440,11 @@ def test_records_old_to_new_lineage_in_the_audit_trail(tmp_path: Path) -> None:
         audit = list_audit(database, action="compaction")
         assert [row.outcome for row in audit] == ["compacted_from", "compacted_into"]
         assert all(row.actor == "maintenance" and row.reason == "mixed_expiry" for row in audit)
-        # Each id is stored only as a fingerprint, never raw.
-        assert audit[0].resource == hashlib.sha256(b"batch-a").hexdigest()
-        assert audit[1].resource == hashlib.sha256(new_batch_id.encode("utf-8")).hexdigest()
+        # No keyed pseudonymizer is wired, so the identifier derivative is omitted (never a raw id
+        # or public SHA-256); the lineage is still an ordered from->into pair with reclaim counts.
+        assert audit[0].resource is None
+        assert audit[1].resource is None
+        assert new_batch_id.encode("utf-8") not in _audit_bytes(database)
         assert audit[0].record_count == 2  # old total
         assert audit[1].record_count == 1  # retained
     finally:
@@ -704,5 +715,151 @@ def test_multiple_segments_compact_independently(tmp_path: Path) -> None:
         assert {s.status for s in result.skipped} == {"live", "fully_expired"}
         rows = _segment_rows(database)
         assert "batch-live" in rows and "batch-expired" in rows and "batch-mixed" not in rows
+    finally:
+        database.close()
+
+
+# --------------------------------------------------------------------------------------------------
+# PR #69 review remediations
+# --------------------------------------------------------------------------------------------------
+
+
+def _recreate_audit_table(database) -> None:
+    from milhouse.state.schema import CONTROL_MIGRATIONS
+
+    create_sql = next(
+        stmt
+        for migration in CONTROL_MIGRATIONS
+        if migration.name == "create_audit"
+        for stmt in migration.statements
+        if "_audit" in stmt and stmt.strip().upper().startswith("CREATE TABLE")
+    )
+    with database.transaction() as connection:
+        connection.execute(create_sql)
+
+
+def _exporter_states(database, batch_id: str) -> dict[str, str]:
+    return dict(
+        database.connection.execute(
+            "SELECT exporter_id, delivery_status FROM _segment_exporters WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchall()
+    )
+
+
+def test_a_foreign_segment_at_the_derived_id_is_refused_and_the_old_survives(
+    tmp_path: Path,
+) -> None:
+    # P1 (review): the derived successor id is predictable and the batch id space is caller-chosen,
+    # so an UNRELATED committed segment can occupy it. Compaction must not retire the mixed segment
+    # (and lose its live record) against that foreign segment.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _record, frames = _commit(
+            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
+        )
+        live_record_id = str(frames[1].record.record_id)
+        derived = compaction_module._derive_batch_id([frames[1]])
+        # An unrelated committed segment occupies the derived id (different content).
+        _commit(store, derived, [("foreign-live", _LIVE_AT)])
+
+        result = _compact(database, barrier, spool_root)
+
+        assert result.compacted == ()  # nothing was rewritten
+        assert ("batch-a", "verify_failed") in [(s.batch_id, s.status) for s in result.skipped]
+        # The mixed segment, its file, and its live record are all untouched...
+        assert "batch-a" in _segment_rows(database)
+        assert _segment_file(spool_root, "batch-a").exists()
+        assert live_record_id in _record_ids(spool_root, "batch-a")
+        # ...and the foreign segment is untouched too.
+        assert derived in _segment_rows(database)
+        assert _record_ids(spool_root, derived) != [live_record_id]
+    finally:
+        database.close()
+
+
+def test_a_crash_after_publish_restores_mixed_exporter_states(tmp_path: Path) -> None:
+    # P1 (review): a crash after successor publication and before the swap leaves an orphan that
+    # reconciliation re-registers with every exporter pending. The retry must restore the old
+    # segment's terminal/retryable states, never leave a delivered record regressed to pending.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(
+            store,
+            "batch-a",
+            [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)],
+            exporters=("alpha", "beta", "gamma"),
+        )
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE _segment_exporters SET delivery_status = 'delivered' "
+                "WHERE batch_id = 'batch-a' AND exporter_id = 'alpha'"
+            )
+            connection.execute(
+                "UPDATE _segment_exporters SET delivery_status = 'failed' "
+                "WHERE batch_id = 'batch-a' AND exporter_id = 'gamma'"
+            )  # beta stays pending — a genuinely mixed exporter state
+
+        # Crash after publication, before the swap commits (drop _audit so record_compaction fails).
+        with database.transaction() as connection:
+            connection.execute("DROP TABLE _audit")
+        first = _compact(database, barrier, spool_root)
+        assert first.compacted == ()  # swap rolled back; the successor is an unrecorded orphan
+        assert _segment_rows(database) == {"batch-a"}  # old fully intact
+
+        # Real reconciliation re-registers the orphan successor (with every exporter pending).
+        _recreate_audit_table(database)
+        _reconcile(database, barrier, spool_root)
+
+        # The retry adopts the successor and restores the old segment's exporter states exactly.
+        second = _compact(database, barrier, spool_root)
+        new_batch_id = second.compacted[0].new_batch_id
+        assert _exporter_states(database, new_batch_id) == {
+            "alpha": "delivered",
+            "beta": "pending",
+            "gamma": "failed",
+        }
+    finally:
+        database.close()
+
+
+def test_a_delivered_successor_is_never_regressed_by_a_reregistered_old(tmp_path: Path) -> None:
+    # P1 (review), the other direction: after a successful swap whose old-file unlink was
+    # interrupted, reconciliation re-registers the OLD file with exporters pending. The retry must
+    # retire that stale old without regressing the already-delivered successor to pending.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        record, frames = _commit(
+            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
+        )
+        deliver_segment(
+            database, barrier, record, frames, {"clickhouse": _FakeExporter("clickhouse")}, now=_NOW
+        )
+
+        import milhouse.spooling.compaction as module
+
+        original_remove = module.remove_regular_file_no_follow
+
+        def failing_remove(*args: object, **kwargs: object) -> None:
+            raise SecureFileError(SecureFileErrorKind.WRITE_FAILED)
+
+        module.remove_regular_file_no_follow = failing_remove  # type: ignore[assignment]
+        try:
+            first = _compact(database, barrier, spool_root)
+        finally:
+            module.remove_regular_file_no_follow = original_remove  # type: ignore[assignment]
+        new_batch_id = first.compacted[0].new_batch_id
+        assert first.compacted[0].file_outcome == "orphaned"
+        assert _exporter_states(database, new_batch_id) == {"clickhouse": "delivered"}
+
+        # Reconciliation re-registers the orphaned OLD file (with the exporter pending).
+        _reconcile(database, barrier, spool_root)
+        assert _exporter_states(database, "batch-a") == {"clickhouse": "pending"}
+
+        # The retry retires the stale old and must NOT regress the delivered successor.
+        second = _compact(database, barrier, spool_root)
+        assert [c.old_batch_id for c in second.compacted] == ["batch-a"]
+        assert _segment_rows(database) == {new_batch_id}
+        assert _exporter_states(database, new_batch_id) == {"clickhouse": "delivered"}
     finally:
         database.close()

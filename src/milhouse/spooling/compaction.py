@@ -71,6 +71,7 @@ _PENDING = "pending"
 _SPOOL = "spool"
 _BARRIER_NAME = "commit.lock"
 _EXISTS_CODE = "MH_SPOOL_EXISTS"
+_DELIVERED = "delivered"
 
 # The compacted segment's batch id is this prefix plus the SHA-256 hex of the surviving records'
 # ordered ids, so it is deterministic (re-runs are idempotent) and cannot collide with a batch id.
@@ -261,6 +262,37 @@ def _remove_old_file(path: Path) -> str:
     return FILE_REMOVED
 
 
+def _is_intended_successor(existing: SegmentRecord, intended: SegmentRecord) -> bool:
+    """Whether an existing row at the derived id is EXACTLY the successor this compaction intends.
+
+    A committed segment's ``batch_id`` is caller-chosen, so the deterministic derived id could be
+    occupied by an unrelated segment (no cryptographic collision needed). Reusing such a row would
+    retire the mixed segment against foreign data and lose the live records, so an existing row is
+    reusable only if every file-attestable identity field — including both digests — and the
+    exporter id set equal the intended successor's. ``origin`` (a crash-re-registered orphan is
+    ``reconciled``) and the per-exporter delivery statuses are deliberately excluded: the former is
+    not identity, and the latter are restored to the intended states during the swap.
+    """
+
+    return (
+        existing.batch_id == intended.batch_id
+        and existing.day == intended.day
+        and existing.schema_version == intended.schema_version
+        and existing.frame_version == intended.frame_version
+        and existing.config_generation == intended.config_generation
+        and existing.scope == intended.scope
+        and existing.target_id == intended.target_id
+        and existing.privacy_class == intended.privacy_class
+        and existing.retention_days == intended.retention_days
+        and existing.record_count == intended.record_count
+        and existing.content_sha256 == intended.content_sha256
+        and existing.byte_size == intended.byte_size
+        and existing.file_sha256 == intended.file_sha256
+        and {e.exporter_id for e in existing.exporters}
+        == {e.exporter_id for e in intended.exporters}
+    )
+
+
 def _swap_ledger(
     database: ControlDatabase,
     old_record: SegmentRecord,
@@ -269,12 +301,18 @@ def _swap_ledger(
     now: datetime,
     insert_new: bool,
 ) -> bool:
-    """Atomically publish the new row (if needed), re-point cursors, delete the old row, and audit.
+    """Atomically publish/restore the successor, re-point cursors, delete the old row, and audit.
 
     Returns whether the transaction committed. Cursors are RE-POINTED to the new segment (not
     detached), since the live records they checkpoint survive in it; the new row is inserted before
     the re-point so the ``_cursors`` foreign key is satisfied, and the old row is deleted only after
     no cursor references it.
+
+    When the successor row already exists (a crash-re-registered orphan is registered with every
+    exporter ``pending``), its per-exporter delivery states are restored to the intended states
+    inherited from the old segment — but only for rows not already ``delivered``, so a successor
+    a prior pass already confirmed delivered is never regressed to pending (which would re-expose an
+    acknowledged record to duplicate external delivery).
     """
 
     failed = False
@@ -282,6 +320,18 @@ def _swap_ledger(
         with database.transaction() as connection:
             if insert_new:
                 insert_segment_row(connection, new_record)
+            else:
+                for exporter in new_record.exporters:
+                    connection.execute(
+                        "UPDATE _segment_exporters SET delivery_status = ? "
+                        "WHERE batch_id = ? AND exporter_id = ? AND delivery_status != ?",
+                        (
+                            exporter.delivery_status,
+                            new_record.batch_id,
+                            exporter.exporter_id,
+                            _DELIVERED,
+                        ),
+                    )
             connection.execute(
                 "UPDATE _cursors SET batch_id = ? WHERE batch_id = ?",
                 (new_record.batch_id, old_record.batch_id),
@@ -353,19 +403,23 @@ def _compact_one(
             # other publish failure leaves the old segment fully intact.
             if error.code != _EXISTS_CODE:
                 return _skip(STATUS_PUBLISH_FAILED, error.code)
-        reference = new_record
         insert_new = True
-    else:
-        reference = existing
+    elif _is_intended_successor(existing, new_record):
         insert_new = False
+    else:
+        # The derived id is occupied by a row that is NOT this compaction's intended successor (a
+        # foreign or colliding segment). Retiring the old segment against it would lose the live
+        # records, so refuse and leave the old segment fully intact.
+        return _skip(STATUS_VERIFY_FAILED, "MH_SPOOL_VERIFY")
 
-    # Verify the on-disk new segment reads back and agrees with its authoritative row BEFORE the old
-    # segment is retired, so a corrupt or foreign file at the new name can never lose the live data.
+    # Verify the on-disk file agrees with the INTENDED successor (``new_record``) — never with a
+    # pre-existing row — BEFORE the old segment is retired, so a foreign or corrupt file at the
+    # derived name can never cause the live data to be lost.
     try:
         parsed_new = read_trusted_segment(new_path, installation_id=installation_id)
     except SpoolError as error:
         return _skip(STATUS_VERIFY_FAILED, error.code)
-    if not _agrees(parsed_new, reference.day, new_batch_id, reference):
+    if not _agrees(parsed_new, new_record.day, new_batch_id, new_record):
         return _skip(STATUS_VERIFY_FAILED, "MH_SPOOL_VERIFY")
 
     if not _swap_ledger(database, record, new_record, now=now, insert_new=insert_new):

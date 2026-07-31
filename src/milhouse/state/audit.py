@@ -2,36 +2,40 @@
 
 Every deliberate maintenance mutation — retention pruning, compaction, purge, restore — records one
 append-only row in ``_audit`` describing what happened in privacy-safe terms: a fixed action code, a
-fixed actor class, a fixed outcome and reason code, an opaque resource FINGERPRINT, and safe counts.
-An audit row never carries the acted-on raw payload, a secret, a path, a URL, or free text (plan
-section 4.6 ``audit``, ADR 0007).
+fixed actor class, a fixed outcome and reason code, an optional KEYED resource pseudonym, and safe
+counts. An audit row never carries the acted-on raw payload, a secret, a path, a URL, or free text
+(plan section 4.6 ``audit``, ADR 0007).
 
 The public surface is a set of **purpose-specific constructors** (e.g.
 :func:`record_retention_prune`) rather than a free-text sink: each constructor fixes its own
 action/actor/outcome/reason codes as constants, so a caller cannot inject arbitrary text into those
-fields. The one caller-supplied value — the resource id — is charset-validated AND then stored only
-as a SHA-256 fingerprint, so the resource column is structurally incapable of holding a raw string:
-the charset guard alone is not a secrecy proof (a *legal* opaque id can still be secret-shaped, e.g.
-an access key), so fingerprinting is what guarantees no path, email, URL, prompt, secret, or raw
-payload is ever persisted. Recording is transaction-scoped: the caller writes the row on the SAME
-open connection, in the SAME transaction as the mutation it attests, so the trail and the state
-commit or roll back together. Every fault normalizes to a fixed ``MH_STATE_AUDIT`` code raised
-outside the handler.
+fields. The one caller-supplied identifier — a batch id — is charset-validated and, per plan section
+4.7, may be persisted ONLY as an installation-keyed HMAC pseudonym, never as a public unsalted hash
+(a plain SHA-256 of a low-entropy id is dictionary-recoverable and correlates across installations).
+The pseudonym key is created by ``init`` (W06) and is not yet wired into the control plane, so when
+no :class:`~milhouse.privacy.pseudonym.Pseudonymizer` is supplied the identifier derivative is
+OMITTED (the resource is ``NULL``) rather than stored reversibly — exactly as ``spooling/reconcile``
+already does. Recording is transaction-scoped: the caller writes the row on the SAME open
+connection, in the SAME transaction as the mutation it attests, so the trail and the state commit or
+roll back together. Every fault normalizes to a fixed ``MH_STATE_AUDIT`` code raised outside the
+handler.
 """
 
 from __future__ import annotations
 
-import hashlib
 import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from milhouse.core.clock import TimeError, format_timestamp
 from milhouse.state.database import ControlDatabase
 from milhouse.state.errors import StateError
+
+if TYPE_CHECKING:
+    from milhouse.privacy.pseudonym import Pseudonymizer
 
 _AUDIT_TABLE = "_audit"
 _MAX_COUNT = 2**63 - 1  # the largest value SQLite's signed 64-bit INTEGER can store
@@ -68,17 +72,22 @@ def _validate_resource(value: object) -> str:
     return value
 
 
-def _resource_fingerprint(value: str) -> str:
-    """Return a stable SHA-256 hex fingerprint of ``value`` for storage in the audit resource.
+_RESOURCE_KIND = "batch"
 
-    The charset guard rejects a path/URL/email/multiline, but a *legal* opaque id can still be a
-    secret-shaped string (an access key like ``AKIAIOSFODNN7EXAMPLE`` is a valid batch-id shape), so
-    the audit trail never stores the caller's raw string — only this fixed-width fingerprint. The
-    stored value is thus structurally incapable of carrying a raw secret, path, or payload, while an
-    operator who holds the real id can still correlate by re-fingerprinting it.
+
+def _keyed_resource(pseudonymizer: Pseudonymizer | None, batch_id: str) -> str | None:
+    """Return the keyed HMAC pseudonym of ``batch_id``, or ``None`` when no key is wired.
+
+    Plan section 4.7 requires a persisted identifier derivative to be a keyed installation-local
+    HMAC pseudonym, never a public unsalted hash. The pseudonym key is created by ``init`` (W06) and
+    is not yet wired into the control plane, so when no pseudonymizer is supplied the derivative is
+    OMITTED rather than persisted as a reversible hash — the precedent ``spooling/reconcile`` sets.
+    When a key is wired, the same call yields a keyed ``mh_fp1_`` token, no schema change.
     """
 
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    if pseudonymizer is None:
+        return None
+    return pseudonymizer.fingerprint(_RESOURCE_KIND, batch_id)
 
 
 def _validate_count(value: object, subject: str) -> int:
@@ -96,7 +105,7 @@ def _insert_audit(
     action: str,
     actor: str,
     outcome: str,
-    resource: str,
+    resource: str | None,
     reason: str,
     record_count: int,
     byte_size: int,
@@ -104,7 +113,7 @@ def _insert_audit(
     """Insert one audit row. Internal: only the typed constructors call it, with fixed codes.
 
     ``action``/``actor``/``outcome``/``reason`` are code constants owned by the calling constructor,
-    never caller free text; ``resource`` is the already-fingerprinted id and the counts are its
+    never caller free text; ``resource`` is a keyed pseudonym or ``None`` and the counts are the
     already-validated caller data. Only the timestamp is validated here before the insert; any
     residual backend fault normalizes to the fixed code.
     """
@@ -141,15 +150,16 @@ def record_retention_prune(
     record_count: int,
     byte_size: int,
     undelivered: bool,
+    pseudonymizer: Pseudonymizer | None = None,
 ) -> None:
     """Record that retention pruned one committed segment, on the caller's open transaction.
 
     The action/actor/outcome/reason codes are fixed here, so no free text reaches the audit row. The
-    only caller-supplied value is ``batch_id``: it is charset-validated as an opaque identifier and
-    then stored ONLY as a SHA-256 fingerprint, so the audit trail never persists the caller's raw
-    string even if a legal id is secret-shaped. ``undelivered`` distinguishes the critical case
-    where the segment reached its privacy deadline before it was exported. Call inside the same
-    transaction as the prune so the two commit or roll back together.
+    only caller-supplied identifier is ``batch_id``: it is charset-validated and persisted only as a
+    keyed pseudonym when ``pseudonymizer`` is supplied, and OMITTED (resource ``NULL``) otherwise,
+    so a reversible unsalted hash is never stored (plan section 4.7). ``undelivered`` distinguishes
+    the critical case where the segment reached its privacy deadline before it was exported. Call
+    inside the same transaction as the prune so the two commit or roll back together.
     """
 
     if type(undelivered) is not bool:
@@ -164,7 +174,7 @@ def record_retention_prune(
         actor="maintenance",
         outcome="pruned_undelivered" if undelivered else "pruned",
         reason="expired_undelivered" if undelivered else "expired",
-        resource=_resource_fingerprint(batch_id),
+        resource=_keyed_resource(pseudonymizer, batch_id),
         record_count=record_count,
         byte_size=byte_size,
     )
@@ -180,17 +190,20 @@ def record_compaction(
     old_byte_size: int,
     new_record_count: int,
     new_byte_size: int,
+    pseudonymizer: Pseudonymizer | None = None,
 ) -> None:
     """Record a mixed-expiry compaction as a linked pair of append-only audit rows.
 
-    The ``_audit`` table carries one resource fingerprint per row, so old→new lineage is expressed
-    as two rows written on the caller's transaction: a ``compacted_from`` row fingerprinting the
-    superseded old segment and a ``compacted_into`` row fingerprinting the new segment. They share
-    ``action="compaction"`` and ``recorded_at``, and their adjacent ids preserve the from→into
-    order. Each batch id is charset-validated and stored ONLY as a SHA-256 fingerprint, never raw.
-    The dropped (expired) record count is the difference of the two ``record_count`` values. Call
-    inside the same transaction as the ledger swap so the lineage and the state commit or roll back
-    together.
+    The ``_audit`` table carries one resource per row, so old→new lineage is expressed as two rows
+    written on the caller's transaction: a ``compacted_from`` row for the superseded old segment and
+    a ``compacted_into`` row for the new segment. They share ``action="compaction"`` and
+    ``recorded_at``, and their adjacent ids preserve the from→into order. Each batch id is
+    charset-validated and persisted only as a keyed pseudonym when ``pseudonymizer`` is supplied,
+    OMITTED (resource ``NULL``) otherwise, so a reversible unsalted hash is never stored (plan
+    section 4.7). The dropped (expired) record count is the difference of the two ``record_count``
+    values.
+    Call inside the same transaction as the ledger swap so the lineage and the state commit or roll
+    back together.
     """
 
     _validate_resource(old_batch_id)
@@ -206,7 +219,7 @@ def record_compaction(
         actor="maintenance",
         outcome="compacted_from",
         reason="mixed_expiry",
-        resource=_resource_fingerprint(old_batch_id),
+        resource=_keyed_resource(pseudonymizer, old_batch_id),
         record_count=old_record_count,
         byte_size=old_byte_size,
     )
@@ -217,7 +230,7 @@ def record_compaction(
         actor="maintenance",
         outcome="compacted_into",
         reason="mixed_expiry",
-        resource=_resource_fingerprint(new_batch_id),
+        resource=_keyed_resource(pseudonymizer, new_batch_id),
         record_count=new_record_count,
         byte_size=new_byte_size,
     )

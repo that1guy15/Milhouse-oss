@@ -222,7 +222,7 @@ def test_migration_7_preserves_existing_cursor_rows(tmp_path: Path) -> None:
                 "VALUES ('github', 'page-9', ?, 4, ?)",
                 (batch_id, "2026-07-28T12:00:00.000Z"),
             )
-        migrate(database, CONTROL_MIGRATIONS, barrier=barrier, applied_at=_NOW)  # apply migration 7
+        migrate(database, CONTROL_MIGRATIONS[:7], barrier=barrier, applied_at=_NOW)  # apply mig 7
         assert schema_version(database) == 7
         row = database.connection.execute(
             "SELECT source, position, batch_id, revision FROM _cursors WHERE source = 'github'"

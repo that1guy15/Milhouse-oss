@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from milhouse.privacy.pseudonym import Pseudonymizer
 from milhouse.state import (
     AuditRecord,
     GlobalCommitBarrier,
@@ -28,6 +29,9 @@ from milhouse.state import (
     record_retention_prune,
     schema_version,
 )
+
+_KEY_A = b"\xa1" * 32
+_KEY_B = b"\xb2" * 32
 
 _NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
 _STAMP = "2026-07-28T12:00:00.000Z"
@@ -43,7 +47,8 @@ _RAW_CANARIES = [
 ]
 
 # Secret-shaped strings that are ALSO legal opaque-id charset (so the charset guard cannot reject
-# them): these must be accepted but stored ONLY as a fingerprint, never raw (D05 re-review).
+# them). With no keyed pseudonymizer the identifier derivative is OMITTED, so neither the raw value
+# nor its plain SHA-256 is ever persisted (PR #69 review: no public unsalted hash).
 _CREDENTIAL_CANARIES = [
     "AKIAIOSFODNN7EXAMPLE",  # AWS access key id — all alphanumeric, a valid batch-id shape
     "AKIAIOSFODNN7EXAMPLEQQ",  # a longer access-key variant
@@ -83,7 +88,7 @@ def _audit_bytes(database) -> bytes:
 def test_the_migration_creates_the_audit_table(tmp_path: Path) -> None:
     database = _database(tmp_path)
     try:
-        assert schema_version(database) == 7
+        assert schema_version(database) == 8
         tables = {
             row[0]
             for row in database.connection.execute(
@@ -108,7 +113,7 @@ def test_records_a_delivered_prune_with_fixed_codes(tmp_path: Path) -> None:
                 action="retention_prune",
                 actor="maintenance",
                 outcome="pruned",
-                resource=_fp("batch-1"),
+                resource=None,  # no keyed pseudonymizer wired → identifier omitted
                 reason="expired",
                 record_count=3,
                 byte_size=128,
@@ -151,19 +156,87 @@ def test_a_raw_canary_resource_is_rejected_before_any_write(tmp_path: Path, cana
 
 
 @pytest.mark.parametrize("canary", _CREDENTIAL_CANARIES)
-def test_a_secret_shaped_legal_id_is_fingerprinted_never_stored_raw(
-    tmp_path: Path, canary: str
-) -> None:
-    # D05 re-review: the charset guard alone is not a secrecy proof — an access-key-shaped id is a
-    # legal opaque id. It is accepted, but ONLY its fingerprint is persisted, so the raw
-    # secret-shaped value never reaches control state.
+def test_a_secret_shaped_legal_id_is_omitted_without_a_key(tmp_path: Path, canary: str) -> None:
+    # PR #69 review: a plain SHA-256 of a legal-but-secret-shaped id is dictionary-recoverable and
+    # cross-installation correlatable. With no keyed pseudonymizer wired, the derivative is omitted
+    # entirely — neither the raw value NOR its public SHA-256 reaches control state.
     database = _database(tmp_path)
     try:
         _prune(database, now=_NOW, batch_id=canary, record_count=1, byte_size=1, undelivered=False)
         row = list_audit(database)[0]
-        assert row.resource == _fp(canary)  # stored as a fixed-width fingerprint
-        assert row.resource != canary  # never the raw value
-        assert canary.encode("utf-8") not in _audit_bytes(database)  # not anywhere in the row bytes
+        assert row.resource is None
+        assert canary.encode("utf-8") not in _audit_bytes(database)
+        assert _fp(canary).encode("utf-8") not in _audit_bytes(database)  # no public unsalted hash
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("canary", _CREDENTIAL_CANARIES)
+def test_a_keyed_pseudonymizer_stores_a_keyed_token_not_a_public_hash(
+    tmp_path: Path, canary: str
+) -> None:
+    # When a key is wired, the identifier is persisted as a keyed HMAC pseudonym — never the raw
+    # value and never its public SHA-256 (which a dictionary attack could reverse/correlate).
+    database = _database(tmp_path)
+    try:
+        pseudonymizer = Pseudonymizer(_KEY_A)
+        _prune(
+            database,
+            now=_NOW,
+            batch_id=canary,
+            record_count=1,
+            byte_size=1,
+            undelivered=False,
+            pseudonymizer=pseudonymizer,
+        )
+        row = list_audit(database)[0]
+        assert row.resource == pseudonymizer.fingerprint("batch", canary)
+        assert row.resource is not None and row.resource.startswith("mh_fp1_")
+        assert canary.encode("utf-8") not in _audit_bytes(database)
+        assert _fp(canary).encode("utf-8") not in _audit_bytes(database)
+    finally:
+        database.close()
+
+
+def test_keyed_tokens_are_installation_scoped_and_correlate_within_one(tmp_path: Path) -> None:
+    # Same id + same key -> identical token (authorized same-installation correlation); same id +
+    # different key -> different token (no cross-installation correlation).
+    database = _database(tmp_path)
+    try:
+        key_a1, key_a2, key_b = Pseudonymizer(_KEY_A), Pseudonymizer(_KEY_A), Pseudonymizer(_KEY_B)
+        assert key_a1.fingerprint("batch", "batch-1") == key_a2.fingerprint("batch", "batch-1")
+        assert key_a1.fingerprint("batch", "batch-1") != key_b.fingerprint("batch", "batch-1")
+    finally:
+        database.close()
+
+
+def test_migration_8_clears_legacy_unsalted_audit_resources(tmp_path: Path) -> None:
+    # PR #69 review: any slice-5b-era row that stored a plain SHA-256 resource must be cleared on
+    # upgrade so no reversible identifier survives.
+    from milhouse.state import CONTROL_MIGRATIONS, migrate
+
+    directory = tmp_path / "control"
+    directory.mkdir(mode=0o700)
+    os.chmod(directory, 0o700)
+    database = open_control_database(directory / "milhouse.sqlite3")
+    barrier = GlobalCommitBarrier(directory / "commit.lock")
+    try:
+        migrate(database, CONTROL_MIGRATIONS[:7], barrier=barrier, applied_at=_NOW)  # v7 (pre-fix)
+        assert schema_version(database) == 7
+        legacy = _fp("batch-legacy")
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO _audit (recorded_at, action, actor, outcome, resource, reason, "
+                "record_count, byte_size) VALUES "
+                "(?, 'retention_prune', 'maintenance', 'pruned', ?, 'expired', 1, 1)",
+                (_STAMP, legacy),
+            )
+        assert list_audit(database)[0].resource == legacy
+
+        migrate(database, CONTROL_MIGRATIONS, barrier=barrier, applied_at=_NOW)  # apply migration 8
+        assert schema_version(database) == 8
+        assert list_audit(database)[0].resource is None  # reversible hash cleared
+        assert legacy.encode("utf-8") not in _audit_bytes(database)
     finally:
         database.close()
 
@@ -198,7 +271,7 @@ def test_ids_are_monotonic_and_append_ordered(tmp_path: Path) -> None:
             )
         rows = list_audit(database)
         assert [r.id for r in rows] == [1, 2, 3]
-        assert [r.resource for r in rows] == [_fp("batch-1"), _fp("batch-2"), _fp("batch-3")]
+        assert [r.resource for r in rows] == [None, None, None]  # omitted without a keyed key
     finally:
         database.close()
 

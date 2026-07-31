@@ -9,7 +9,6 @@ and re-pruned on a later pass).
 
 from __future__ import annotations
 
-import hashlib
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -205,7 +204,7 @@ def test_prunes_a_fully_expired_delivered_segment(tmp_path: Path) -> None:
         assert (audit[0].action, audit[0].outcome, audit[0].resource) == (
             "retention_prune",
             "pruned",
-            hashlib.sha256(b"batch-a").hexdigest(),  # resource stored as a fingerprint (D05)
+            None,  # no keyed pseudonymizer wired → identifier omitted (PR #69 review)
         )
         assert (audit[0].record_count, audit[0].byte_size) == (2, record.byte_size)
     finally:
