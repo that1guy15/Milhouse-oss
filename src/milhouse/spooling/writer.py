@@ -26,6 +26,7 @@ from milhouse.spooling.segment import (
     MAX_SEGMENT_FRAMES,
     SegmentHeaderV1,
     SpoolFrameV1,
+    is_reserved_compaction_batch_id,
     spool_content_sha256,
     spool_frame_line,
     spool_segment_header_line,
@@ -58,7 +59,24 @@ def _validate_consistency(header: SegmentHeaderV1, frames: tuple[SpoolFrameV1, .
             _fail("MH_SPOOL_PRIVACY", "each frame privacy class must match the header")
 
 
-def publish_segment_bytes(path: str | Path, content: bytes) -> None:
+def _reject_reserved_name(path: str | Path) -> None:
+    # The compaction successor namespace (``c`` + 64-hex) is reserved: only compaction may publish
+    # into it (it passes ``allow_reserved=True``). Every producer publish path — the writer and any
+    # direct ``publish_segment_bytes`` caller — is rejected, so no producer can create a
+    # reserved-named file that reconciliation would later adopt as a foreign successor and strand a
+    # real compaction (G03 review finding #2). The batch id is the file stem before ``.jsonl``.
+    stem = Path(path).name
+    if stem.endswith(".jsonl"):
+        stem = stem[: -len(".jsonl")]
+    if is_reserved_compaction_batch_id(stem):
+        _fail("MH_SPOOL_RESERVED_ID", "the compaction successor namespace is reserved")
+
+
+def publish_segment_bytes(
+    path: str | Path, content: bytes, *, allow_reserved: bool = False
+) -> None:
+    if not allow_reserved:
+        _reject_reserved_name(path)
     exists = False
     failed = False
     try:

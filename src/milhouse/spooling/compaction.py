@@ -32,7 +32,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn, cast
+from typing import NoReturn, cast
 
 from milhouse.config.filesystem import (
     SecureFileError,
@@ -43,6 +43,7 @@ from milhouse.config.filesystem import (
 from milhouse.core.clock import TimeError, format_timestamp
 from milhouse.domain.identity import ScopeV1
 from milhouse.domain.records import PrivacyClassV1
+from milhouse.privacy.pseudonym import Pseudonymizer
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
     ORIGIN_RECONCILED,
@@ -67,9 +68,6 @@ from milhouse.state.audit import record_compaction
 from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
 from milhouse.state.database import ControlDatabase, _validated_database_path
 from milhouse.state.errors import StateError
-
-if TYPE_CHECKING:
-    from milhouse.privacy.pseudonym import Pseudonymizer
 
 _PENDING = "pending"
 _SPOOL = "spool"
@@ -203,14 +201,35 @@ def _validate_barrier(database: ControlDatabase, barrier: object) -> None:
         _fail("MH_SPOOL_COMPACTION", "the barrier must be the control-plane commit lock")
 
 
-def _derive_batch_id(live_frames: list[SpoolFrameV1]) -> str:
-    # Deterministic in the surviving records' ids (independent of the old batch id and of which
-    # frames expired), so re-compacting the same survivors yields the same new segment identity —
-    # the property that makes an interrupted pass converge idempotently. The id lands in the
-    # ``c`` + 64-hex namespace that producers may never commit into, so it is unforgeable.
-    material = "\n".join(str(frame.record.record_id) for frame in live_frames)
+def _derive_batch_id(record: SegmentRecord, live_frames: list[SpoolFrameV1]) -> str:
+    # The successor id must be deterministic in the FULL intended identity — everything
+    # ``_is_intended_successor`` compares — plus a source-specific discriminator (the old batch id),
+    # NOT just the surviving record ids. Two mixed segments that share a surviving record id but
+    # differ in exporters, policy, or source would otherwise derive the same id, so the first
+    # compacts and the second sees a NON-successor at the id and strands its expired frame (G03
+    # review: same-survivor collision). Including the old batch id also keeps each source segment's
+    # successor distinct (compaction removes only expired frames; it never merges two segments), and
+    # keeps a re-run of the SAME source idempotent. The fields below are all independent of the new
+    # batch id (unlike the content/file digests, which are computed over frames that embed it). The
+    # id lands in the reserved ``c`` + 64-hex namespace that producers may never publish into.
+    exporter_ids = sorted({exporter.exporter_id for exporter in record.exporters})
+    material = "\n".join(
+        [
+            "milhouse-compaction-successor-v2",
+            record.batch_id,
+            record.config_generation,
+            record.scope,
+            record.target_id or "",
+            record.privacy_class,
+            str(record.retention_days),
+            str(len(exporter_ids)),
+            *exporter_ids,
+            str(len(live_frames)),
+            *[str(frame.record.record_id) for frame in live_frames],
+        ]
+    )
     batch_id = _COMPACTED_PREFIX + hashlib.sha256(material.encode("utf-8")).hexdigest()
-    # Defensive: the derived id must be exactly the reserved successor shape the commit ingress
+    # Defensive: the derived id must be exactly the reserved successor shape the publish ingress
     # protects; if this invariant ever broke (e.g. the prefix changed), a producer could forge the
     # id, so fail closed. A ``c`` + 64-hex digest always matches, so this never fires in practice.
     if not is_reserved_compaction_batch_id(batch_id):  # pragma: no cover - defensive invariant
@@ -325,7 +344,7 @@ def _swap_ledger(
     *,
     now: datetime,
     insert_new: bool,
-    pseudonymizer: Pseudonymizer | None,
+    pseudonymizer: Pseudonymizer,
 ) -> bool:
     """Atomically publish/restore the successor, re-point cursors, delete the old row, and audit.
 
@@ -379,6 +398,13 @@ def _swap_ledger(
                 old_byte_size=old_record.byte_size,
                 new_record_count=new_record.record_count,
                 new_byte_size=new_record.byte_size,
+                # Immutable evidence of the exact retired/replacement bytes (plan §§4.8-4.9): old
+                # digests were verified against the file by ``_agrees`` at the start of this
+                # compaction; the new digests were verified by reading the published successor back.
+                old_content_sha256=old_record.content_sha256,
+                old_file_sha256=old_record.file_sha256,
+                new_content_sha256=new_record.content_sha256,
+                new_file_sha256=new_record.file_sha256,
                 pseudonymizer=pseudonymizer,
             )
     except (sqlite3.Error, StateError):
@@ -395,19 +421,20 @@ def _resolve_successor(
 ) -> tuple[str, SegmentRecord, bytes, bool, bool] | None:
     """Resolve the single deterministic successor slot for this compaction.
 
-    The successor id is derived from the surviving record ids and lands in the reserved ``c`` +
-    64-hex namespace that producers may never commit into, so it is unforgeable: it is free (publish
-    a new file and insert a row), already holds THIS compaction's intended successor as a committed
-    row (reuse it — crash recovery), or holds it as an unrecorded orphan file (adopt it — insert the
-    row). Because the namespace is reserved, the only way a NON-successor could occupy the id is a
-    SHA-256 collision, which no finite or predictable input can produce; that fails closed (returns
-    ``None``, the caller reports it) rather than ever retiring the old segment against foreign data.
-    There is no bounded probe: a single derived id can no longer be stranded past its privacy
-    deadline by occupying predictable alternatives (G03 review finding #1).
+    The successor id is derived from the FULL intended identity (every field
+    ``_is_intended_successor`` compares) plus the old batch id, and lands in the reserved ``c`` +
+    64-hex namespace that no producer publish path may write into, so it is unforgeable AND unique
+    to this exact successor: it is free (publish a new file and insert a row), already holds THIS
+    compaction's intended successor as a committed row (reuse it — crash recovery), or holds it as
+    an unrecorded orphan file (adopt it — insert the row). Because the id is a function of the whole
+    successor identity, any occupant is either exactly this successor or a SHA-256 collision (no
+    finite or predictable input produces one); a non-successor fails closed (returns ``None``, the
+    caller reports it) rather than ever retiring the old segment against foreign data. There is no
+    bounded probe and no same-survivor/different-policy strand (G03 review findings #1/#2).
     Returns ``(batch_id, new_record, content, needs_publish, insert_new)`` or ``None``.
     """
 
-    candidate = _derive_batch_id(live_frames)
+    candidate = _derive_batch_id(record, live_frames)
     new_record, content = _build_new_segment(record, live_frames, candidate)
     existing = read_segment_record(database, candidate)
     if existing is not None:
@@ -434,7 +461,7 @@ def _compact_one(
     installation_id: str,
     now: datetime,
     record: SegmentRecord,
-    pseudonymizer: Pseudonymizer | None,
+    pseudonymizer: Pseudonymizer,
 ) -> tuple[CompactedSegment | None, SkippedSegment | None]:
     """Compact one segment iff it is mixed-expiry; else return why it was skipped."""
 
@@ -475,9 +502,10 @@ def _compact_one(
     if needs_publish:
         # The resolver only returns needs_publish for a slot with no name present, so publication
         # onto that free slot under the exclusive hold cannot collide; any failure (including a
-        # surprise existing name) leaves the old segment fully intact.
+        # surprise existing name) leaves the old segment fully intact. Compaction is the ONLY writer
+        # permitted into the reserved successor namespace, so it opts in explicitly.
         try:
-            publish_segment_bytes(new_path, content)
+            publish_segment_bytes(new_path, content, allow_reserved=True)
         except SpoolError as error:
             return _skip(STATUS_PUBLISH_FAILED, error.code)
 
@@ -518,7 +546,7 @@ def compact_apply(
     installation_id: str,
     now: datetime,
     confirm: bool,
-    pseudonymizer: Pseudonymizer | None = None,
+    pseudonymizer: Pseudonymizer,
 ) -> CompactionResult:
     """Rewrite every mixed-expiry committed segment into a new unexpired-only segment, audited.
 
@@ -529,15 +557,19 @@ def compact_apply(
     (retention prunes the fully-expired ones), and an unreadable or disagreeing segment is left for
     verify/reconciliation. Every failure normalizes to a fixed ``MH_SPOOL_*`` code.
 
-    ``pseudonymizer`` keys the old→new lineage recorded in ``_audit`` per plan §4.7. A maintenance
-    caller loads the installation key with
-    :func:`milhouse.privacy.keys.load_pseudonym_key` and passes the resulting
-    :class:`~milhouse.privacy.pseudonym.Pseudonymizer`; when it is absent (no key provisioned yet)
-    the lineage resources are recorded as ``NULL`` rather than as a reversible hash. The
-    derivation runs inside the audit boundary, which requires the exact trusted ``Pseudonymizer``
-    type, so an untrusted look-alike can never persist a caller-shaped value.
+    ``pseudonymizer`` is REQUIRED: plan §4.7 makes keyed old→new lineage a W03 deliverable, so
+    compaction records an attributable pseudonym for every retired/replacement segment and never a
+    NULL or reversible-hash resource. It must be the exact trusted installation
+    :class:`~milhouse.privacy.pseudonym.Pseudonymizer` (loaded by a maintenance caller with
+    :func:`milhouse.privacy.keys.load_pseudonym_key`); a missing, wrong-type, or subclassed
+    authority fails closed HERE — before the barrier and before any file, ledger, cursor, or audit
+    mutation.
     """
 
+    if type(pseudonymizer) is not Pseudonymizer:
+        # Fail closed before any mutation: only the exact concrete installation Pseudonymizer keys
+        # the mandated lineage. A subclass/proxy or missing key is refused (G03 review finding #3).
+        _fail("MH_SPOOL_COMPACTION", "compaction requires the trusted installation Pseudonymizer")
     _validate_common(database, spool_root, installation_id)
     _validate_barrier(database, barrier)
     _require_now(now)

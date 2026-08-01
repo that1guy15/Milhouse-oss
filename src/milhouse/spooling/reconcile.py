@@ -76,7 +76,9 @@ from milhouse.config.filesystem import (
     FileIdentity,
     FileSnapshot,
     SecureFileError,
+    SecureFileErrorKind,
     lexical_absolute_path,
+    remove_regular_file_no_follow,
     require_no_extended_acl,
 )
 from milhouse.spooling.errors import SpoolError
@@ -168,7 +170,9 @@ class SegmentAnomaly:
     created, exists, or could not be ruled out, but the pending source's state, prior-recovery
     cleanup, or live target binding could not be confirmed; the next scan converges by adopting a
     live same-digest copy or producing a fresh live copy), or
-    ``limit`` (a scan bound was exceeded).
+    ``limit`` (a scan bound was exceeded), or ``retirement_incomplete`` (a crash-interrupted
+    retention prune whose orphan file could not be unlinked this pass — the tombstone is kept and
+    the next mandatory reconciliation retries; detail ``io`` or ``uncertain``).
     ``batch_id`` and ``day`` are validated identifiers or empty when the underlying name was
     invalid (untrusted names are omitted entirely, never echoed or fingerprinted); ``detail`` is a
     fixed reason or ``MH_SPOOL_*`` code — never a raw path.
@@ -713,7 +717,9 @@ class _Scan:
         "_move_failures",
         "_pending_quarantines",
         "_pending_registrations",
+        "_pending_retirements",
         "_pending_staging_cleanups",
+        "_pending_tombstone_deletions",
         "_quarantined",
         "_recovery_safe",
         "_registered",
@@ -728,6 +734,11 @@ class _Scan:
         self._installation_id = installation_id
         self._registered: list[OrphanRegistration] = []
         self._pending_registrations: list[tuple[ParsedSegment, str, str]] = []
+        # Retirement completion (G03 finding #1): finish a crash-interrupted retention prune.
+        # (day, path, batch_id, day_identity, expected file_sha256) for an orphan file matching a
+        # tombstone digest — unlink + clear it; plus stale tombstones (below) to just clear.
+        self._pending_retirements: list[tuple[str, Path, str, FileIdentity, str]] = []
+        self._pending_tombstone_deletions: set[str] = set()
         # (day, name, day_identity, snapshot, digest, batch_id_or_empty, detail)
         self._pending_quarantines: list[
             tuple[str, str, FileIdentity, FileSnapshot, str, str, str]
@@ -782,6 +793,7 @@ class _Scan:
             with barrier_context as transition:
                 barrier_acquired = True
                 ledger, malformed = self._ledger_index()
+                retirements = self._retirement_index()
                 for batch_id in sorted(malformed):
                     # The batch id came from a row that failed validation, so it may not be well
                     # formed.
@@ -805,6 +817,20 @@ class _Scan:
                             self._verify_committed(
                                 path, day, batch_id, ledger[batch_id], day_identity
                             )
+                        elif batch_id in retirements:
+                            # A crash-interrupted retention prune left this orphan file with a
+                            # tombstone recording the retired file's digest (G03 finding #1). If the
+                            # file still matches, finish the retirement (unlink + clear tombstone)
+                            # rather than re-adopting expired bytes as a live segment. If it does
+                            # not match, the retired file is already gone and this is a different
+                            # orphan (a reused id): clear the stale tombstone, reconcile normally.
+                            if _raw_sha256(path) == retirements[batch_id][1]:
+                                self._pending_retirements.append(
+                                    (day, path, batch_id, day_identity, retirements[batch_id][1])
+                                )
+                            else:
+                                self._pending_tombstone_deletions.add(batch_id)
+                                self._reconcile_orphan(path, day, batch_id, day_identity)
                         else:
                             self._reconcile_orphan(path, day, batch_id, day_identity)
 
@@ -847,6 +873,16 @@ class _Scan:
                         if batch_id not in seen:
                             self._anomaly(batch_id, record.day, "missing_file", "absent")
 
+                # A retirement tombstone whose file is already gone (no candidate) or whose id was
+                # reused by a now-committed segment is stale: clear it (G03 finding #1). Tombstones
+                # whose orphan file is still present were routed to completion or deletion above.
+                if self._complete:
+                    for batch_id in retirements:
+                        if self._capped():  # pragma: no cover - defensive cap bound
+                            break
+                        if batch_id not in seen or batch_id in ledger:
+                            self._pending_tombstone_deletions.add(batch_id)
+
                 # After every phase and again immediately before mutation: a fired anomaly cap
                 # voids the pass even when it fired on the FINAL classified item (the re-review's
                 # reproduction, where a top-of-loop check alone never runs again).
@@ -872,6 +908,19 @@ class _Scan:
                         for parsed, batch_id, day in self._pending_registrations:
                             self._register(parsed, batch_id, day)
                             self._registered.append(OrphanRegistration(batch_id, day))
+                        # Finish crash-interrupted retention prunes (G03 finding #1): unlink each
+                        # digest-matched retired orphan and clear its tombstone; clear stale
+                        # tombstones whose file is already gone or whose id was reused.
+                        for (
+                            retire_day,
+                            retire_path,
+                            retire_id,
+                            _identity,
+                            expected,
+                        ) in self._pending_retirements:
+                            self._complete_retirement(retire_day, retire_path, retire_id, expected)
+                        for tombstone_id in sorted(self._pending_tombstone_deletions):
+                            self._delete_tombstone(tombstone_id)
                         for (
                             day,
                             name,
@@ -907,6 +956,8 @@ class _Scan:
                     self._pending_registrations.clear()
                     self._pending_quarantines.clear()
                     self._pending_staging_cleanups.clear()
+                    self._pending_retirements.clear()
+                    self._pending_tombstone_deletions.clear()
 
                 report = ReconciliationReport(
                     registered=tuple(self._registered),
@@ -970,6 +1021,29 @@ class _Scan:
         if failed:
             _fail("MH_SPOOL_LEDGER", "the segment ledger could not be read")
         return ledger, malformed
+
+    def _retirement_index(self) -> dict[str, tuple[str, str]]:
+        """Load pending retirement tombstones: batch_id -> (day, file_sha256).
+
+        The ``_retirements`` schema CHECKs guarantee a non-empty batch id, a 10-char day, and a
+        64-hex file digest, so the rows are trusted here (like ``_ledger_index`` validates its own).
+        A corrupt digest would simply never match a real file and the tombstone would be cleared as
+        stale — never an unlink of unrelated bytes.
+        """
+
+        retirements: dict[str, tuple[str, str]] = {}
+        failed = False
+        try:
+            rows = self._database.connection.execute(
+                "SELECT batch_id, day, file_sha256 FROM _retirements"
+            ).fetchall()
+            for batch_id, day, file_sha256 in rows:
+                retirements[str(batch_id)] = (str(day), str(file_sha256))
+        except (sqlite3.Error, StateError):  # pragma: no cover - defensive: read normalizes to code
+            failed = True
+        if failed:  # pragma: no cover - defensive
+            _fail("MH_SPOOL_LEDGER", "the retirement tombstones could not be read")
+        return retirements
 
     def _inventory(self) -> list[tuple[str, str, Path, FileIdentity]]:
         pending = self._spool_root / _PENDING
@@ -1178,6 +1252,41 @@ class _Scan:
             return
         # registration is deferred: mutation begins only after the whole pass proves complete
         self._pending_registrations.append((parsed, batch_id, day))
+
+    def _complete_retirement(self, day: str, path: Path, batch_id: str, expected: str) -> None:
+        """Finish a crash-interrupted retention prune under the exclusive hold: re-verify the file
+        still matches the retired digest, unlink it no-follow, and clear the tombstone. If the file
+        changed or is gone, the retired bytes are not here — clear the stale tombstone. Any unlink
+        failure leaves the tombstone for the NEXT mandatory reconciliation, so the intent is never
+        lost and the expired bytes cannot outlive their privacy deadline (G03 finding #1)."""
+
+        if _raw_sha256(path) != expected:
+            # The retired file is gone or was replaced (a reused id, a hostile same-UID swap, or a
+            # prior partial completion): the specific retired bytes are absent, so the intent is
+            # discharged — clear the stale tombstone and touch no file.
+            self._delete_tombstone(batch_id)
+            return
+        removed = False
+        try:
+            remove_regular_file_no_follow(path)
+            removed = True
+        except SecureFileError as error:
+            # Pre-unlink failure leaves the file; commit-uncertain means the unlink may not be
+            # durable. Either way KEEP the tombstone so the next mandatory reconciliation retries,
+            # and report it distinctly (never as a completed removal).
+            kind = "uncertain" if error.kind is SecureFileErrorKind.COMMIT_UNCERTAIN else "io"
+            self._move_failures.append(SegmentAnomaly(batch_id, day, "retirement_incomplete", kind))
+        if removed:
+            self._delete_tombstone(batch_id)
+
+    def _delete_tombstone(self, batch_id: str) -> None:
+        """Delete one retirement tombstone; a failed cleanup leaves it for the next pass."""
+
+        try:
+            with self._database.transaction() as connection:
+                connection.execute("DELETE FROM _retirements WHERE batch_id = ?", (batch_id,))
+        except (sqlite3.Error, StateError):  # pragma: no cover - defensive: keep the tombstone
+            return
 
     def _trusted_read(
         self, path: Path, day_identity: FileIdentity

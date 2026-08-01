@@ -62,6 +62,19 @@ class AuditRecord:
     reason: str | None
     record_count: int | None
     byte_size: int | None
+    content_sha256: str | None
+    file_sha256: str | None
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
+
+
+def _validate_digest(value: object, subject: str) -> str:
+    # A full-segment SHA-256 is a high-entropy digest of many records (not a low-entropy id), so it
+    # is privacy-safe to store raw as immutable evidence of the retired/replacement bytes.
+    if type(value) is not str or _SHA256_HEX.fullmatch(value) is None:
+        _fail("MH_STATE_AUDIT", f"an audit {subject} must be a lowercase 64-hex sha-256 digest")
+    return value
 
 
 def _validate_resource(value: object) -> str:
@@ -132,13 +145,17 @@ def _insert_audit(
     reason: str,
     record_count: int,
     byte_size: int,
+    content_sha256: str | None = None,
+    file_sha256: str | None = None,
 ) -> None:
     """Insert one audit row. Internal: only the typed constructors call it, with fixed codes.
 
     ``action``/``actor``/``outcome``/``reason`` are code constants owned by the calling constructor,
     never caller free text; ``resource`` is a keyed pseudonym or ``None`` and the counts are the
-    already-validated caller data. Only the timestamp is validated here before the insert; any
-    residual backend fault normalizes to the fixed code.
+    already-validated caller data. ``content_sha256``/``file_sha256`` are high-entropy digests of
+    the acted-on segment bytes (immutable evidence), NULL for actions that have none. Only the
+    timestamp is validated here before the insert; any residual backend fault normalizes to the
+    fixed code.
     """
 
     invalid_time = False
@@ -153,9 +170,21 @@ def _insert_audit(
     try:
         connection.execute(
             f"INSERT INTO {_AUDIT_TABLE} "
-            "(recorded_at, action, actor, outcome, resource, reason, record_count, byte_size) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (recorded_at, action, actor, outcome, resource, reason, record_count, byte_size),
+            "(recorded_at, action, actor, outcome, resource, reason, record_count, byte_size, "
+            "content_sha256, file_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                recorded_at,
+                action,
+                actor,
+                outcome,
+                resource,
+                reason,
+                record_count,
+                byte_size,
+                content_sha256,
+                file_sha256,
+            ),
         )
     except (sqlite3.Error, OverflowError):
         # Normalize any residual backend fault to the fixed code raised outside the handler, so no
@@ -213,6 +242,10 @@ def record_compaction(
     old_byte_size: int,
     new_record_count: int,
     new_byte_size: int,
+    old_content_sha256: str,
+    old_file_sha256: str,
+    new_content_sha256: str,
+    new_file_sha256: str,
     pseudonymizer: Pseudonymizer | None = None,
 ) -> None:
     """Record a mixed-expiry compaction as a linked pair of append-only audit rows.
@@ -225,8 +258,14 @@ def record_compaction(
     OMITTED (resource ``NULL``) otherwise, so a reversible unsalted hash is never stored (plan
     section 4.7). The dropped (expired) record count is the difference of the two ``record_count``
     values.
-    Call inside the same transaction as the ledger swap so the lineage and the state commit or roll
-    back together.
+
+    Plan sections 4.8-4.9 additionally require the OLD/NEW content and file hashes recorded
+    transactionally as immutable evidence of the exact retired and replacement bytes: the
+    ``compacted_from`` row carries the old segment's ``content_sha256``/``file_sha256`` and the
+    ``compacted_into`` row the new segment's. They are validated 64-hex digests (a full-segment
+    SHA-256 is high-entropy, so privacy-safe to store raw, unlike the low-entropy batch id). Call
+    inside the SAME transaction as the ledger swap: any digest that fails validation, or any backend
+    fault, raises the fixed code so the swap and the audit roll back together.
     """
 
     _validate_resource(old_batch_id)
@@ -235,6 +274,10 @@ def record_compaction(
     _validate_count(old_byte_size, "byte size")
     _validate_count(new_record_count, "record count")
     _validate_count(new_byte_size, "byte size")
+    _validate_digest(old_content_sha256, "content digest")
+    _validate_digest(old_file_sha256, "file digest")
+    _validate_digest(new_content_sha256, "content digest")
+    _validate_digest(new_file_sha256, "file digest")
     _insert_audit(
         connection,
         now=now,
@@ -245,6 +288,8 @@ def record_compaction(
         resource=_keyed_resource(pseudonymizer, old_batch_id),
         record_count=old_record_count,
         byte_size=old_byte_size,
+        content_sha256=old_content_sha256,
+        file_sha256=old_file_sha256,
     )
     _insert_audit(
         connection,
@@ -256,6 +301,8 @@ def record_compaction(
         resource=_keyed_resource(pseudonymizer, new_batch_id),
         record_count=new_record_count,
         byte_size=new_byte_size,
+        content_sha256=new_content_sha256,
+        file_sha256=new_file_sha256,
     )
 
 
@@ -270,6 +317,8 @@ def _row_to_audit(row: Sequence[Any]) -> AuditRecord:
         reason=None if row[6] is None else str(row[6]),
         record_count=None if row[7] is None else int(row[7]),
         byte_size=None if row[8] is None else int(row[8]),
+        content_sha256=None if row[9] is None else str(row[9]),
+        file_sha256=None if row[10] is None else str(row[10]),
     )
 
 
@@ -284,7 +333,10 @@ def list_audit(
         _fail("MH_STATE_AUDIT", "an audit action filter must be non-empty text")
     rows: list[tuple[Any, ...]] = []
     failed = False
-    columns = "id, recorded_at, action, actor, outcome, resource, reason, record_count, byte_size"
+    columns = (
+        "id, recorded_at, action, actor, outcome, resource, reason, record_count, byte_size, "
+        "content_sha256, file_sha256"
+    )
     try:
         if action is None:
             rows = database.connection.execute(

@@ -191,6 +191,51 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "UPDATE _audit SET resource = NULL WHERE resource IS NOT NULL",
         ),
     ),
+    Migration(
+        9,
+        "add_audit_content_digests",
+        (
+            # Plan sections 4.8-4.9 require compaction to record the OLD/NEW content and file HASHES
+            # transactionally — immutable evidence of the exact retired and replacement BYTES, which
+            # a keyed batch-id pseudonym (lineage) is not (G03 review finding #4). A full-segment
+            # SHA-256 is a high-entropy digest of many records, not a low-entropy identifier, so it
+            # is privacy-safe to store raw (unlike the batch id, which stays a keyed pseudonym in
+            # ``resource``). Each compaction audit row carries ITS OWN segment's digests: the
+            # ``compacted_from`` row the old segment's, the ``compacted_into`` the new segment's.
+            # Both are NULL for non-compaction audit rows (e.g. retention prune). Nullable ADD COL
+            # with a self-referential CHECK is satisfied by existing rows (NULL passes).
+            "ALTER TABLE _audit ADD COLUMN content_sha256 TEXT "
+            "CHECK (content_sha256 IS NULL OR length(content_sha256) = 64)",
+            "ALTER TABLE _audit ADD COLUMN file_sha256 TEXT "
+            "CHECK (file_sha256 IS NULL OR length(file_sha256) = 64)",
+        ),
+    ),
+    Migration(
+        10,
+        "create_retirements",
+        (
+            # Durable retirement intent (tombstone) so a privacy-expired prune SELF-COMPLETES after
+            # a crash (G03 review finding #1). Retention deletes the segment row before unlinking
+            # durable file; a crash in that window used to leave an orphan file that reconciliation
+            # re-registered as a live committed segment, with no intent from which to finish the
+            # deletion — so the expired bytes could outlive their hard privacy deadline until a
+            # SEPARATE retention pass ran. A tombstone written in the SAME transaction as the row
+            # delete records the retiring segment's ``file_sha256`` (digest-scoped so a later
+            # segment that reuses the batch id is never mistaken for the retired file); mandatory
+            # reconciliation recognizes it and finishes the deletion (unlink the exact matching
+            # orphan + clear the tombstone) within one acquisition cycle, not re-adopting it.
+            # It carries no payload — only the batch id, day partition, the file digest, and a
+            # timestamp — and is cleared once the file is durably gone.
+            "CREATE TABLE _retirements ("
+            "batch_id TEXT PRIMARY KEY NOT NULL, "
+            "day TEXT NOT NULL, "
+            "file_sha256 TEXT NOT NULL, "
+            "retired_at TEXT NOT NULL, "
+            "CHECK (length(batch_id) > 0), "
+            "CHECK (length(day) = 10), "
+            "CHECK (length(file_sha256) = 64))",
+        ),
+    ),
 )
 
 
