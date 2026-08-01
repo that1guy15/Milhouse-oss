@@ -57,6 +57,7 @@ from milhouse.spooling.segment import (
     SCHEMA_VERSION,
     SegmentHeaderV1,
     SpoolFrameV1,
+    is_reserved_compaction_batch_id,
 )
 from milhouse.spooling.writer import build_segment_bytes, publish_segment_bytes
 from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
@@ -322,6 +323,12 @@ class DurableSpool:
 
         if not isinstance(header, SegmentHeaderV1):
             _fail("MH_SPOOL_HEADER", "a segment header is required")
+        if is_reserved_compaction_batch_id(header.batch_id):
+            # The compaction successor namespace (``c`` + 64-hex) is reserved: a producer must never
+            # commit into it, so a caller-chosen segment can never occupy a compaction-derived
+            # successor id and strand a mixed-expiry segment's expired frames (plan §§4.8-4.9; G03
+            # review finding #1). Compaction inserts its own rows directly, bypassing this ingress.
+            _fail("MH_SPOOL_RESERVED_ID", "the compaction successor batch-id namespace is reserved")
         authorize_local_persistence(header.privacy_class)
         stamp = _committed_stamp(committed_at)
         day = stamp[:_DAY_LENGTH]
