@@ -2,7 +2,7 @@
 
 - Status: Accepted (ratification)
 - Date: 2026-07-18
-- Amended by: ADR 0016 (adds the `local_log` egress surface and the persisted structured-log contract, 2026-07-22)
+- Amended by: ADR 0016 (adds the `local_log` egress surface and the persisted structured-log contract, 2026-07-22); Addendum A07 (installation-key provenance and reserved compaction-namespace upgrade, 2026-08-01)
 
 ## Context
 
@@ -25,6 +25,33 @@ Target purge requires an exact dry-run manifest/digest, explicit target confirma
 ## Consequences
 
 No sink may weaken classification or redaction. Privacy and security tests plant secrets, PII, encoded values, prompt injection, unsafe markup, paths, and symlinks across every surface. Encrypted volumes remain operator guidance because Milhouse cannot promise forensic erasure on all filesystems/media.
+
+## Addendum A07 (2026-08-01) — installation-key provenance and reserved compaction-namespace upgrade
+
+Owner-approved 2026-08-01 to resolve two P1s an independent review found in the W03 compaction/audit
+remediation. It scopes the boundary between W03 and `init` (W06) and preserves every privacy invariant
+above; it changes no wire byte, retention rule, product scope, or release authority.
+
+- **Installation pseudonym-key provenance.** A persisted keyed derivative is trustworthy only if it is
+  produced by the installation's own key, not merely by an object of the right class (`Pseudonymizer`
+  is constructible from any 32 caller-supplied bytes). `init` (W06) owns creating the installation
+  pseudonym-key file at the config/paths-bound location. **W03 compaction establishes provenance by
+  LOADING** the key inside the validated config/runtime-path boundary
+  (`load_pseudonym_key(config, paths)`, which enforces the bound path plus owner/mode/`nlink`/ACL
+  checks) — it does not accept a caller-supplied key — and **fails closed before any file, ledger,
+  cursor, or audit mutation** when the key is absent (unprovisioned installation), unloadable, or
+  invalid. The lower audit constructor is non-optional on the compaction path. Consequently compaction
+  cannot run on an un-`init`'d installation; that is a fail-closed contract, recorded honestly, not a
+  passing path. Retention/purge keyed derivatives follow the same provenance rule where they key an id.
+
+- **Reserved compaction-successor namespace and upgrade.** The `c[0-9a-f]{64}` successor namespace is
+  reserved from the schema that introduces it (schema 10); no producer may commit into it. Those ids
+  were producer-writable before the reservation, so on acquisition/upgrade a restartable
+  exclusive-barrier check inventories any pre-existing committed segment in the reserved namespace and
+  **fails closed with an operator-remediation code** rather than silently stranding a mixed segment.
+  Because the upgrade guarantees the reserved namespace then contains only compaction successors, the
+  single deterministic-slot successor allocation remains collision-safe. In pre-alpha (no released
+  installs) this state is empty and the check is a deterministic, crash-safe no-op.
 
 ## Plan references
 
