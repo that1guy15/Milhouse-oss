@@ -28,14 +28,12 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import Any, NoReturn
 
 from milhouse.core.clock import TimeError, format_timestamp
+from milhouse.privacy.pseudonym import Pseudonymizer
 from milhouse.state.database import ControlDatabase
 from milhouse.state.errors import StateError
-
-if TYPE_CHECKING:
-    from milhouse.privacy.pseudonym import Pseudonymizer
 
 _AUDIT_TABLE = "_audit"
 _MAX_COUNT = 2**63 - 1  # the largest value SQLite's signed 64-bit INTEGER can store
@@ -76,7 +74,7 @@ _RESOURCE_KIND = "batch"
 _MAX_RESOURCE_BYTES = 128
 # A keyed fingerprint for kind "batch" is exactly ``mh_fp1_e{epoch}_batch_{base32}``: an epoch of
 # 1..2^31-1 and the lowercase base32 (52 chars) of the 32-byte SHA-256 HMAC digest. The audit
-# boundary validates the pseudonymizer's output against this canonical grammar so a hostile or buggy
+# boundary validates the pseudonymizer's output against this canonical grammar so a buggy
 # Pseudonymizer cannot persist a secret-shaped, wrong-kind, or overlong value.
 _FINGERPRINT_TOKEN = re.compile(r"mh_fp1_e[1-9][0-9]{0,9}_batch_[a-z2-7]{52}", flags=re.ASCII)
 
@@ -85,22 +83,28 @@ def _keyed_resource(pseudonymizer: Pseudonymizer | None, batch_id: str) -> str |
     """Return the keyed HMAC pseudonym of ``batch_id``, or ``None`` when no key is wired.
 
     Plan section 4.7 requires a persisted identifier derivative to be a keyed installation-local
-    HMAC pseudonym, never a public unsalted hash. The pseudonym key is created by ``init`` (W06) and
-    is not yet wired into the control plane, so when no pseudonymizer is supplied the derivative is
-    OMITTED rather than persisted as a reversible hash — the precedent ``spooling/reconcile`` sets.
-    When a key is wired, the same call yields a keyed ``mh_fp1_`` token, no schema change. The
-    pseudonymizer is untrusted at this boundary: its output is validated against the exact canonical
-    ``mh_fp1_..._batch_...`` grammar (and length bound), and any deviation fails closed with a fixed
-    code so a hostile or buggy implementation can never persist a raw or secret-shaped value.
+    HMAC pseudonym, never a public unsalted hash. When no pseudonymizer is supplied the derivative
+    is OMITTED (``None``) rather than persisted as a reversible hash — the precedent
+    ``spooling/reconcile`` sets. When a key is wired, the same call yields a keyed ``mh_fp1_``
+    token, no schema change.
+
+    Derivation happens INSIDE a trusted boundary: the argument must be the exact concrete
+    :class:`~milhouse.privacy.pseudonym.Pseudonymizer` type (``type(...) is Pseudonymizer``), not a
+    subclass or a look-alike proxy. A grammar check alone is not proof of keyed derivation — an
+    overridable ``fingerprint`` could return a canonical-*shaped* value derived from caller
+    input (G03 review finding #2), so the type gate ensures the real HMAC method runs. The output is
+    then ALSO validated against the exact ``mh_fp1_..._batch_...`` grammar and length bound as
+    defence in depth, failing closed with a fixed code on any deviation.
     """
 
     if pseudonymizer is None:
         return None
-    try:
-        token = pseudonymizer.fingerprint(_RESOURCE_KIND, batch_id)
-    except Exception:
-        token = None
-    if (
+    if type(pseudonymizer) is not Pseudonymizer:
+        # Reject any subclass or look-alike proxy: only the concrete trusted type derives here, so a
+        # caller cannot substitute an overriding ``fingerprint`` that echoes shaped input.
+        _fail("MH_STATE_AUDIT", "audit lineage requires the trusted Pseudonymizer type")
+    token = pseudonymizer.fingerprint(_RESOURCE_KIND, batch_id)
+    if (  # pragma: no cover - the trusted Pseudonymizer always yields a canonical token
         not isinstance(token, str)
         or len(token) > _MAX_RESOURCE_BYTES
         or _FINGERPRINT_TOKEN.fullmatch(token) is None

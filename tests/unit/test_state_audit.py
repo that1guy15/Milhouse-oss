@@ -30,11 +30,12 @@ from milhouse.state import (
     record_retention_prune,
     schema_version,
 )
+from milhouse.state import audit as audit_module
 
 
 class _HostilePseudonymizer:
-    """A pseudonymizer whose fingerprint() returns caller-controlled output (untrusted at the audit
-    boundary), used to prove the boundary validates the token grammar before persisting."""
+    """A look-alike (NOT a Pseudonymizer subclass) whose fingerprint() returns caller-controlled
+    output, used to prove the audit boundary requires the exact trusted type before persisting."""
 
     def __init__(self, output: object) -> None:
         self._output = output
@@ -43,6 +44,15 @@ class _HostilePseudonymizer:
         if isinstance(self._output, BaseException):
             raise self._output
         return self._output
+
+
+class _ForgingPseudonymizer(Pseudonymizer):
+    """A Pseudonymizer SUBCLASS whose overridden fingerprint() returns a canonical-SHAPED but forged
+    token. Its output passes the grammar check, so only the exact-type gate can reject it (finding
+    #2: token shape is not proof of keyed derivation)."""
+
+    def fingerprint(self, kind: str, value: str) -> str:
+        return "mh_fp1_e1_batch_" + "a" * 52  # grammar-valid, NOT a real keyed HMAC of `value`
 
 
 _KEY_A = b"\xa1" * 32
@@ -444,6 +454,7 @@ _HOSTILE_TOKENS = [
     "mh_fp1_e1_secret_" + "a" * 52,  # wrong kind
     "mh_ps1_e1_batch_" + "a" * 52,  # a pseudonym, not a fingerprint
     "mh_fp1_e1_batch_" + "a" * 200,  # overlong
+    "mh_fp1_e1_batch_" + "a" * 52,  # a grammar-VALID canonical token — a look-alike still fails
     "",  # empty
 ]
 
@@ -452,8 +463,9 @@ _HOSTILE_TOKENS = [
 def test_a_hostile_pseudonymizer_output_is_rejected_and_nothing_is_persisted(
     tmp_path: Path, bad: str
 ) -> None:
-    # PR #72 review: the pseudonymizer is untrusted at the audit boundary. Output that is not the
-    # exact canonical keyed-token grammar fails closed with a fixed code and persists nothing.
+    # PR review: the pseudonymizer is untrusted at the audit boundary. A look-alike (not the exact
+    # Pseudonymizer type) is rejected by the type gate before its output is even trusted — even a
+    # grammar-VALID canonical token from a look-alike persists nothing (finding #2).
     database = _database(tmp_path)
     try:
         with pytest.raises(StateError) as captured:
@@ -470,6 +482,32 @@ def test_a_hostile_pseudonymizer_output_is_rejected_and_nothing_is_persisted(
         assert list_audit(database) == ()  # nothing persisted at all
         if bad:  # (the empty token is vacuously a substring of everything)
             assert bad.encode("utf-8") not in _audit_bytes(database)
+    finally:
+        database.close()
+
+
+def test_a_pseudonymizer_subclass_with_canonical_output_is_rejected(tmp_path: Path) -> None:
+    # Finding #2: token SHAPE is not proof of keyed derivation. A Pseudonymizer SUBCLASS can
+    # override fingerprint() to return a canonical-shaped token forged from caller input; the shape
+    # check alone would admit it, so the audit boundary requires the EXACT concrete Pseudonymizer
+    # type. The subclass is rejected and nothing is persisted, even though its output IS grammar-ok.
+    database = _database(tmp_path)
+    try:
+        forged = _ForgingPseudonymizer(_KEY_A)
+        # Prove the forged output would pass the grammar check, so the TYPE gate is what rejects it.
+        assert audit_module._FINGERPRINT_TOKEN.fullmatch(forged.fingerprint("batch", "batch-1"))
+        with pytest.raises(StateError) as captured:
+            _prune(
+                database,
+                now=_NOW,
+                batch_id="batch-1",
+                record_count=1,
+                byte_size=1,
+                undelivered=False,
+                pseudonymizer=forged,
+            )
+        assert captured.value.code == "MH_STATE_AUDIT"
+        assert list_audit(database) == ()  # nothing persisted
     finally:
         database.close()
 

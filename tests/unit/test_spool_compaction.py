@@ -26,6 +26,7 @@ from milhouse.domain.records import (
     TargetDescriptorV1,
     finalize_record,
 )
+from milhouse.privacy.pseudonym import Pseudonymizer
 from milhouse.spooling import (
     CompactionResult,
     DurableSpool,
@@ -39,6 +40,7 @@ from milhouse.spooling import (
 )
 from milhouse.spooling import compaction as compaction_module
 from milhouse.spooling.errors import SpoolError
+from milhouse.spooling.segment import is_reserved_compaction_batch_id
 from milhouse.state import (
     GlobalCommitBarrier,
     advance_cursor,
@@ -747,147 +749,144 @@ def _exporter_states(database, batch_id: str) -> dict[str, str]:
     )
 
 
-def test_a_foreign_segment_at_the_derived_id_is_probed_past_and_the_segment_is_compacted(
-    tmp_path: Path,
-) -> None:
-    # P1 (review): the primary derived id is predictable and the batch id space is caller-chosen, so
-    # an UNRELATED committed segment can occupy it. Compaction must NOT strand the mixed segment's
-    # expired frames — it probes a deterministic alternative id and compacts there, keeping the
-    # foreign and surviving records while removing the expired frame before its privacy deadline.
+def test_a_producer_cannot_commit_into_the_reserved_successor_namespace(tmp_path: Path) -> None:
+    # P1 (review finding #1): a compaction successor id (``c`` + 64-hex) is a valid batch-id shape,
+    # so a producer COULD otherwise commit a segment at a derived successor id and strand a
+    # mixed-expiry segment's expired frames past their privacy deadline. The commit ingress reserves
+    # the namespace: a producer commit into it fails closed and publishes nothing.
+    database, _barrier, spool_root, store = _spool(tmp_path)
+    try:
+        live_frames = _frames("batch-a", [("live-1", _LIVE_AT)])
+        reserved = compaction_module._derive_batch_id(live_frames)
+        assert is_reserved_compaction_batch_id(reserved)  # the derived id IS the reserved shape
+
+        with pytest.raises(SpoolError) as excinfo:
+            _commit(store, reserved, [("live-1", _LIVE_AT)])
+        assert excinfo.value.code == "MH_SPOOL_RESERVED_ID"
+        assert _segment_rows(database) == set()  # nothing committed
+        assert not _segment_file(spool_root, reserved).exists()  # nothing published
+    finally:
+        database.close()
+
+
+def test_the_compaction_successor_id_lands_in_the_reserved_namespace(tmp_path: Path) -> None:
+    # The successor a real compaction writes must land in the reserved namespace, so the commit
+    # ingress actually protects the id compaction derives (no producer can pre-occupy it).
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
-        _record, frames = _commit(
-            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
-        )
-        live_record_id = str(frames[1].record.record_id)
-        primary = compaction_module._derive_batch_id([frames[1]])  # probe 0 — occupied below
-        alternate = compaction_module._derive_batch_id([frames[1]], 1)  # probe 1
-        _commit(store, primary, [("foreign-live", _LIVE_AT)])  # foreign at the primary id
-
+        _commit(store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)])
         result = _compact(database, barrier, spool_root)
-
-        # Compacted at the alternate id, not stranded.
-        assert [c.old_batch_id for c in result.compacted] == ["batch-a"]
-        assert result.compacted[0].new_batch_id == alternate
-        assert result.compacted[0].dropped_records == 1  # the expired frame was removed
-        rows = _segment_rows(database)
-        assert "batch-a" not in rows  # old retired
-        assert alternate in rows and primary in rows  # successor + untouched foreign
-        assert not _segment_file(spool_root, "batch-a").exists()
-        assert _record_ids(spool_root, alternate) == [live_record_id]  # surviving record preserved
-        assert _record_ids(spool_root, primary) != [live_record_id]  # foreign untouched
-
-        # Crash-idempotent: a re-run probes past the still-foreign primary, finds the alternate
-        # successor already committed, and changes nothing (both remaining segments are all-live).
-        second = _compact(database, barrier, spool_root)
-        assert second.compacted == ()
-        assert {s.status for s in second.skipped} == {"live"}
+        assert is_reserved_compaction_batch_id(result.compacted[0].new_batch_id)
     finally:
         database.close()
 
 
-def test_compaction_probes_past_a_foreign_id_and_reconverges_after_an_interrupted_swap(
-    tmp_path: Path,
-) -> None:
-    # The reviewer's exact regression: preoccupy the first candidate, interrupt publication+swap,
-    # restart, and prove the foreign and surviving records remain while the expired frame is gone.
+def test_compaction_records_keyed_lineage_when_a_pseudonymizer_is_supplied(tmp_path: Path) -> None:
+    # P1 (review finding #3): plan §4.7 makes keyed old->new compaction lineage a W03 deliverable —
+    # it cannot be deferred to W06. When compact_apply is given the installation Pseudonymizer (the
+    # exact type load_pseudonym_key returns), BOTH audit rows carry keyed mh_fp1_... tokens,
+    # never a raw id or a public SHA-256, so the lineage is attributable and wired into W03.
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
-        _record, frames = _commit(
+        _record, _frames = _commit(
             store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
         )
-        live_record_id = str(frames[1].record.record_id)
-        primary = compaction_module._derive_batch_id([frames[1]])
-        alternate = compaction_module._derive_batch_id([frames[1]], 1)
-        _commit(store, primary, [("foreign-live", _LIVE_AT)])
+        pseudonymizer = Pseudonymizer(b"\xa1" * 32)
+        result = compact_apply(
+            database,
+            barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+            now=_APPLY_NOW,
+            confirm=True,
+            pseudonymizer=pseudonymizer,
+        )
+        new_id = result.compacted[0].new_batch_id
 
-        # Interrupt the swap (drop _audit): the alternate successor file is published as an orphan,
-        # the old segment stays fully intact.
-        with database.transaction() as connection:
-            connection.execute("DROP TABLE _audit")
-        first = _compact(database, barrier, spool_root)
-        assert first.compacted == ()
-        assert "batch-a" in _segment_rows(database)  # old intact
-        assert _segment_file(spool_root, alternate).exists()  # orphan successor at the alternate id
-
-        # Restart: reconciliation adopts the alternate orphan, then a retry probes past the foreign
-        # primary, reuses the alternate successor, and retires the old segment.
-        _recreate_audit_table(database)
-        _reconcile(database, barrier, spool_root)
-        second = _compact(database, barrier, spool_root)
-        assert [c.new_batch_id for c in second.compacted] == [alternate]
-        rows = _segment_rows(database)
-        assert "batch-a" not in rows and alternate in rows and primary in rows
-        assert _record_ids(spool_root, alternate) == [live_record_id]  # surviving record kept
-        assert _record_ids(spool_root, primary) != [live_record_id]  # foreign kept
+        rows = list_audit(database, action="compaction")
+        assert [row.outcome for row in rows] == ["compacted_from", "compacted_into"]
+        assert rows[0].resource == pseudonymizer.fingerprint("batch", "batch-a")
+        assert rows[1].resource == pseudonymizer.fingerprint("batch", new_id)
+        assert all(r.resource is not None and r.resource.startswith("mh_fp1_") for r in rows)
+        # Neither the raw ids nor their public SHA-256 appear anywhere in the audit table.
+        blob = _audit_bytes(database)
+        assert b"batch-a" not in blob and new_id.encode("utf-8") not in blob
+        assert hashlib.sha256(b"batch-a").hexdigest().encode("utf-8") not in blob
+        assert hashlib.sha256(new_id.encode("utf-8")).hexdigest().encode("utf-8") not in blob
     finally:
         database.close()
 
 
-def test_compaction_reports_a_collision_when_every_candidate_is_foreign(
+def test_compaction_fails_closed_when_the_reserved_id_holds_a_foreign_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # With a tiny probe bound, occupy every candidate with a foreign segment: compaction reports a
-    # bounded collision (never silently strands) and leaves the mixed segment intact for a retry.
+    # The reserved namespace makes a foreign committed row at the derived id reachable ONLY by a
+    # SHA-256 collision. Simulate that (derive collides with an unrelated committed segment):
+    # compaction must fail closed with ``reserved_conflict`` and leave the mixed segment fully
+    # intact — never retire it against foreign data — rather than strand silently.
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
-        _record, frames = _commit(
-            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
+        _commit(store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)])
+        _commit(store, "batch-foreign", [("foreign-live", _LIVE_AT)])
+        monkeypatch.setattr(
+            compaction_module, "_derive_batch_id", lambda live_frames: "batch-foreign"
         )
-        monkeypatch.setattr(compaction_module, "_MAX_PROBE", 2)
-        for probe in (0, 1):
-            occupied = compaction_module._derive_batch_id([frames[1]], probe)
-            _commit(store, occupied, [(f"foreign-{probe}", _LIVE_AT)])
 
         result = _compact(database, barrier, spool_root)
         assert result.compacted == ()
-        assert ("batch-a", "collision_bound") in [(s.batch_id, s.status) for s in result.skipped]
-        assert "batch-a" in _segment_rows(database)  # untouched — retryable later
+        assert ("batch-a", "reserved_conflict") in [(s.batch_id, s.status) for s in result.skipped]
+        rows = _segment_rows(database)
+        assert "batch-a" in rows and "batch-foreign" in rows  # both untouched, retryable
+        assert _segment_file(spool_root, "batch-a").exists()
     finally:
         database.close()
 
 
-def test_compaction_probes_past_an_unreadable_orphan_file(tmp_path: Path) -> None:
-    # A file occupies the primary id with NO ledger row and is not a readable successor (a garbage
-    # crash artifact or foreign file): compaction probes past it to a free alternate.
+def test_compaction_fails_closed_when_the_reserved_id_holds_an_unreadable_file(
+    tmp_path: Path,
+) -> None:
+    # A file at the derived id with NO ledger row that does not parse (reachable only by a collision
+    # artifact): compaction fails closed with ``reserved_conflict``, never retiring the old segment.
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
         _record, frames = _commit(
             store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
         )
-        primary = compaction_module._derive_batch_id([frames[1]])
-        alternate = compaction_module._derive_batch_id([frames[1]], 1)
-        primary_path = _segment_file(spool_root, primary)
-        primary_path.write_bytes(b"{ not a valid segment\n")
-        os.chmod(primary_path, 0o600)
+        derived = compaction_module._derive_batch_id([frames[1]])
+        derived_path = _segment_file(spool_root, derived)
+        derived_path.write_bytes(b"{ not a valid segment\n")
+        os.chmod(derived_path, 0o600)
 
         result = _compact(database, barrier, spool_root)
-        assert result.compacted[0].new_batch_id == alternate  # probed past the unreadable orphan
-        assert "batch-a" not in _segment_rows(database)
+        assert result.compacted == ()
+        assert ("batch-a", "reserved_conflict") in [(s.batch_id, s.status) for s in result.skipped]
+        assert "batch-a" in _segment_rows(database)  # old intact
     finally:
         database.close()
 
 
-def test_compaction_probes_past_a_valid_foreign_orphan_file(tmp_path: Path) -> None:
-    # A VALID segment file (not garbage) occupies the primary id with no ledger row and is NOT this
-    # compaction's successor: it verifies as disagreeing and the probe walks past it.
+def test_compaction_fails_closed_when_the_reserved_id_holds_a_foreign_file(tmp_path: Path) -> None:
+    # A VALID but non-successor segment file at the derived id with no ledger row (again reachable
+    # only by a collision): it verifies as disagreeing and compaction fails closed, keeping the old.
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
         _record, frames = _commit(
             store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
         )
-        primary = compaction_module._derive_batch_id([frames[1]])
-        alternate = compaction_module._derive_batch_id([frames[1]], 1)
-        # Commit a valid foreign segment at the primary id, then drop only its ledger rows so a
-        # valid foreign FILE (different content) remains without a row.
-        _commit(store, primary, [("foreign-live", _LIVE_AT)])
-        with database.transaction() as connection:
-            connection.execute("DELETE FROM _segment_exporters WHERE batch_id = ?", (primary,))
-            connection.execute("DELETE FROM _segments WHERE batch_id = ?", (primary,))
+        derived = compaction_module._derive_batch_id([frames[1]])
+        # Build a valid segment file at the derived name whose content differs from the successor.
+        foreign_frames = _frames(derived, [("foreign-live", _LIVE_AT)])
+        foreign_bytes = compaction_module.build_segment_bytes(
+            _header(derived, foreign_frames), foreign_frames
+        )
+        derived_path = _segment_file(spool_root, derived)
+        derived_path.write_bytes(foreign_bytes)
+        os.chmod(derived_path, 0o600)
 
         result = _compact(database, barrier, spool_root)
-        assert result.compacted[0].new_batch_id == alternate  # probed past the valid foreign orphan
-        assert "batch-a" not in _segment_rows(database)
+        assert result.compacted == ()
+        assert ("batch-a", "reserved_conflict") in [(s.batch_id, s.status) for s in result.skipped]
+        assert "batch-a" in _segment_rows(database)  # old intact
     finally:
         database.close()
 

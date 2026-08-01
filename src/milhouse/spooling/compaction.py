@@ -32,7 +32,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NoReturn, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 from milhouse.config.filesystem import (
     SecureFileError,
@@ -58,6 +58,7 @@ from milhouse.spooling.retention import FILE_ORPHANED, FILE_REMOVED, FILE_UNCERT
 from milhouse.spooling.segment import (
     SegmentHeaderV1,
     SpoolFrameV1,
+    is_reserved_compaction_batch_id,
     spool_content_sha256,
     spool_frame_line,
 )
@@ -67,18 +68,24 @@ from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
 from milhouse.state.database import ControlDatabase, _validated_database_path
 from milhouse.state.errors import StateError
 
+if TYPE_CHECKING:
+    from milhouse.privacy.pseudonym import Pseudonymizer
+
 _PENDING = "pending"
 _SPOOL = "spool"
 _BARRIER_NAME = "commit.lock"
 _DELIVERED = "delivered"
 
 # The compacted segment's batch id is this prefix plus the SHA-256 hex of the surviving records'
-# ordered ids (and, for a collision probe, a salt), so it is deterministic (re-runs are idempotent).
+# ordered ids, so it is deterministic (re-runs are idempotent) and lies in the reserved compaction
+# successor namespace. Producers may never commit into that namespace (rejected at the commit
+# ingress), so the derived id is UNFORGEABLE: no caller-chosen segment can occupy it. It is thus
+# always either free, or already holds THIS compaction's intended successor (crash recovery). Only a
+# SHA-256 collision — which no finite or predictable input can produce — could place a non-successor
+# there, and that fails closed loudly rather than ever stranding expired frames (G03 review finding
+# #1: a bounded probe over predictable ids could still be exhausted and strand; the reservation
+# removes the reachable stranding entirely, so no probe is needed).
 _COMPACTED_PREFIX = "c"
-# Batch ids are caller-chosen, so a derived successor id can be occupied by an unrelated segment.
-# When it is, compaction probes this many deterministic alternatives before reporting a collision,
-# so a mixed-expiry segment's expired frames are never silently stranded past its privacy deadline.
-_MAX_PROBE = 1024
 
 STATUS_LIVE = "live"
 STATUS_FULLY_EXPIRED = "fully_expired"
@@ -87,7 +94,10 @@ STATUS_DISAGREEING = "disagreeing"
 STATUS_VERIFY_FAILED = "verify_failed"
 STATUS_PUBLISH_FAILED = "publish_failed"
 STATUS_COMMIT_FAILED = "commit_failed"
-STATUS_COLLISION = "collision_bound"
+# A non-successor row/file at the reserved derived id: reachable only under a SHA-256 collision, so
+# this is a fail-closed integrity outcome, never a routine bounded-probe exhaustion. The old segment
+# is left fully intact (a live record is never lost); the skip is reported, never silent.
+STATUS_RESERVED_CONFLICT = "reserved_conflict"
 
 
 def _fail(code: str, message: str) -> NoReturn:
@@ -193,16 +203,19 @@ def _validate_barrier(database: ControlDatabase, barrier: object) -> None:
         _fail("MH_SPOOL_COMPACTION", "the barrier must be the control-plane commit lock")
 
 
-def _derive_batch_id(live_frames: list[SpoolFrameV1], probe: int = 0) -> str:
+def _derive_batch_id(live_frames: list[SpoolFrameV1]) -> str:
     # Deterministic in the surviving records' ids (independent of the old batch id and of which
     # frames expired), so re-compacting the same survivors yields the same new segment identity —
-    # the property that makes an interrupted pass converge idempotently. ``probe`` salts the id so
-    # that, when the primary candidate is occupied by an unrelated segment, compaction can walk a
-    # deterministic sequence of alternatives; probe 0 (the common case) is unsalted and unchanged.
+    # the property that makes an interrupted pass converge idempotently. The id lands in the
+    # ``c`` + 64-hex namespace that producers may never commit into, so it is unforgeable.
     material = "\n".join(str(frame.record.record_id) for frame in live_frames)
-    if probe:
-        material = f"{material}\n#{probe}"
-    return _COMPACTED_PREFIX + hashlib.sha256(material.encode("utf-8")).hexdigest()
+    batch_id = _COMPACTED_PREFIX + hashlib.sha256(material.encode("utf-8")).hexdigest()
+    # Defensive: the derived id must be exactly the reserved successor shape the commit ingress
+    # protects; if this invariant ever broke (e.g. the prefix changed), a producer could forge the
+    # id, so fail closed. A ``c`` + 64-hex digest always matches, so this never fires in practice.
+    if not is_reserved_compaction_batch_id(batch_id):  # pragma: no cover - defensive invariant
+        _fail("MH_SPOOL_COMPACTION", "the derived successor id is not in the reserved namespace")
+    return batch_id
 
 
 def _build_new_segment(
@@ -312,6 +325,7 @@ def _swap_ledger(
     *,
     now: datetime,
     insert_new: bool,
+    pseudonymizer: Pseudonymizer | None,
 ) -> bool:
     """Atomically publish/restore the successor, re-point cursors, delete the old row, and audit.
 
@@ -325,6 +339,10 @@ def _swap_ledger(
     inherited from the old segment — but only for rows not already ``delivered``, so a successor
     a prior pass already confirmed delivered is never regressed to pending (which would re-expose an
     acknowledged record to duplicate external delivery).
+
+    ``pseudonymizer`` (when supplied) keys the old→new lineage identifiers recorded in ``_audit``;
+    when it is ``None`` (no installation key wired) the lineage resources are OMITTED as ``NULL``,
+    never stored as a reversible hash (plan §4.7).
     """
 
     failed = False
@@ -361,6 +379,7 @@ def _swap_ledger(
                 old_byte_size=old_record.byte_size,
                 new_record_count=new_record.record_count,
                 new_byte_size=new_record.byte_size,
+                pseudonymizer=pseudonymizer,
             )
     except (sqlite3.Error, StateError):
         failed = True
@@ -374,38 +393,39 @@ def _resolve_successor(
     record: SegmentRecord,
     live_frames: list[SpoolFrameV1],
 ) -> tuple[str, SegmentRecord, bytes, bool, bool] | None:
-    """Probe deterministic candidate ids for a usable successor slot.
+    """Resolve the single deterministic successor slot for this compaction.
 
-    Returns ``(batch_id, new_record, content, needs_publish, insert_new)`` for the first candidate
-    that is free (publish a new file and insert a row), already holds this compaction's intended
-    successor as a committed row (reuse it — crash recovery), or holds it as an unrecorded orphan
-    file (adopt it — insert the row). A candidate occupied by a FOREIGN committed row or a
-    foreign/unreadable orphan file advances the probe, so a colliding id can never strand a
-    mixed-expiry segment's expired frames past their privacy deadline. Returns ``None`` if every
-    candidate up to ``_MAX_PROBE`` is foreign-occupied (the caller reports it; never silent).
+    The successor id is derived from the surviving record ids and lands in the reserved ``c`` +
+    64-hex namespace that producers may never commit into, so it is unforgeable: it is free (publish
+    a new file and insert a row), already holds THIS compaction's intended successor as a committed
+    row (reuse it — crash recovery), or holds it as an unrecorded orphan file (adopt it — insert the
+    row). Because the namespace is reserved, the only way a NON-successor could occupy the id is a
+    SHA-256 collision, which no finite or predictable input can produce; that fails closed (returns
+    ``None``, the caller reports it) rather than ever retiring the old segment against foreign data.
+    There is no bounded probe: a single derived id can no longer be stranded past its privacy
+    deadline by occupying predictable alternatives (G03 review finding #1).
+    Returns ``(batch_id, new_record, content, needs_publish, insert_new)`` or ``None``.
     """
 
-    for probe in range(_MAX_PROBE):
-        candidate = _derive_batch_id(live_frames, probe)
-        new_record, content = _build_new_segment(record, live_frames, candidate)
-        existing = read_segment_record(database, candidate)
-        if existing is not None:
-            if _is_intended_successor(existing, new_record):
-                return candidate, new_record, content, False, False  # reuse committed successor
-            continue  # a foreign committed row occupies this id — try the next candidate
-        candidate_path = root / _PENDING / record.day / f"{candidate}.jsonl"
-        if not os.path.lexists(candidate_path):
-            return candidate, new_record, content, True, True  # free slot — publish and insert
-        # A name exists with no ledger row (a crash orphan or a foreign file). Adopt it only if it
-        # is exactly this compaction's intended successor; otherwise walk to the next candidate.
-        try:
-            parsed = read_trusted_segment(candidate_path, installation_id=installation_id)
-        except SpoolError:
-            continue  # unreadable/foreign orphan — next candidate
-        if _agrees(parsed, new_record.day, candidate, new_record):
-            return candidate, new_record, content, False, True  # our orphan — adopt (insert row)
-        continue  # a foreign orphan file occupies this id — next candidate
-    return None
+    candidate = _derive_batch_id(live_frames)
+    new_record, content = _build_new_segment(record, live_frames, candidate)
+    existing = read_segment_record(database, candidate)
+    if existing is not None:
+        if _is_intended_successor(existing, new_record):
+            return candidate, new_record, content, False, False  # reuse committed successor
+        return None  # reserved id holds a non-successor committed row (SHA-256 collision only)
+    candidate_path = root / _PENDING / record.day / f"{candidate}.jsonl"
+    if not os.path.lexists(candidate_path):
+        return candidate, new_record, content, True, True  # free slot — publish and insert
+    # A name exists with no ledger row (this compaction's crash orphan under the reserved id). Adopt
+    # it only if it is exactly this compaction's intended successor; otherwise fail closed.
+    try:
+        parsed = read_trusted_segment(candidate_path, installation_id=installation_id)
+    except SpoolError:
+        return None  # reserved id holds an unreadable file (SHA-256 collision only)
+    if _agrees(parsed, new_record.day, candidate, new_record):
+        return candidate, new_record, content, False, True  # our orphan — adopt (insert row)
+    return None  # reserved id holds a non-successor file (SHA-256 collision only)
 
 
 def _compact_one(
@@ -414,6 +434,7 @@ def _compact_one(
     installation_id: str,
     now: datetime,
     record: SegmentRecord,
+    pseudonymizer: Pseudonymizer | None,
 ) -> tuple[CompactedSegment | None, SkippedSegment | None]:
     """Compact one segment iff it is mixed-expiry; else return why it was skipped."""
 
@@ -438,14 +459,16 @@ def _compact_one(
             STATUS_FULLY_EXPIRED, None
         )  # all expired — retention prunes it, not compaction
 
-    # Resolve a usable successor id, probing past any foreign occupant of the derived id so a
-    # collision can never strand the expired frames. A build failure leaves the old segment intact.
+    # Resolve the single reserved-namespace successor id. It is free or already this compaction's
+    # successor; only a SHA-256 collision could place a non-successor there, so ``None`` is a
+    # fail-closed integrity outcome, never a routine occupancy. A failure leaves the old segment
+    # fully intact — a live record is never lost.
     try:
         resolved = _resolve_successor(database, root, installation_id, record, live_frames)
     except SpoolError as error:
         return _skip(STATUS_VERIFY_FAILED, error.code)
     if resolved is None:
-        return _skip(STATUS_COLLISION, "MH_SPOOL_COMPACTION")  # every candidate foreign-occupied
+        return _skip(STATUS_RESERVED_CONFLICT, "MH_SPOOL_COMPACTION")
     new_batch_id, new_record, content, needs_publish, insert_new = resolved
     new_path = root / _PENDING / record.day / f"{new_batch_id}.jsonl"
 
@@ -468,7 +491,9 @@ def _compact_one(
     if not _agrees(parsed_new, new_record.day, new_batch_id, new_record):
         return _skip(STATUS_VERIFY_FAILED, "MH_SPOOL_VERIFY")
 
-    if not _swap_ledger(database, record, new_record, now=now, insert_new=insert_new):
+    if not _swap_ledger(
+        database, record, new_record, now=now, insert_new=insert_new, pseudonymizer=pseudonymizer
+    ):
         return _skip(STATUS_COMMIT_FAILED, "MH_SPOOL_COMPACTION")
 
     file_outcome = _remove_old_file(old_path)
@@ -493,6 +518,7 @@ def compact_apply(
     installation_id: str,
     now: datetime,
     confirm: bool,
+    pseudonymizer: Pseudonymizer | None = None,
 ) -> CompactionResult:
     """Rewrite every mixed-expiry committed segment into a new unexpired-only segment, audited.
 
@@ -502,6 +528,14 @@ def compact_apply(
     some live) is rewritten, a segment with nothing expired or with everything expired is left alone
     (retention prunes the fully-expired ones), and an unreadable or disagreeing segment is left for
     verify/reconciliation. Every failure normalizes to a fixed ``MH_SPOOL_*`` code.
+
+    ``pseudonymizer`` keys the old→new lineage recorded in ``_audit`` per plan §4.7. A maintenance
+    caller loads the installation key with
+    :func:`milhouse.privacy.keys.load_pseudonym_key` and passes the resulting
+    :class:`~milhouse.privacy.pseudonym.Pseudonymizer`; when it is absent (no key provisioned yet)
+    the lineage resources are recorded as ``NULL`` rather than as a reversible hash. The
+    derivation runs inside the audit boundary, which requires the exact trusted ``Pseudonymizer``
+    type, so an untrusted look-alike can never persist a caller-shaped value.
     """
 
     _validate_common(database, spool_root, installation_id)
@@ -515,7 +549,7 @@ def compact_apply(
     skipped: list[SkippedSegment] = []
     with barrier.exclusive():
         for record in list_segment_records(database):
-            done, skip = _compact_one(database, root, installation_id, now, record)
+            done, skip = _compact_one(database, root, installation_id, now, record, pseudonymizer)
             if done is not None:
                 compacted.append(done)
             else:

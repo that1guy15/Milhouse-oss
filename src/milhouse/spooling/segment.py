@@ -33,6 +33,14 @@ MAX_SEGMENT_FRAMES = 1_000_000
 MAX_RETENTION_DAYS = 3_650  # matches the config `[retention]` ceiling
 
 BATCH_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", flags=re.ASCII)
+# The reserved compaction successor namespace: a lowercase ``c`` followed by a 64-hex SHA-256 digest
+# (see :mod:`milhouse.spooling.compaction`). It is a valid ``BATCH_ID_PATTERN`` shape, so a producer
+# COULD otherwise commit a segment at a derived successor id and strand a mixed-expiry segment's
+# expired frames past their privacy deadline. The producer commit ingress rejects this namespace, so
+# the derived successor id is unforgeable — only compaction itself ever writes into it (plan
+# §§4.8-4.9; G03 review finding #1). Compaction builds its own headers directly, so the header type
+# must NOT reject the namespace; only the producer ingress does.
+RESERVED_COMPACTION_BATCH_ID_PATTERN = re.compile(r"c[0-9a-f]{64}", flags=re.ASCII)
 EXPORTER_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", flags=re.ASCII)
 _TARGET_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", flags=re.ASCII)
 _SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
@@ -48,6 +56,16 @@ def _fail(code: str, message: str) -> NoReturn:
 def _validate_batch_id(value: object) -> None:
     if type(value) is not str or BATCH_ID_PATTERN.fullmatch(value) is None:
         _fail("MH_SPOOL_BATCH_ID", "a bounded safe batch id is required")
+
+
+def is_reserved_compaction_batch_id(value: object) -> bool:
+    """Whether ``value`` lies in the reserved compaction successor namespace (``c`` + 64-hex).
+
+    The producer commit ingress rejects this namespace so no caller-chosen segment can occupy a
+    compaction-derived successor id; compaction itself is the only writer into it.
+    """
+
+    return type(value) is str and RESERVED_COMPACTION_BATCH_ID_PATTERN.fullmatch(value) is not None
 
 
 def _validate_positive_sequence(value: object) -> None:
