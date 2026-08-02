@@ -34,9 +34,22 @@ Plan amendment A02, approved by the owner on 2026-07-22 and ratified by ADR 0016
 persisted local structured-log contract in section 4.15 and adds the `local_log` egress surface to
 section 4.7. It authorizes installation-scoped local operational metadata only, adds no external
 egress, record, or publication authority, and expands no retention beyond the existing 14-day log
-class. Amendment A03, approved by the owner on 2026-07-22 and ratified by ADR 0017, records the exact
-bounded historical DCO disposition for the D01 PR #21 squash incident without weakening future
-enforcement.
+class. Reason: section 1 forbids locking a stored contract inside implementation, and the persisted
+local structured-log wire is a new locked storage/lifecycle contract that must be recorded as a
+numbered amendment. Alternatives considered: leaving the log surface unstructured or provider-defined
+(rejected because W03, W06, and W16 need a stable, self-describing, bounded wire to persist, rotate,
+recover, and retire), and folding it into the existing record spool (rejected because operational logs
+are a distinct 14-day class with their own file surface and must not enter the record/egress
+pipeline). Compatibility and migration: no public stored-log format has shipped, so the contract is v1
+with no migration and no implicit adoption of preexisting files, split across W02 (wire, encoder,
+sink), W03 (file surface, recovery, retention), W06 (CLI/stderr), and W16 (backup, restore, purge).
+Security: the wire carries installation-scoped operational metadata only — never secrets, PII, paths,
+prompts, transcripts, or tool output — and adds no external egress, record, publication, or retention
+authority beyond the existing 14-day log class. Revised tests: ADR 0016's revised validation plus the
+section 4.15 file-surface, rotation, recovery, concurrency, bound, and retention gate assertions
+exercise the contract at G03. Amendment A03, approved by the owner on 2026-07-22 and ratified by
+ADR 0017, records the exact bounded historical DCO disposition for the D01 PR #21 squash incident
+without weakening future enforcement.
 
 Plan amendment A04, approved by the owner on 2026-07-23, resolves defect D02 by re-scoping the W02 gate
 G02 assertions to certify the W02 redaction, rendering, structured-error, structured-event, and

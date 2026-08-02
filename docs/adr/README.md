@@ -9,7 +9,8 @@ an owner-approved process adaptation dated 2026-07-19; it changes no public API,
 stored schema, privacy promise, or product scope. ADRs 0016 and 0017 record
 owner-approved amendments A02 and A03 dated 2026-07-22: ADR 0016 ratifies the
 persisted local structured-log contract and amends ADR 0007, and ADR 0017 records
-the bounded D01 historical DCO disposition. The ADR 0004 addendum ratifies
+the bounded D01 historical DCO disposition. An ADR 0016 addendum ratifies amendment
+A05 dated 2026-07-23 (the exact v1 stored-log schema). The ADR 0004 addendum ratifies
 owner-approved amendment A06 dated 2026-07-28 and makes the installation-account
 filesystem-containment boundary explicit. The ADR 0007 addendum ratifies
 owner-approved amendment A07 dated 2026-08-01, binding W03 audited compaction to
@@ -33,7 +34,7 @@ compaction-successor namespace with its auto-converging upgrade remediation.
 | [0013](0013-packaging-versioning-and-release.md) | Packaging, versioning, artifacts, and release train |
 | [0014](0014-support-governance-security-and-provenance.md) | Support, governance, security response, and provenance |
 | [0015](0015-agent-engineering-workflow.md) | Agent engineering loop, five focused skills, read-only review, sanitized learning, discovery, and authority boundaries |
-| [0016](0016-local-structured-log-persistence.md) | Persisted local structured-log wire, namespace, durability, rotation, recovery, concurrency, and `local_log` egress (amendment A02; amends ADR 0007) |
+| [0016](0016-local-structured-log-persistence.md) | Persisted local structured-log wire, namespace, durability, rotation, recovery, concurrency, and `local_log` egress (amendments A02 and A05; amends ADR 0007) |
 | [0017](0017-d01-dco-historical-disposition.md) | Exact bounded D01 PR #21 historical DCO disposition (amendment A03) |
 
 ## Status vocabulary
