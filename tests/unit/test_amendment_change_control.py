@@ -44,10 +44,31 @@ _REQUIRED_FIELDS: dict[str, str] = {
     "revised tests": r"\brevised tests\b",
 }
 
-# An amendment ratified by (or amending) an ADR. Captures the four-digit ADR number.
+# An amendment ratified by (or amending) an ADR. Every match matters: one amendment may ratify
+# multiple ADRs, and every associated ADR row must name it.
 _ADR_RATIFIED = re.compile(r"ratified by (?:an?\s+)?adr\s+(\d{4})", re.IGNORECASE)
-# Every amendment reference of any width. The first occurrence of an id opens its block.
-_AMENDMENT_REF = re.compile(r"(?:process |plan )?amendment (A\d+)", re.IGNORECASE)
+# A declaration starts either a register paragraph/line or a new sentence. Capturing the raw token
+# lets the checker reject Markdown-styled or otherwise malformed identifiers instead of skipping
+# them. Bare ``Amendment A03`` is retained for the historical register spelling.
+_AMENDMENT_DECLARATION = re.compile(
+    r"(?:^|(?<=\.\s))"
+    r"(?P<kind>process amendment|plan amendment|amendment)\s+"
+    r"(?P<token>\S+)",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_CANONICAL_ID = re.compile(r"A(?P<number>0[1-9]|[1-9][0-9]+),?", re.IGNORECASE)
+_AMENDMENT_REFERENCE = re.compile(r"\bamendment\s+[*_`]*(?P<aid>A[1-9][0-9]*)[*_`]*", re.IGNORECASE)
+_ADR_ROW = re.compile(
+    r"^\|\s*\[(?P<adr>[0-9]{4})\]\([^)]+\)\s*\|(?P<decision>.*?)\|\s*$",
+    flags=re.MULTILINE,
+)
+
+# Process exemptions are integrity-bound to the approved declaration, not merely to an identifier.
+# A duplicate/reused id is rejected separately before this exemption can apply.
+_PROCESS_EXEMPT_DECLARATIONS: dict[str, tuple[str, str]] = {
+    "A01": ("process amendment", "establishes the agent engineering workflow"),
+    "A03": ("amendment", "records the exact bounded historical dco disposition"),
+}
 
 
 def _register(plan_text: str) -> str:
@@ -56,22 +77,47 @@ def _register(plan_text: str) -> str:
     return plan_text[start:end]
 
 
-def _amendment_blocks(register: str) -> dict[str, str]:
-    """Return {amendment id: block text}, the block running from an id's first reference to the next
-    reference of a DIFFERENT amendment (or the register end)."""
+def _declarations(register: str) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Return canonical ``(id, kind, block)`` declarations and malformed-id violations."""
 
-    spans = [(m.start(), m.group(1)) for m in _AMENDMENT_REF.finditer(register)]
-    blocks: dict[str, str] = {}
-    for index, (start, aid) in enumerate(spans):
-        if aid in blocks:
+    matches = list(_AMENDMENT_DECLARATION.finditer(register))
+    declarations: list[tuple[str, str, str]] = []
+    violations: list[str] = []
+    for index, match in enumerate(matches):
+        token = match.group("token")
+        canonical = _CANONICAL_ID.fullmatch(token)
+        if canonical is None:
+            referenced = re.search(r"A[0-9]+", token, flags=re.IGNORECASE)
+            subject = referenced.group(0).upper() if referenced is not None else token
+            violations.append(f"{subject} has a malformed amendment identifier token {token!r}")
             continue
-        end = len(register)
-        for next_start, next_id in spans[index + 1 :]:
-            if next_id != aid:
-                end = next_start
-                break
-        blocks[aid] = register[start:end]
+        aid = f"A{int(canonical.group('number')):02d}"
+        start = match.start("kind")
+        end = matches[index + 1].start("kind") if index + 1 < len(matches) else len(register)
+        declarations.append((aid, match.group("kind").lower(), register[start:end]))
+    return declarations, violations
+
+
+def _amendment_blocks(register: str) -> dict[str, str]:
+    """Return the first canonical block for each declared amendment id."""
+
+    declarations, _ = _declarations(register)
+    blocks: dict[str, str] = {}
+    for aid, _kind, block in declarations:
+        blocks.setdefault(aid, block)
     return blocks
+
+
+def _adr_rows(index_text: str) -> tuple[dict[str, str], list[str]]:
+    """Parse the ADR Markdown table structurally and reject duplicate ADR rows."""
+
+    grouped: dict[str, list[str]] = {}
+    for match in _ADR_ROW.finditer(index_text):
+        grouped.setdefault(match.group("adr"), []).append(match.group("decision"))
+    violations = [
+        f"ADR {adr} has duplicate index rows" for adr, rows in grouped.items() if len(rows) > 1
+    ]
+    return {adr: rows[0] for adr, rows in grouped.items()}, violations
 
 
 def evaluate(plan_text: str, adr_index_text: str) -> list[str]:
@@ -82,21 +128,54 @@ def evaluate(plan_text: str, adr_index_text: str) -> list[str]:
     ADR's own index row (the line linking the ADR file), so a missing/wrong-ADR registration fails.
     """
 
-    blocks = _amendment_blocks(_register(plan_text))
-    index_lines = adr_index_text.splitlines()
-    violations: list[str] = []
-    for aid, block in sorted(blocks.items()):
-        if aid in _PROCESS_EXEMPT:
+    register = _register(plan_text)
+    declarations, violations = _declarations(register)
+    rows, row_violations = _adr_rows(adr_index_text)
+    violations.extend(row_violations)
+
+    counts: dict[str, int] = {}
+    for aid, _kind, _block in declarations:
+        counts[aid] = counts.get(aid, 0) + 1
+    for aid, count in sorted(counts.items()):
+        if count > 1:
+            violations.append(f"{aid} has duplicate amendment declarations")
+
+    ordered = [int(aid[1:]) for aid, _kind, _block in declarations]
+    unique_ordered = list(dict.fromkeys(ordered))
+    if unique_ordered != sorted(unique_ordered):
+        violations.append("amendment sequence is out of order")
+    if len(unique_ordered) > 1 and sorted(unique_ordered) != list(
+        range(min(unique_ordered), max(unique_ordered) + 1)
+    ):
+        violations.append("amendment sequence contains an unexpected gap")
+
+    declared_ids = set(counts)
+    for reference in _AMENDMENT_REFERENCE.finditer(register):
+        aid = f"A{int(reference.group('aid')[1:]):02d}"
+        if aid not in declared_ids:
+            violations.append(f"{aid} reference has no canonical amendment declaration")
+
+    first: dict[str, tuple[str, str]] = {}
+    for aid, kind, block in declarations:
+        first.setdefault(aid, (kind, block))
+    for aid, (kind, block) in sorted(first.items()):
+        exempt = _PROCESS_EXEMPT_DECLARATIONS.get(aid)
+        if exempt is not None:
+            expected_kind, required_text = exempt
+            normalized_block = " ".join(block.lower().split())
+            if counts[aid] != 1 or kind != expected_kind or required_text not in normalized_block:
+                violations.append(
+                    f"{aid} does not match its approved process-exemption declaration"
+                )
             continue
         low = block.lower()
         missing = [name for name, pat in _REQUIRED_FIELDS.items() if re.search(pat, low) is None]
         if missing:
             violations.append(f"{aid} omits change-control fields: {missing}")
-        ratified = _ADR_RATIFIED.search(block)
-        if ratified is not None:
-            adr = ratified.group(1)
-            row = next((line for line in index_lines if f"{adr}-" in line), "")
-            if aid not in row:
+        ratified_adrs = {match.group(1) for match in _ADR_RATIFIED.finditer(block)}
+        for adr in sorted(ratified_adrs):
+            decision = rows.get(adr)
+            if decision is None or re.search(rf"\b{re.escape(aid)}\b", decision) is None:
                 violations.append(f"{aid} is not registered on ADR {adr}'s index row")
     return violations
 
@@ -118,7 +197,7 @@ def test_the_process_allowlist_reads_as_process_or_disposition() -> None:
     # The exempt set must be genuinely non-contract, not a convenient escape hatch.
     blocks = _amendment_blocks(_register(_PLAN))
     signals = ("process ", "disposition", "without changing", "changes no", "without weakening")
-    for amendment in _PROCESS_EXEMPT:
+    for amendment in _PROCESS_EXEMPT_DECLARATIONS:
         block = blocks[amendment].lower()
         assert any(signal in block for signal in signals), (
             f"{amendment} is exempt but does not read as a process/disposition amendment"
@@ -168,6 +247,31 @@ def test_a_multi_digit_amendment_id_is_enumerated_and_checked() -> None:
     assert any("A10" in v for v in evaluate(plan, _ADR_INDEX))
 
 
+def test_a_styled_amendment_id_is_rejected_instead_of_skipped() -> None:
+    plan = _synth_plan("Plan amendment **A08**, approved by the owner, changes a locked contract.")
+    violations = evaluate(plan, _ADR_INDEX)
+    assert any("A08" in v and "identifier" in v for v in violations), violations
+
+
+def test_a_reused_process_exemption_is_rejected() -> None:
+    plan = _synth_plan(
+        "Process amendment A01, approved by the owner, changes no locked contract. "
+        "Reason: process only. Amendment A01, approved by the owner, changes a locked "
+        "storage contract."
+    )
+    violations = evaluate(plan, _ADR_INDEX)
+    assert any("A01" in v and "duplicate" in v for v in violations), violations
+
+
+def test_out_of_order_or_gapped_amendment_declarations_are_rejected() -> None:
+    plan = _synth_plan(
+        f"Plan amendment A02, approved by the owner, changes a contract. {_ALL_FIELDS} "
+        f"Plan amendment A04, approved by the owner, changes a contract. {_ALL_FIELDS}"
+    )
+    violations = evaluate(plan, _ADR_INDEX)
+    assert any("sequence" in v for v in violations), violations
+
+
 def test_a_missing_adr_index_registration_is_rejected() -> None:
     amendment = f"Plan amendment A08, ratified by ADR 0099, changes a contract. {_ALL_FIELDS}"
     index = _index_with("| [0099](0099-thing.md) | A thing with no amendment named |")
@@ -183,6 +287,50 @@ def test_a_wrong_adr_registration_is_rejected() -> None:
     )
     violations = evaluate(_synth_plan(amendment), index)
     assert any("A08" in v and "0099" in v for v in violations), violations
+
+
+def test_prose_outside_the_adr_table_cannot_satisfy_registration() -> None:
+    amendment = f"Plan amendment A08, ratified by ADR 0099, changes a contract. {_ALL_FIELDS}"
+    index = (
+        "# index\n\nADR [0099](0099-thing.md) ratifies amendment A08.\n\n"
+        "| ADR | Ratified decision |\n|---|---|\n"
+        "| [0099](0099-thing.md) | A thing with no amendment named |\n"
+    )
+    violations = evaluate(_synth_plan(amendment), index)
+    assert any("A08" in v and "0099" in v for v in violations), violations
+
+
+def test_every_declared_adr_ratification_requires_its_own_row_binding() -> None:
+    amendment = (
+        f"Plan amendment A08, ratified by ADR 0099 and ratified by ADR 0088, "
+        f"changes a contract. {_ALL_FIELDS}"
+    )
+    index = _index_with(
+        "| [0099](0099-thing.md) | A thing (amendment A08) |\n"
+        "| [0088](0088-other.md) | Other decision |"
+    )
+    violations = evaluate(_synth_plan(amendment), index)
+    assert any("A08" in v and "0088" in v for v in violations), violations
+
+
+def test_duplicate_adr_rows_are_rejected() -> None:
+    amendment = f"Plan amendment A08, ratified by ADR 0099, changes a contract. {_ALL_FIELDS}"
+    index = _index_with(
+        "| [0099](0099-thing.md) | A thing (amendment A08) |\n"
+        "| [0099](0099-copy.md) | A duplicate (amendment A08) |"
+    )
+    violations = evaluate(_synth_plan(amendment), index)
+    assert any("0099" in v and "duplicate" in v for v in violations), violations
+
+
+def test_an_adr_addendum_ratification_is_structurally_bound() -> None:
+    amendment = (
+        f"Plan amendment A08, ratified by an ADR 0099 addendum, changes a contract. {_ALL_FIELDS}"
+    )
+    missing = evaluate(_synth_plan(amendment), _index_with("| [0099](0099-thing.md) | A thing |"))
+    assert any("A08" in violation and "0099" in violation for violation in missing), missing
+    registered = _index_with("| [0099](0099-thing.md) | A thing (amendment A08) |")
+    assert evaluate(_synth_plan(amendment), registered) == []
 
 
 def test_a_complete_registered_contract_amendment_passes() -> None:

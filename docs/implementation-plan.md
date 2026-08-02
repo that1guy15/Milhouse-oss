@@ -138,7 +138,14 @@ Because a `c`+64-hex id is a legal producer batch id, a pre-reservation schema c
 reserved-namespace segment; on acquisition a restartable exclusive-barrier remediation auto-converges
 such a legacy occupant by rewriting it to a fresh non-reserved id (all records preserved, cursors
 re-pointed, the old file retired under a durable tombstone), so a legal install is never wedged and
-expired data is never retained. Compaction also records a durable retirement tombstone for the
+expired data is never retained. Migration 12 records authoritative successor/rehome intents. Because
+that table begins empty on upgrade, the first exclusive pass reconstructs and verifies every genuine
+pre-intent old-source/successor crash pair from the trusted segment bytes and atomically finishes that
+swap before it classifies any remaining reserved row as a legacy occupant; ambiguity fails safely.
+Rehome uses a durably bound collision-resistant 256-bit ordinary ID, retries any finite set of
+producer-occupied rows/files/intents without a probe bound or SQLite sequence ceiling, and atomically
+replaces a recorded target only after proving it foreign while the old source remains authoritative.
+Compaction also records a durable retirement tombstone for the
 superseded old segment in the same transaction as the ledger swap, and reconciliation completes that
 deletion only behind a positive day-directory durability fence, never re-adopting the retired bytes.
 Reason: the first remediation established provenance only by loading a file and guarded legacy occupants
@@ -148,17 +155,20 @@ audit lineage entirely to W06/`init` (rejected by the owner in favor of binding 
 recording of the key ID at first compaction (rejected because it cannot prove installation authority);
 and a bounded operator-run remediation for legacy occupants (rejected by the owner in favor of an
 auto-converging migration needing no operator step). Compatibility and migration: migration 11 adds the
-singleton `_installation_key` table (schema 11); the auto-converging reserved-occupant remediation and
-the compaction retirement tombstone are crash-restartable and, in pre-alpha where no install has shipped,
-are deterministic no-ops; A07 changes no wire byte, retention rule, product scope, tag, publication, or
-release authority and preserves every privacy invariant. Security impact: audit lineage becomes
+singleton `_installation_key` table (schema 11); migration 12 adds the successor/rehome intent table and
+generic sequence table, while its first exclusive maintenance pass reconstructs pre-intent successors
+before rehome. The remediation and compaction retirement tombstone are crash-restartable and, in
+pre-alpha where no install has shipped, normally no-ops; A07 changes no wire byte, retention rule,
+product scope, tag, publication, or release authority and preserves every privacy invariant. Security impact: audit lineage becomes
 attributable to the installation's own key (wrong, cross-installation, and forged keys fail before any
 mutation), the successor namespace is reserved end to end so a reachable expired-data stranding vector is
 removed, and a commit-uncertain resurrection of privacy-expired bytes is closed behind a durability
 fence — while a legal upgraded install stays usable. Revised tests: a wrong/cross-installation key and an
 unprovisioned key each fail compaction before the barrier while the exact recorded key/epoch passes; a
-legacy committed reserved-namespace segment auto-converges to a non-reserved id across every crash
-boundary with no live-record loss or expired retention; every exported/direct writer path rejects a
+schema-11 old source plus its valid crash-published successor migrates to exactly one authoritative
+copy with cursor and exporter state preserved; a legacy reserved occupant auto-converges across every
+allocation/publish/swap/retire crash boundary, including finite producer occupation and a foreign
+recorded target, with no live-record loss or expired retention; every exported/direct writer path rejects a
 reserved name while the unexported compaction authority still publishes; a commit-uncertain compaction
 unlink never re-adopts the old segment and clears its tombstone only after a durability fence; and a
 change-control test asserts every numbered amendment records its required fields and is registered in the

@@ -60,7 +60,13 @@ this addendum states the resulting contract.
   a committed reserved-namespace segment. On acquisition a **restartable exclusive-barrier remediation
   auto-converges** such a legacy occupant by rewriting it to a fresh non-reserved id — preserving every
   record, re-pointing cursors, and retiring the old file under a durable tombstone — so a legal upgraded
-  install is **never wedged** and no expired data is retained. Because the upgrade guarantees the
+  install is **never wedged** and no expired data is retained. Migration 12's authoritative intent
+  table starts empty on upgrade, so the first exclusive pass reconstructs and verifies any genuine
+  pre-intent old-source/successor crash pair and atomically finishes that swap before rehoming the
+  remaining unproven reserved rows. Rehome allocations are durably bound collision-resistant 256-bit
+  ordinary IDs; allocation retries finite producer occupation without a probe bound or SQLite sequence
+  ceiling and replaces a recorded target only after it is verified foreign while the source remains
+  authoritative. Because the upgrade guarantees the
   reserved namespace then contains only compaction successors, the single deterministic-slot successor
   allocation stays collision-safe. Compaction additionally records a **durable retirement tombstone for
   the superseded old segment in the same transaction as the ledger swap**; reconciliation completes that
