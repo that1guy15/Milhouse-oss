@@ -11,7 +11,10 @@ owner-approved amendments A02 and A03 dated 2026-07-22: ADR 0016 ratifies the
 persisted local structured-log contract and amends ADR 0007, and ADR 0017 records
 the bounded D01 historical DCO disposition. The ADR 0004 addendum ratifies
 owner-approved amendment A06 dated 2026-07-28 and makes the installation-account
-filesystem-containment boundary explicit.
+filesystem-containment boundary explicit. The ADR 0007 addendum ratifies
+owner-approved amendment A07 dated 2026-08-01, binding W03 audited compaction to
+the installation's control-plane pseudonym key ID/epoch and adding the reserved
+compaction-successor namespace with its auto-converging upgrade remediation.
 
 | ADR | Ratified decision |
 |---|---|
@@ -21,7 +24,7 @@ filesystem-containment boundary explicit.
 | [0004](0004-spool-sqlite-commit-and-recovery.md) | Durable spool, SQLite control state, commit, replay, recovery, and the A06 installation-account filesystem-containment boundary |
 | [0005](0005-clickhouse-analytical-storage.md) | ClickHouse analytical storage, migrations, and recovery |
 | [0006](0006-alert-incident-and-feedback-state.md) | Alert, incident, and verified-feedback state machines |
-| [0007](0007-privacy-identity-egress-and-retention.md) | Trust, privacy, installation identity, egress, retention, and purge |
+| [0007](0007-privacy-identity-egress-and-retention.md) | Trust, privacy, installation identity, egress, retention, and purge, and the A07 installation-key-provenance and reserved compaction-namespace upgrade addendum |
 | [0008](0008-trusted-plugin-boundary.md) | Trusted in-process plugin boundary and collector API |
 | [0009](0009-scheduler-process-and-service-model.md) | Scheduler, processes, jobs, and explicit OS services |
 | [0010](0010-local-stdio-mcp.md) | Local stdio MCP with bounded, read-first tools |

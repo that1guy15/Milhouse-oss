@@ -103,6 +103,54 @@ cooperating-writer, deterministic directory-displacement, recovery-copy-preserva
 coverage; no acceptance test may claim containment against hostile code already executing as the
 Milhouse account.
 
+Plan amendment A07, approved by the owner on 2026-08-01 and ratified by an ADR 0007 addendum, resolves
+the deep P1s independent reviews reproduced in the W03 audited-compaction remediation (defects
+D07/D08): installation-key provenance and the reserved compaction-successor namespace upgrade. **(1)
+Installation-key provenance.** A persisted keyed audit derivative is trustworthy only if produced by
+the installation's own key; because `Pseudonymizer` is constructible from any 32 caller-supplied bytes,
+neither an exact-type gate nor merely loading a file at the config-bound path proves installation
+identity. W03 records the installation's non-secret pseudonym key ID and epoch in the SQLite control
+plane (migration 11, the singleton `_installation_key` table), and compaction (a) binds the
+config/runtime `state_root` to the control database's state root, (b) reads the recorded key ID/epoch,
+and (c) loads the key with `load_pseudonym_key(config, paths, epoch=<recorded>,
+expected_key_id=<recorded>)`, failing closed before any file, ledger, cursor, or audit mutation when the
+record is absent (unprovisioned), the key is missing/unloadable/malformed, or its derived ID/epoch does
+not match. Compaction accepts no caller-supplied key and its audit constructor is non-optional. `init`
+(W06) establishes the recorded key ID/epoch when it creates the key file; until then compaction fails
+closed and cannot run. **(2) Reserved compaction-successor namespace and upgrade.** The `c[0-9a-f]{64}`
+successor namespace is reserved from schema 10; the producer commit ingress rejects it, and only
+compaction publishes into it through an unexported, reserved-only publication authority — the public
+`publish_segment_bytes`/`write_spool_segment` surface rejects reserved names with no caller bypass.
+Because a `c`+64-hex id is a legal producer batch id, a pre-reservation schema could hold a committed
+reserved-namespace segment; on acquisition a restartable exclusive-barrier remediation auto-converges
+such a legacy occupant by rewriting it to a fresh non-reserved id (all records preserved, cursors
+re-pointed, the old file retired under a durable tombstone), so a legal install is never wedged and
+expired data is never retained. Compaction also records a durable retirement tombstone for the
+superseded old segment in the same transaction as the ledger swap, and reconciliation completes that
+deletion only behind a positive day-directory durability fence, never re-adopting the retired bytes.
+Reason: the first remediation established provenance only by loading a file and guarded legacy occupants
+by aborting all spool acquisition, which independent review reproduced as, respectively, caller-forgeable
+lineage and a permanent acquisition wedge of a legal install. Alternatives considered: deferring keyed
+audit lineage entirely to W06/`init` (rejected by the owner in favor of binding it now); trust-on-first-use
+recording of the key ID at first compaction (rejected because it cannot prove installation authority);
+and a bounded operator-run remediation for legacy occupants (rejected by the owner in favor of an
+auto-converging migration needing no operator step). Compatibility and migration: migration 11 adds the
+singleton `_installation_key` table (schema 11); the auto-converging reserved-occupant remediation and
+the compaction retirement tombstone are crash-restartable and, in pre-alpha where no install has shipped,
+are deterministic no-ops; A07 changes no wire byte, retention rule, product scope, tag, publication, or
+release authority and preserves every privacy invariant. Security impact: audit lineage becomes
+attributable to the installation's own key (wrong, cross-installation, and forged keys fail before any
+mutation), the successor namespace is reserved end to end so a reachable expired-data stranding vector is
+removed, and a commit-uncertain resurrection of privacy-expired bytes is closed behind a durability
+fence — while a legal upgraded install stays usable. Revised tests: a wrong/cross-installation key and an
+unprovisioned key each fail compaction before the barrier while the exact recorded key/epoch passes; a
+legacy committed reserved-namespace segment auto-converges to a non-reserved id across every crash
+boundary with no live-record loss or expired retention; every exported/direct writer path rejects a
+reserved name while the unexported compaction authority still publishes; a commit-uncertain compaction
+unlink never re-adopts the old segment and clears its tombstone only after a durability fence; and a
+change-control test asserts every numbered amendment records its required fields and is registered in the
+ADR index.
+
 ## 2. Product contract
 
 ### 2.1 Product definition
@@ -838,7 +886,7 @@ Default retention:
 | Pending spool | Until successful delivery or the record-class privacy expiry, whichever comes first |
 | Backups | Manual policy |
 
-Spool, ClickHouse, and SQLite projections retain records for their data-class periods. Pending records remain retryable until delivered or until their data-class privacy expiry. Compaction rewrites only expired frames into a new fsynced segment, records old/new hashes and lineage transactionally, and unlinks the superseded file only after verification; interruption is restartable. Per ADR 0007 addendum A07 (2026-08-01): compaction's keyed lineage is bound to the installation's own pseudonym key — established by loading the key inside the validated config/runtime-path boundary (`load_pseudonym_key`), not by trusting a caller-supplied object — and compaction fails closed before any mutation on an unprovisioned/wrong/absent key; the reserved `c[0-9a-f]{64}` successor namespace is reserved from schema 10, and a restartable exclusive-barrier upgrade check fails closed on any legacy committed reserved-namespace segment so the single-slot allocation stays collision-safe. Retention's crash-safe prune persists a durable retirement tombstone before unlink, and reconciliation completes the deletion only after a positive durability fence, never re-adopting a privacy-expired segment. Milhouse does not promise forensic secure erasure on SSD, copy-on-write, snapshot, or journaled storage. Privacy-sensitive operators must use encrypted volumes and apply platform/media sanitization when retiring storage. `retention preview` lists exact counts and bytes without mutation. `retention apply --confirm` records an audit event.
+Spool, ClickHouse, and SQLite projections retain records for their data-class periods. Pending records remain retryable until delivered or until their data-class privacy expiry. Compaction rewrites only expired frames into a new fsynced segment, records old/new hashes and lineage transactionally, and unlinks the superseded file only after verification; interruption is restartable. Per ADR 0007 addendum A07 (2026-08-01): compaction's keyed lineage is bound to the installation's own pseudonym key by IDENTITY, not merely by loading a file — W03 records the installation's non-secret key ID and epoch in the SQLite control plane (migration 11, `_installation_key`), and compaction binds its config/runtime `state_root` to the control database's state root, reads that record, loads the key with the recorded `expected_key_id`/epoch, and fails closed before any file, ledger, cursor, or audit mutation on an absent record (unprovisioned), a missing/unloadable/malformed key, or an ID/epoch mismatch (no caller-supplied key). The reserved `c[0-9a-f]{64}` successor namespace is reserved from schema 10: the commit ingress rejects it and only compaction publishes into it through an unexported reserved-only authority (no public bypass); because `c`+64-hex is a legal producer batch id, a restartable exclusive-barrier remediation auto-converges any legacy committed reserved-namespace segment by rewriting it to a fresh non-reserved id (all records preserved, cursors re-pointed, old file retired under a durable tombstone), so a legal install is never wedged and expired data is never retained. Compaction records a durable retirement tombstone for the superseded old segment in the same transaction as the ledger swap, and reconciliation completes that deletion only after a positive day-directory durability fence, never re-adopting the retired bytes. Retention's crash-safe prune likewise persists a durable retirement tombstone before unlink, and reconciliation completes the deletion only after a positive durability fence, never re-adopting a privacy-expired segment. Milhouse does not promise forensic secure erasure on SSD, copy-on-write, snapshot, or journaled storage. Privacy-sensitive operators must use encrypted volumes and apply platform/media sanitization when retiring storage. `retention preview` lists exact counts and bytes without mutation. `retention apply --confirm` records an audit event.
 
 Target purge is an explicit destructive workflow. `milhouse targets purge TARGET --dry-run` produces an exact manifest and digest. Confirmation requires both `--confirm TARGET` and that manifest digest. The command acquires an exclusive target maintenance fence plus the compaction/retention fence, blocks every scheduler, receiver, CLI, MCP, manual-collection, notifier, audit, and plugin write for that target, and revalidates the manifest before mutation. It then removes that target's pending, delivered, and quarantine segments; SQLite projections; ClickHouse rows using a mutation that is waited on and verified; and generated briefs. The fences remain held through verification and the final metadata-only purge audit tombstone. Immutable backups containing the target are listed separately. Partial deletion is resumable, makes health unhealthy until resolved, and is covered by race and interrupted-purge tests.
 
