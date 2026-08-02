@@ -1045,6 +1045,138 @@ def test_a_rehome_of_a_disagreeing_occupant_is_skipped(tmp_path: Path) -> None:
         database.close()
 
 
+def test_a_rehome_converges_when_a_producer_occupies_the_first_target(tmp_path: Path) -> None:
+    # A07 / review #79-P1-1 (exact reproduction, now DEFEATED): the rehome target is a MONOTONIC
+    # counter, not a content-derived predictable id, and it increments past any occupied id. Even if
+    # a producer commits a valid ordinary segment at the FIRST target the counter would pick, the
+    # legacy occupant still auto-converges (to the next free target) and the producer segment is
+    # untouched — the unbounded counter always finds a free id.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        reserved = "c" + "e" * 64
+        base_frames = _seed_reserved_occupant(
+            database, store, spool_root, reserved, [("r1", _LIVE_AT), ("r2", _LIVE_AT)]
+        )
+        first_target = "r" + format(0, "064x")  # the first value the rehome counter allocates
+        _commit(store, first_target, [("producer-1", _LIVE_AT)])  # a legal ordinary producer seg
+
+        result = _compact(database, barrier, spool_root)
+        assert [r.old_batch_id for r in result.rehomed] == [reserved]  # still converged
+        new_id = result.rehomed[0].new_batch_id
+        assert new_id != first_target  # skipped the occupied target
+        assert not is_reserved_compaction_batch_id(new_id)
+        assert first_target in _segment_rows(database)  # the producer segment is untouched
+        assert reserved not in _segment_rows(database)  # the legacy occupant is gone
+        assert set(_record_ids(spool_root, new_id)) == {
+            str(frame.record.record_id) for frame in base_frames
+        }
+    finally:
+        database.close()
+
+
+def test_a_pre_upgrade_reserved_orphan_is_rehomed_not_kept_as_a_successor(tmp_path: Path) -> None:
+    # A07 / review #79-P1-2 (exact reproduction, DEFEATED): a pre-upgrade producer crash can leave
+    # a valid reserved-namespace FILE with no ledger row; mandatory reconciliation registers it
+    # origin='reconciled'. Origin cannot prove it a genuine compaction successor — only a durable
+    # successor intent can, and a legacy orphan has none — so the rehome rewrites it out of the
+    # reserved namespace rather than mistaking it for a successor and stranding.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        base, base_frames = _commit(store, "batch-seed", [("r1", _LIVE_AT), ("r2", _LIVE_AT)])
+        reserved = "c" + "d" * 64
+        _record, content = compaction_module._build_new_segment(base, list(base_frames), reserved)
+        # A pre-upgrade orphan: the reserved FILE exists with NO ledger row and NO successor intent.
+        with database.transaction() as connection:
+            connection.execute("DELETE FROM _segment_exporters WHERE batch_id = ?", ("batch-seed",))
+            connection.execute("DELETE FROM _segments WHERE batch_id = ?", ("batch-seed",))
+        compaction_module._publish_reserved_successor(_segment_file(spool_root, reserved), content)
+        _segment_file(spool_root, "batch-seed").unlink()
+
+        # Mandatory reconciliation registers the orphan as a committed segment (origin=reconciled).
+        _reconcile(database, barrier, spool_root)
+        assert reserved in _segment_rows(database)
+
+        # Compaction rehomes it (no successor intent proves it genuine); nothing is stranded.
+        result = _compact(database, barrier, spool_root)
+        assert [r.old_batch_id for r in result.rehomed] == [reserved]
+        new_id = result.rehomed[0].new_batch_id
+        assert not is_reserved_compaction_batch_id(new_id)
+        assert _segment_rows(database) == {new_id}
+        assert set(_record_ids(spool_root, new_id)) == {
+            str(frame.record.record_id) for frame in base_frames
+        }
+    finally:
+        database.close()
+
+
+def test_a_rehome_reuses_its_recorded_target_after_an_interrupted_swap(tmp_path: Path) -> None:
+    # A07 / review #79-P1-1 restart: the rehome binds the source to its target via a durable rehome
+    # intent BEFORE publishing, so a swap interrupted after the target is published
+    # REUSES the same target on the next pass (adopts the orphan) and converges — never allocating a
+    # second target or losing a record.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        reserved = "c" + "f" * 64
+        base_frames = _seed_reserved_occupant(
+            database, store, spool_root, reserved, [("r1", _LIVE_AT)]
+        )
+        # Interrupt the rehome swap (drop _audit so record_compaction fails and the swap rolls back)
+        # AFTER the intent is committed and the target file is published.
+        with database.transaction() as connection:
+            connection.execute("DROP TABLE _audit")
+        first = _compact(database, barrier, spool_root)
+        assert first.rehomed == ()
+        assert any(skip.status == "commit_failed" for skip in first.skipped)
+        assert reserved in _segment_rows(database)  # occupant not yet retired
+
+        _recreate_audit_table(database)
+        second = _compact(database, barrier, spool_root)
+        assert [r.old_batch_id for r in second.rehomed] == [reserved]
+        new_id = second.rehomed[0].new_batch_id
+        assert _segment_rows(database) == {new_id}
+        assert set(_record_ids(spool_root, new_id)) == {
+            str(frame.record.record_id) for frame in base_frames
+        }
+    finally:
+        database.close()
+
+
+def test_a_successor_intent_failure_leaves_the_old_segment_intact(tmp_path: Path) -> None:
+    # A07 / review #79-P1-2: the successor provenance intent is recorded BEFORE the successor is
+    # published; if it cannot be recorded, compaction fails closed before publishing or mutating, so
+    # no reserved successor is ever created without its authoritative provenance.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)])
+        with database.transaction() as connection:
+            connection.execute("DROP TABLE _compaction_intents")
+        result = _compact(database, barrier, spool_root)
+        assert result.compacted == ()
+        assert result.skipped[0].status == "commit_failed"
+        assert _segment_rows(database) == {"batch-a"}  # nothing published or mutated
+    finally:
+        database.close()
+
+
+def test_a_genuine_successor_is_not_rehomed_on_a_later_pass(tmp_path: Path) -> None:
+    # A successor's provenance intent PERSISTS while the successor exists (cleared only when the
+    # successor is itself retired), so a subsequent compaction pass never mistakes the genuine
+    # reserved successor for a legacy occupant and rehomes it out of the reserved namespace.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)])
+        first = _compact(database, barrier, spool_root)
+        successor = first.compacted[0].new_batch_id
+        assert is_reserved_compaction_batch_id(successor)
+
+        second = _compact(database, barrier, spool_root)
+        assert second.rehomed == ()  # the genuine successor is NOT rehomed
+        assert second.compacted == ()  # and it is fully live, so not re-compacted
+        assert _segment_rows(database) == {successor}  # it stays in the reserved namespace
+    finally:
+        database.close()
+
+
 def test_two_mixed_segments_sharing_a_survivor_but_differing_in_exporters_both_compact(
     tmp_path: Path,
 ) -> None:

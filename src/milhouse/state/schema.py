@@ -261,6 +261,43 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "CHECK (epoch BETWEEN 1 AND 2147483647))",
         ),
     ),
+    Migration(
+        12,
+        "create_compaction_intents",
+        (
+            # Authoritative compaction/rehome provenance (ADR 0007 addendum A07; G03 review of the
+            # reserved-namespace upgrade). A ``c[0-9a-f]{64}`` id was a valid producer id before
+            # the reservation, so origin alone cannot distinguish a genuine successor from
+            # a legal pre-reservation occupant (a producer-committed row OR a pre-upgrade producer
+            # crash orphan reconciliation registers ``origin=reconciled``). Compaction instead
+            # records an INTENT for each successor BEFORE publishing it, so a reserved id is
+            # successor ONLY if an intent proves it — and a crash-published successor is still
+            # adoptable, never rehomed (which would duplicate its records). This table is EMPTY on
+            # schema-12 upgrade, so every pre-existing reserved segment is correctly classified as a
+            # legacy occupant to rehome. The rehome records a ``rehome`` intent binding source to
+            # its allocated target so a re-run reuses the same target (idempotent, restartable).
+            "CREATE TABLE _compaction_intents ("
+            "target_batch_id TEXT PRIMARY KEY NOT NULL, "
+            "source_batch_id TEXT NOT NULL, "
+            "kind TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, "
+            "CHECK (kind IN ('successor', 'rehome')), "
+            "CHECK (length(target_batch_id) > 0), "
+            "CHECK (length(source_batch_id) > 0), "
+            "CHECK (length(created_at) > 0))",
+            "CREATE INDEX _compaction_intents_by_source ON _compaction_intents (source_batch_id)",
+            # A monotonic control-plane counter. The rehome allocates its target from this counter,
+            # NOT from a content-derived predictable id, so a producer cannot pre-occupy the target;
+            # on the (rare) conflict it increments. The counter is unbounded, so a free target
+            # exists beyond the finitely many occupied ids — the upgrade always converges (unlike a
+            # bounded content-probe, which an occupied candidate set could strand — G03/D06).
+            "CREATE TABLE _sequences ("
+            "name TEXT PRIMARY KEY NOT NULL, "
+            "value INTEGER NOT NULL, "
+            "CHECK (length(name) > 0), "
+            "CHECK (value >= 0))",
+        ),
+    ),
 )
 
 

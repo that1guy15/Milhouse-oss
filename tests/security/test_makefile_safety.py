@@ -44,6 +44,7 @@ CRITICAL_COVERAGE_FILES = {
     "src/milhouse/spooling/compaction.py",
     "src/milhouse/spooling/errors.py",
     "src/milhouse/spooling/exporter.py",
+    "src/milhouse/spooling/intents.py",
     "src/milhouse/spooling/ledger.py",
     "src/milhouse/spooling/reader.py",
     "src/milhouse/spooling/reconcile.py",

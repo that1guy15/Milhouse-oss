@@ -107,6 +107,7 @@ test-coverage:
 		--critical 'src/milhouse/spooling/compaction.py' \
 		--critical 'src/milhouse/spooling/errors.py' \
 		--critical 'src/milhouse/spooling/exporter.py' \
+		--critical 'src/milhouse/spooling/intents.py' \
 		--critical 'src/milhouse/spooling/ledger.py' \
 		--critical 'src/milhouse/spooling/reader.py' \
 		--critical 'src/milhouse/spooling/reconcile.py' \
