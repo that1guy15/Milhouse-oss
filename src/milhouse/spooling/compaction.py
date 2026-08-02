@@ -32,7 +32,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NoReturn, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 from milhouse.config.filesystem import (
     SecureFileError,
@@ -43,7 +43,8 @@ from milhouse.config.filesystem import (
 from milhouse.core.clock import TimeError, format_timestamp
 from milhouse.domain.identity import ScopeV1
 from milhouse.domain.records import PrivacyClassV1
-from milhouse.privacy.pseudonym import Pseudonymizer
+from milhouse.privacy.keys import load_pseudonym_key
+from milhouse.privacy.pseudonym import PrivacyError, Pseudonymizer
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
     ORIGIN_RECONCILED,
@@ -68,6 +69,10 @@ from milhouse.state.audit import record_compaction
 from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
 from milhouse.state.database import ControlDatabase, _validated_database_path
 from milhouse.state.errors import StateError
+
+if TYPE_CHECKING:
+    from milhouse.config._models import MilhouseConfig
+    from milhouse.config.paths import RuntimePaths
 
 _PENDING = "pending"
 _SPOOL = "spool"
@@ -538,6 +543,25 @@ def _compact_one(
     )
 
 
+def _load_installation_key(config: MilhouseConfig, paths: RuntimePaths) -> Pseudonymizer:
+    """Load the installation's own pseudonym key inside the validated config/runtime-path boundary —
+    the only way compaction obtains keyed-lineage authority (ADR 0007 addendum A07).
+    :func:`load_pseudonym_key` enforces the config-bound key path plus owner/mode/``nlink``/ACL
+    checks, so the key is the installation's own; a missing (unprovisioned installation — ``init``/
+    W06 has not run), unloadable, or invalid key fails closed. Because the caller never supplies a
+    key object, a forged arbitrary-bytes ``Pseudonymizer`` can never reach the audit path (G03
+    review: caller-forgeable key)."""
+
+    loaded: Pseudonymizer | None = None
+    try:
+        loaded = load_pseudonym_key(config, paths)
+    except PrivacyError:
+        loaded = None
+    if loaded is None:
+        _fail("MH_SPOOL_COMPACTION", "compaction requires the provisioned installation key")
+    return loaded
+
+
 def compact_apply(
     database: ControlDatabase,
     barrier: GlobalCommitBarrier,
@@ -546,7 +570,8 @@ def compact_apply(
     installation_id: str,
     now: datetime,
     confirm: bool,
-    pseudonymizer: Pseudonymizer,
+    config: MilhouseConfig,
+    paths: RuntimePaths,
 ) -> CompactionResult:
     """Rewrite every mixed-expiry committed segment into a new unexpired-only segment, audited.
 
@@ -557,19 +582,15 @@ def compact_apply(
     (retention prunes the fully-expired ones), and an unreadable or disagreeing segment is left for
     verify/reconciliation. Every failure normalizes to a fixed ``MH_SPOOL_*`` code.
 
-    ``pseudonymizer`` is REQUIRED: plan §4.7 makes keyed old→new lineage a W03 deliverable, so
-    compaction records an attributable pseudonym for every retired/replacement segment and never a
-    NULL or reversible-hash resource. It must be the exact trusted installation
-    :class:`~milhouse.privacy.pseudonym.Pseudonymizer` (loaded by a maintenance caller with
-    :func:`milhouse.privacy.keys.load_pseudonym_key`); a missing, wrong-type, or subclassed
-    authority fails closed HERE — before the barrier and before any file, ledger, cursor, or audit
-    mutation.
+    Keyed old→new lineage is a W03 deliverable (plan §4.7), and per ADR 0007 addendum A07 its
+    authority is established by LOADING the installation's own pseudonym key inside the validated
+    ``config``/``paths`` boundary (:func:`milhouse.privacy.keys.load_pseudonym_key`) — compaction
+    accepts no caller-supplied key object. A missing (unprovisioned installation), unloadable, or
+    cross-installation key fails closed HERE, before the barrier and before any file, ledger, or
+    audit mutation; compaction therefore cannot run on an un-``init``'d installation.
     """
 
-    if type(pseudonymizer) is not Pseudonymizer:
-        # Fail closed before any mutation: only the exact concrete installation Pseudonymizer keys
-        # the mandated lineage. A subclass/proxy or missing key is refused (G03 review finding #3).
-        _fail("MH_SPOOL_COMPACTION", "compaction requires the trusted installation Pseudonymizer")
+    pseudonymizer = _load_installation_key(config, paths)
     _validate_common(database, spool_root, installation_id)
     _validate_barrier(database, barrier)
     _require_now(now)

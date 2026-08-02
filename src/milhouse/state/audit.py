@@ -246,7 +246,7 @@ def record_compaction(
     old_file_sha256: str,
     new_content_sha256: str,
     new_file_sha256: str,
-    pseudonymizer: Pseudonymizer | None = None,
+    pseudonymizer: Pseudonymizer,
 ) -> None:
     """Record a mixed-expiry compaction as a linked pair of append-only audit rows.
 

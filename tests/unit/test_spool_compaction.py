@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from milhouse.config import load_config, resolve_runtime_paths
+from milhouse.config._models import MilhouseConfig
 from milhouse.config.filesystem import SecureFileError, SecureFileErrorKind
+from milhouse.config.paths import RuntimePaths
 from milhouse.domain.records import (
     CollectorDescriptorV1,
     EventDataV1,
@@ -26,6 +31,7 @@ from milhouse.domain.records import (
     TargetDescriptorV1,
     finalize_record,
 )
+from milhouse.privacy import create_pseudonym_key
 from milhouse.privacy.pseudonym import Pseudonymizer
 from milhouse.spooling import (
     CompactionResult,
@@ -40,6 +46,7 @@ from milhouse.spooling import (
 )
 from milhouse.spooling import compaction as compaction_module
 from milhouse.spooling.errors import SpoolError
+from milhouse.spooling.ledger import ORIGIN_COMMITTED, insert_segment_row
 from milhouse.spooling.segment import is_reserved_compaction_batch_id
 from milhouse.state import (
     GlobalCommitBarrier,
@@ -57,9 +64,42 @@ _GENERATION = "a" * 64
 _EXPIRED_AT = _NOW + timedelta(hours=1)
 _LIVE_AT = _NOW + timedelta(days=30)
 _APPLY_NOW = _NOW + timedelta(days=1)
-# Compaction now REQUIRES the trusted installation Pseudonymizer (keyed lineage is mandatory), so
-# every apply passes this fixed test key.
-_PSEUDONYMIZER = Pseudonymizer(b"\xa1" * 32)
+# A07: compaction loads the installation key from the config/paths boundary; every apply passes a
+# runtime whose key file holds these fixed bytes, so lineage fingerprints match this Pseudonymizer.
+_KEY_BYTES = b"\xa1" * 32
+_PSEUDONYMIZER = Pseudonymizer(_KEY_BYTES)
+_EXAMPLE_CONFIG = Path(__file__).resolve().parents[2] / "config/examples/local-only.toml"
+_RUNTIME_CACHE: list[tuple[MilhouseConfig, RuntimePaths]] = []
+
+
+def _make_runtime(base: Path) -> tuple[MilhouseConfig, RuntimePaths]:
+    base = base.resolve()  # macOS /var -> /private/var; the loader rejects symlink components
+    config_dir = base / "config"
+    config_dir.mkdir(parents=True)
+    config_file = config_dir / "milhouse.toml"
+    config_file.write_text(
+        _EXAMPLE_CONFIG.read_text(encoding="utf-8").replace(
+            'home = "../../data/local-only"', 'home = "../state"'
+        ),
+        encoding="utf-8",
+    )
+    config, selection = load_config(config_file, platform_default=config_file, env={})
+    paths = resolve_runtime_paths(
+        config, config_path=selection, platform_data_root=base / "platform", env={}
+    )
+    paths.pseudonym_key.parent.mkdir(parents=True, mode=0o700)
+    return config, paths
+
+
+def _shared_runtime() -> tuple[MilhouseConfig, RuntimePaths]:
+    # Build one runtime with a provisioned key (deterministic bytes matching _PSEUDONYMIZER) once
+    # for all tests; the key file's location is independent of each test's control database.
+    if not _RUNTIME_CACHE:
+        base = Path(tempfile.mkdtemp(prefix="mh-compaction-key-"))
+        config, paths = _make_runtime(base)
+        create_pseudonym_key(config, paths, random_bytes=lambda size: _KEY_BYTES)
+        _RUNTIME_CACHE.append((config, paths))
+    return _RUNTIME_CACHE[0]
 
 
 class _FakeExporter:
@@ -175,8 +215,9 @@ def _reconcile(database, barrier, spool_root) -> None:
 
 
 def _compact(
-    database, barrier, spool_root, *, now=_APPLY_NOW, confirm=True, pseudonymizer=_PSEUDONYMIZER
+    database, barrier, spool_root, *, now=_APPLY_NOW, confirm=True, runtime=None
 ) -> CompactionResult:
+    config, paths = runtime if runtime is not None else _shared_runtime()
     return compact_apply(
         database,
         barrier,
@@ -184,7 +225,8 @@ def _compact(
         installation_id=_INSTALLATION_ID,
         now=now,
         confirm=confirm,
-        pseudonymizer=pseudonymizer,
+        config=config,
+        paths=paths,
     )
 
 
@@ -260,6 +302,7 @@ def test_a_naive_now_is_rejected(tmp_path: Path) -> None:
 
 def test_a_bad_installation_id_is_rejected(tmp_path: Path) -> None:
     database, barrier, spool_root, store = _spool(tmp_path)
+    config, paths = _shared_runtime()
     try:
         _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
         with pytest.raises(SpoolError) as captured:
@@ -270,7 +313,8 @@ def test_a_bad_installation_id_is_rejected(tmp_path: Path) -> None:
                 installation_id="not-an-id",
                 now=_APPLY_NOW,
                 confirm=True,
-                pseudonymizer=_PSEUDONYMIZER,
+                config=config,
+                paths=paths,
             )
         assert captured.value.code == "MH_SPOOL_IDENTITY"
     finally:
@@ -279,6 +323,7 @@ def test_a_bad_installation_id_is_rejected(tmp_path: Path) -> None:
 
 def test_a_wrong_type_database_or_root_is_rejected(tmp_path: Path) -> None:
     database, barrier, spool_root, _store = _spool(tmp_path)
+    config, paths = _shared_runtime()
     try:
         with pytest.raises(SpoolError) as bad_db:
             compact_apply(
@@ -288,7 +333,8 @@ def test_a_wrong_type_database_or_root_is_rejected(tmp_path: Path) -> None:
                 installation_id=_INSTALLATION_ID,
                 now=_APPLY_NOW,
                 confirm=True,
-                pseudonymizer=_PSEUDONYMIZER,
+                config=config,
+                paths=paths,
             )
         assert bad_db.value.code == "MH_SPOOL_COMPACTION"
         with pytest.raises(SpoolError) as bad_root:
@@ -299,7 +345,8 @@ def test_a_wrong_type_database_or_root_is_rejected(tmp_path: Path) -> None:
                 installation_id=_INSTALLATION_ID,
                 now=_APPLY_NOW,
                 confirm=True,
-                pseudonymizer=_PSEUDONYMIZER,
+                config=config,
+                paths=paths,
             )
         assert bad_root.value.code == "MH_SPOOL_COMPACTION"
     finally:
@@ -308,6 +355,7 @@ def test_a_wrong_type_database_or_root_is_rejected(tmp_path: Path) -> None:
 
 def test_a_wrong_type_barrier_is_rejected(tmp_path: Path) -> None:
     database, _barrier, spool_root, store = _spool(tmp_path)
+    config, paths = _shared_runtime()
     try:
         _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
         with pytest.raises(SpoolError) as captured:
@@ -318,36 +366,35 @@ def test_a_wrong_type_barrier_is_rejected(tmp_path: Path) -> None:
                 installation_id=_INSTALLATION_ID,
                 now=_APPLY_NOW,
                 confirm=True,
-                pseudonymizer=_PSEUDONYMIZER,
+                config=config,
+                paths=paths,
             )
         assert captured.value.code == "MH_SPOOL_COMPACTION"
     finally:
         database.close()
 
 
-def test_compaction_requires_the_trusted_installation_pseudonymizer(tmp_path: Path) -> None:
-    # P1 (review finding #3): keyed lineage is mandatory, so compact_apply REQUIRES the exact
-    # installation Pseudonymizer and fails closed — before the barrier and any file/ledger/cursor/
-    # audit mutation — for a missing (None), wrong-type, or subclassed authority. Nothing mutates.
-    class _ForgingPseudonymizer(Pseudonymizer):
-        def fingerprint(self, kind: str, value: str) -> str:
-            return "mh_fp1_e1_batch_" + "a" * 52
-
+def test_compaction_fails_closed_without_a_provisioned_installation_key(tmp_path: Path) -> None:
+    # P1 (review finding #2, per A07): compaction establishes keyed-lineage authority by LOADING the
+    # installation key inside the config/paths boundary — it accepts NO caller-supplied key object,
+    # so a forged arbitrary-bytes Pseudonymizer can never reach the audit path. An unprovisioned
+    # installation (no key file) fails closed BEFORE the barrier and any mutation; nothing changes.
+    config, paths = _make_runtime(Path(tempfile.mkdtemp(prefix="mh-nokey-")))  # no key created
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
         _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
-        for bad in (None, object(), _ForgingPseudonymizer(b"\xa1" * 32)):
-            with pytest.raises(SpoolError) as captured:
-                compact_apply(
-                    database,
-                    barrier,
-                    spool_root=spool_root,
-                    installation_id=_INSTALLATION_ID,
-                    now=_APPLY_NOW,
-                    confirm=True,
-                    pseudonymizer=bad,  # type: ignore[arg-type]
-                )
-            assert captured.value.code == "MH_SPOOL_COMPACTION"
+        with pytest.raises(SpoolError) as captured:
+            compact_apply(
+                database,
+                barrier,
+                spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
+                now=_APPLY_NOW,
+                confirm=True,
+                config=config,
+                paths=paths,
+            )
+        assert captured.value.code == "MH_SPOOL_COMPACTION"
         assert _segment_rows(database) == {"batch-a"}  # nothing mutated
         assert _segment_file(spool_root, "batch-a").exists()
         assert list_audit(database) == ()  # no audit row written
@@ -831,6 +878,34 @@ def test_the_writer_rejects_a_reserved_named_segment_file(tmp_path: Path) -> Non
     assert not path.exists()  # nothing published either way
 
 
+def test_a_legacy_reserved_namespace_committed_segment_fails_acquisition_closed(
+    tmp_path: Path,
+) -> None:
+    # P1 (review finding #3, per A07): a committed segment in the reserved c[0-9a-f]{64} namespace
+    # with origin='committed' is a legacy producer occupant that predates the reservation
+    # (compaction successors are always origin='reconciled'). Reconciliation on acquisition fails
+    # closed for operator remediation, rather than silently leaving a mixed segment permanently
+    # uncompactable when an upgraded install carries such a row.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        record, _frames = _commit(store, "batch-a", [("a1", _LIVE_AT)])
+        # Simulate a pre-reservation upgrade state: a committed-origin ledger row at a reserved id.
+        legacy = replace(record, batch_id="c" + "e" * 64, origin=ORIGIN_COMMITTED)
+        with database.transaction() as connection:
+            insert_segment_row(connection, legacy)
+
+        with pytest.raises(SpoolError) as captured:
+            DurableSpool(
+                database=database,
+                barrier=barrier,
+                spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
+            )
+        assert captured.value.code == "MH_SPOOL_RESERVED_ID"
+    finally:
+        database.close()
+
+
 def test_two_mixed_segments_sharing_a_survivor_but_differing_in_exporters_both_compact(
     tmp_path: Path,
 ) -> None:
@@ -878,32 +953,23 @@ def test_the_compaction_successor_id_lands_in_the_reserved_namespace(tmp_path: P
         database.close()
 
 
-def test_compaction_records_keyed_lineage_when_a_pseudonymizer_is_supplied(tmp_path: Path) -> None:
-    # P1 (review finding #3): plan §4.7 makes keyed old->new compaction lineage a W03 deliverable —
-    # it cannot be deferred to W06. When compact_apply is given the installation Pseudonymizer (the
-    # exact type load_pseudonym_key returns), BOTH audit rows carry keyed mh_fp1_... tokens,
-    # never a raw id or a public SHA-256, so the lineage is attributable and wired into W03.
+def test_compaction_records_keyed_lineage_from_the_loaded_installation_key(tmp_path: Path) -> None:
+    # P1 (review findings #2/#3, per A07): compaction LOADS the installation key from the config/
+    # paths boundary and records keyed old->new lineage — BOTH audit rows carry keyed mh_fp1_...
+    # tokens (matching the provisioned key), never a raw id or a public SHA-256, so the lineage is
+    # attributable and wired into W03 with a non-forgeable key.
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
         _record, _frames = _commit(
             store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
         )
-        pseudonymizer = Pseudonymizer(b"\xa1" * 32)
-        result = compact_apply(
-            database,
-            barrier,
-            spool_root=spool_root,
-            installation_id=_INSTALLATION_ID,
-            now=_APPLY_NOW,
-            confirm=True,
-            pseudonymizer=pseudonymizer,
-        )
+        result = _compact(database, barrier, spool_root)
         new_id = result.compacted[0].new_batch_id
 
         rows = list_audit(database, action="compaction")
         assert [row.outcome for row in rows] == ["compacted_from", "compacted_into"]
-        assert rows[0].resource == pseudonymizer.fingerprint("batch", "batch-a")
-        assert rows[1].resource == pseudonymizer.fingerprint("batch", new_id)
+        assert rows[0].resource == _PSEUDONYMIZER.fingerprint("batch", "batch-a")
+        assert rows[1].resource == _PSEUDONYMIZER.fingerprint("batch", new_id)
         assert all(r.resource is not None and r.resource.startswith("mh_fp1_") for r in rows)
         # Neither the raw ids nor their public SHA-256 appear anywhere in the audit table.
         blob = _audit_bytes(database)

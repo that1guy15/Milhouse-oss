@@ -83,6 +83,7 @@ from milhouse.config.filesystem import (
 )
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
+    ORIGIN_COMMITTED,
     ORIGIN_RECONCILED,
     SEGMENT_COLUMNS,
     ExporterDelivery,
@@ -102,6 +103,7 @@ from milhouse.spooling.segment import (
     FRAME_VERSION,
     MAX_SEGMENT_FILE_BYTES,
     SCHEMA_VERSION,
+    is_reserved_compaction_batch_id,
 )
 from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
 from milhouse.state.database import ControlDatabase, _validated_database_path
@@ -736,9 +738,10 @@ class _Scan:
         self._pending_registrations: list[tuple[ParsedSegment, str, str]] = []
         # Retirement completion (G03 finding #1): finish a crash-interrupted retention prune.
         # (day, path, batch_id, day_identity, expected file_sha256) for an orphan file matching a
-        # tombstone digest — unlink + clear it; plus stale tombstones (below) to just clear.
+        # tombstone digest — unlink + clear it; plus stale tombstones (below, batch_id -> day) whose
+        # retired file is absent/replaced — cleared only after a day-directory durability fence.
         self._pending_retirements: list[tuple[str, Path, str, FileIdentity, str]] = []
-        self._pending_tombstone_deletions: set[str] = set()
+        self._pending_tombstone_deletions: dict[str, str] = {}
         # (day, name, day_identity, snapshot, digest, batch_id_or_empty, detail)
         self._pending_quarantines: list[
             tuple[str, str, FileIdentity, FileSnapshot, str, str, str]
@@ -794,6 +797,23 @@ class _Scan:
                 barrier_acquired = True
                 ledger, malformed = self._ledger_index()
                 retirements = self._retirement_index()
+                # A07 reserved-namespace upgrade guard: a COMMITTED-origin segment in the reserved
+                # ``c[0-9a-f]{64}`` namespace is a legacy producer occupant that predates the
+                # reservation — compaction successors are always ``origin='reconciled'``, and the
+                # producer commit ingress now rejects the namespace, so no post-reservation path
+                # produces one. It cannot be safely compacted around, so fail acquisition CLOSED for
+                # operator remediation rather than silently strand a mixed segment (G03 review:
+                # legal pre-upgrade reserved occupants). Runs under the exclusive barrier before any
+                # mutation; on pre-alpha installs (none released) this is a no-op.
+                for _reserved_id, _reserved_row in sorted(ledger.items()):
+                    if _reserved_row.origin == ORIGIN_COMMITTED and is_reserved_compaction_batch_id(
+                        _reserved_id
+                    ):
+                        _fail(
+                            "MH_SPOOL_RESERVED_ID",
+                            "a legacy committed segment occupies the reserved compaction "
+                            "namespace; operator remediation is required before use",
+                        )
                 for batch_id in sorted(malformed):
                     # The batch id came from a row that failed validation, so it may not be well
                     # formed.
@@ -829,7 +849,7 @@ class _Scan:
                                     (day, path, batch_id, day_identity, retirements[batch_id][1])
                                 )
                             else:
-                                self._pending_tombstone_deletions.add(batch_id)
+                                self._pending_tombstone_deletions[batch_id] = day
                                 self._reconcile_orphan(path, day, batch_id, day_identity)
                         else:
                             self._reconcile_orphan(path, day, batch_id, day_identity)
@@ -877,11 +897,11 @@ class _Scan:
                 # reused by a now-committed segment is stale: clear it (G03 finding #1). Tombstones
                 # whose orphan file is still present were routed to completion or deletion above.
                 if self._complete:
-                    for batch_id in retirements:
+                    for batch_id, (retire_day, _digest) in retirements.items():
                         if self._capped():  # pragma: no cover - defensive cap bound
                             break
                         if batch_id not in seen or batch_id in ledger:
-                            self._pending_tombstone_deletions.add(batch_id)
+                            self._pending_tombstone_deletions[batch_id] = retire_day
 
                 # After every phase and again immediately before mutation: a fired anomaly cap
                 # voids the pass even when it fired on the FINAL classified item (the re-review's
@@ -919,8 +939,10 @@ class _Scan:
                             expected,
                         ) in self._pending_retirements:
                             self._complete_retirement(retire_day, retire_path, retire_id, expected)
-                        for tombstone_id in sorted(self._pending_tombstone_deletions):
-                            self._delete_tombstone(tombstone_id)
+                        for tombstone_id, tombstone_day in sorted(
+                            self._pending_tombstone_deletions.items()
+                        ):
+                            self._delete_tombstone_fenced(tombstone_id, tombstone_day)
                         for (
                             day,
                             name,
@@ -1262,9 +1284,11 @@ class _Scan:
 
         if _raw_sha256(path) != expected:
             # The retired file is gone or was replaced (a reused id, a hostile same-UID swap, or a
-            # prior partial completion): the specific retired bytes are absent, so the intent is
-            # discharged — clear the stale tombstone and touch no file.
-            self._delete_tombstone(batch_id)
+            # prior partial completion): the specific retired bytes are absent. Because the file is
+            # not present-and-durably-removed here, clear the tombstone only behind a durability
+            # fence, so a rolled-back un-fsync'd unlink cannot resurrect it (G03 finding: commit-
+            # uncertain tombstone loss).
+            self._delete_tombstone_fenced(batch_id, day)
             return
         removed = False
         try:
@@ -1277,7 +1301,42 @@ class _Scan:
             kind = "uncertain" if error.kind is SecureFileErrorKind.COMMIT_UNCERTAIN else "io"
             self._move_failures.append(SegmentAnomaly(batch_id, day, "retirement_incomplete", kind))
         if removed:
+            # A successful ``remove_regular_file_no_follow`` fsyncs the parent directory, so the
+            # absence is already durable — clear the tombstone directly (no extra fence).
             self._delete_tombstone(batch_id)
+
+    def _fence_day(self, day: str) -> bool:
+        """Establish a durability fence for a retired file's absence: successfully fsync the
+        recorded day directory. On a power loss this proves an already-performed unlink is durable,
+        so a rolled-back un-fsync'd unlink cannot bring the expired file back with no tombstone. Any
+        failure (including an absent day directory) returns False so the tombstone is kept."""
+
+        descriptor: int | None = None
+        fenced = False
+        try:
+            descriptor = os.open(self._spool_root / _PENDING / day, _dir_flags())
+            fenced = _fsync_descriptor(descriptor)
+        except OSError:
+            fenced = False
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:  # pragma: no cover - defensive close failure
+                    pass
+        return fenced
+
+    def _delete_tombstone_fenced(self, batch_id: str, day: str) -> None:
+        """Clear a tombstone whose retired file is NOT present-and-durably-removed only after a
+        positive day-directory durability fence; otherwise keep the intent (report it) for the next
+        mandatory reconciliation, so the expired file can never be re-adopted without a fence."""
+
+        if self._fence_day(day):
+            self._delete_tombstone(batch_id)
+        else:
+            self._move_failures.append(
+                SegmentAnomaly(batch_id, day, "retirement_incomplete", "uncertain")
+            )
 
     def _delete_tombstone(self, batch_id: str) -> None:
         """Delete one retirement tombstone; a failed cleanup leaves it for the next pass."""

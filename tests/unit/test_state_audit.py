@@ -598,6 +598,7 @@ def test_record_compaction_rejects_a_malformed_digest_and_rolls_back(tmp_path: P
                 old_file_sha256="b" * 64,
                 new_content_sha256="c" * 64,
                 new_file_sha256="d" * 64,
+                pseudonymizer=Pseudonymizer(_KEY_A),
             )
         assert captured.value.code == "MH_STATE_AUDIT"
         assert list_audit(database, action="compaction") == ()  # rolled back, nothing persisted

@@ -574,6 +574,38 @@ def test_a_retirement_completion_unlink_failure_keeps_the_tombstone_for_retry(
         database.close()
 
 
+def test_an_absent_file_tombstone_clears_only_after_a_durability_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # P1 (review: commit-uncertain unlink loses the tombstone): reconciliation must NOT clear an
+    # absent-file tombstone from bare namespace observation — a power loss rolling back an
+    # un-fsync'd unlink would resurrect the expired file with no intent and re-adopt it. The
+    # tombstone is cleared only after a SUCCESSFUL day-directory durability fence.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        record, _frames = _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+        # Model the commit-uncertain state: the ledger row is gone and the file is (non-durably)
+        # unlinked, so the tombstone is present with no file.
+        with database.transaction() as connection:
+            connection.execute("DELETE FROM _segment_exporters WHERE batch_id = ?", ("batch-a",))
+            connection.execute("DELETE FROM _segments WHERE batch_id = ?", ("batch-a",))
+        _segment_file(spool_root, "batch-a").unlink()
+        _insert_tombstone(database, "batch-a", record.file_sha256)
+
+        # A FAILED day-directory fsync must KEEP the tombstone (no durable proof of absence).
+        monkeypatch.setattr(reconcile_module, "_fsync_descriptor", lambda fd: False)
+        report = _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == {"batch-a"}  # kept — the absence is not proven durable
+        assert any(a.kind == "retirement_incomplete" for a in report.anomalies)
+
+        # With a working fence the absence is durable, so the tombstone is cleared.
+        monkeypatch.undo()
+        _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == set()
+    finally:
+        database.close()
+
+
 def test_a_commit_uncertain_retirement_completion_keeps_the_tombstone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
