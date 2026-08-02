@@ -272,10 +272,11 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             # crash orphan reconciliation registers ``origin=reconciled``). Compaction instead
             # records an INTENT for each successor BEFORE publishing it, so a reserved id is
             # successor ONLY if an intent proves it — and a crash-published successor is still
-            # adoptable, never rehomed (which would duplicate its records). This table is EMPTY on
-            # schema-12 upgrade, so every pre-existing reserved segment is correctly classified as a
-            # legacy occupant to rehome. The rehome records a ``rehome`` intent binding source to
-            # its allocated target so a re-run reuses the same target (idempotent, restartable).
+            # adoptable, never rehomed (which would duplicate its records). The table starts empty
+            # on schema-12 upgrade, so the first exclusive compaction pass reconstructs and verifies
+            # any genuine pre-upgrade old-source/successor pair before treating the remaining
+            # reserved rows as legacy occupants. A rehome intent binds its source to a
+            # collision-resistant target so a restart reuses the same allocation.
             "CREATE TABLE _compaction_intents ("
             "target_batch_id TEXT PRIMARY KEY NOT NULL, "
             "source_batch_id TEXT NOT NULL, "
@@ -286,11 +287,12 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "CHECK (length(source_batch_id) > 0), "
             "CHECK (length(created_at) > 0))",
             "CREATE INDEX _compaction_intents_by_source ON _compaction_intents (source_batch_id)",
-            # A monotonic control-plane counter. The rehome allocates its target from this counter,
-            # NOT from a content-derived predictable id, so a producer cannot pre-occupy the target;
-            # on the (rare) conflict it increments. The counter is unbounded, so a free target
-            # exists beyond the finitely many occupied ids — the upgrade always converges (unlike a
-            # bounded content-probe, which an occupied candidate set could strand — G03/D06).
+            "CREATE UNIQUE INDEX _compaction_intents_one_kind_per_source "
+            "ON _compaction_intents (source_batch_id, kind)",
+            # Generic durable counters for later control-plane workflows. Rehome allocation does
+            # NOT use an SQLite integer sequence: its collision-resistant 256-bit target selection
+            # retries without a finite probe terminal, so neither caller-chosen occupation nor
+            # SQLite's signed-integer ceiling can strand the namespace upgrade.
             "CREATE TABLE _sequences ("
             "name TEXT PRIMARY KEY NOT NULL, "
             "value INTEGER NOT NULL, "

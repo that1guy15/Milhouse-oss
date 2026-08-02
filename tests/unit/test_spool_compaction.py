@@ -45,7 +45,8 @@ from milhouse.spooling import (
 )
 from milhouse.spooling import compaction as compaction_module
 from milhouse.spooling.errors import SpoolError
-from milhouse.spooling.ledger import ORIGIN_COMMITTED, insert_segment_row
+from milhouse.spooling.intents import is_recorded_successor, read_rehome_target
+from milhouse.spooling.ledger import ORIGIN_COMMITTED, insert_segment_row, read_segment_record
 from milhouse.spooling.segment import is_reserved_compaction_batch_id
 from milhouse.state import (
     GlobalCommitBarrier,
@@ -1045,20 +1046,21 @@ def test_a_rehome_of_a_disagreeing_occupant_is_skipped(tmp_path: Path) -> None:
         database.close()
 
 
-def test_a_rehome_converges_when_a_producer_occupies_the_first_target(tmp_path: Path) -> None:
-    # A07 / review #79-P1-1 (exact reproduction, now DEFEATED): the rehome target is a MONOTONIC
-    # counter, not a content-derived predictable id, and it increments past any occupied id. Even if
-    # a producer commits a valid ordinary segment at the FIRST target the counter would pick, the
-    # legacy occupant still auto-converges (to the next free target) and the producer segment is
-    # untouched — the unbounded counter always finds a free id.
+def test_a_rehome_converges_when_a_producer_occupies_the_first_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A07 / review #79-P1-1: collision-resistant allocation has no finite probe terminal. Force its
+    # first sampled target to an ordinary producer segment, then prove it retries a second sample.
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
         reserved = "c" + "e" * 64
         base_frames = _seed_reserved_occupant(
             database, store, spool_root, reserved, [("r1", _LIVE_AT), ("r2", _LIVE_AT)]
         )
-        first_target = "r" + format(0, "064x")  # the first value the rehome counter allocates
+        first_target = "r" + format(0, "064x")  # force the first random sample to this id below
         _commit(store, first_target, [("producer-1", _LIVE_AT)])  # a legal ordinary producer seg
+        targets = iter(["0" * 64, "1" * 64])
+        monkeypatch.setattr(compaction_module, "_random_rehome_suffix", lambda: next(targets))
 
         result = _compact(database, barrier, spool_root)
         assert [r.old_batch_id for r in result.rehomed] == [reserved]  # still converged
@@ -1068,6 +1070,44 @@ def test_a_rehome_converges_when_a_producer_occupies_the_first_target(tmp_path: 
         assert first_target in _segment_rows(database)  # the producer segment is untouched
         assert reserved not in _segment_rows(database)  # the legacy occupant is gone
         assert set(_record_ids(spool_root, new_id)) == {
+            str(frame.record.record_id) for frame in base_frames
+        }
+    finally:
+        database.close()
+
+
+def test_a_foreign_segment_at_a_recorded_rehome_target_is_reallocated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash-bound ordinary target cannot become a permanent producer-controlled wedge."""
+
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        reserved = "c" + "f" * 64
+        base_frames = _seed_reserved_occupant(
+            database, store, spool_root, reserved, [("r1", _LIVE_AT), ("r2", _LIVE_AT)]
+        )
+        targets = iter(["a" * 64, "b" * 64])
+        monkeypatch.setattr(compaction_module, "_random_rehome_suffix", lambda: next(targets))
+        real_publish = compaction_module.publish_segment_bytes
+
+        def fail_publish(_path: Path, _content: bytes) -> None:
+            raise SpoolError("MH_SPOOL_WRITE", "injected pre-publish failure")
+
+        monkeypatch.setattr(compaction_module, "publish_segment_bytes", fail_publish)
+        first = _compact(database, barrier, spool_root)
+        assert any(item.status == "publish_failed" for item in first.skipped)
+        assert read_rehome_target(database.connection, reserved) == "r" + "a" * 64
+
+        # During the interruption, a supported producer legally occupies the recorded ordinary id.
+        monkeypatch.setattr(compaction_module, "publish_segment_bytes", real_publish)
+        _commit(store, "r" + "a" * 64, [("producer-1", _LIVE_AT)])
+        second = _compact(database, barrier, spool_root)
+
+        assert [item.new_batch_id for item in second.rehomed] == ["r" + "b" * 64]
+        assert "r" + "a" * 64 in _segment_rows(database)  # producer segment untouched
+        assert reserved not in _segment_rows(database)
+        assert set(_record_ids(spool_root, "r" + "b" * 64)) == {
             str(frame.record.record_id) for frame in base_frames
         }
     finally:
@@ -1103,6 +1143,134 @@ def test_a_pre_upgrade_reserved_orphan_is_rehomed_not_kept_as_a_successor(tmp_pa
         assert not is_reserved_compaction_batch_id(new_id)
         assert _segment_rows(database) == {new_id}
         assert set(_record_ids(spool_root, new_id)) == {
+            str(frame.record.record_id) for frame in base_frames
+        }
+    finally:
+        database.close()
+
+
+def test_schema11_crash_published_successor_is_adopted_without_duplicate_history(
+    tmp_path: Path,
+) -> None:
+    """Migration 12 must reconstruct a genuine old-source -> successor pair before rehome."""
+
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        old_record, frames = _commit(
+            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
+        )
+        deliver_segment(
+            database,
+            barrier,
+            old_record,
+            frames,
+            {"clickhouse": _FakeExporter("clickhouse")},
+            now=_NOW,
+        )
+        advance_cursor(
+            database,
+            "github",
+            position="page-7",
+            batch_id="batch-a",
+            now=_NOW,
+            expected_revision=0,
+        )
+        current = read_segment_record(database, "batch-a")
+        assert current is not None
+        successor = compaction_module._derive_batch_id(current, [frames[1]])
+        _successor_record, content = compaction_module._build_new_segment(
+            current, [frames[1]], successor
+        )
+
+        # Return the control plane to the exact pre-migration-12 schema prefix, then model the
+        # supported crash after the old compactor published its real successor but before its swap.
+        with database.transaction() as connection:
+            connection.execute("DROP TABLE _sequences")
+            connection.execute("DROP TABLE _compaction_intents")
+            connection.execute("DELETE FROM _schema_migrations WHERE version = 12")
+        compaction_module._publish_reserved_successor(_segment_file(spool_root, successor), content)
+        initialize_control_state(database, barrier=barrier, applied_at=_APPLY_NOW)
+        _reconcile(database, barrier, spool_root)
+        assert _segment_rows(database) == {"batch-a", successor}
+        assert (
+            database.connection.execute("SELECT count(*) FROM _compaction_intents").fetchone()[0]
+            == 0
+        )
+
+        result = _compact(database, barrier, spool_root)
+
+        # The migration recovery collapses the pair; it never rehomes the real successor and then
+        # recreates it, which would leave the live record in two authoritative segments.
+        assert result.rehomed == ()
+        assert _segment_rows(database) == {successor}
+        assert _record_ids(spool_root, successor) == [str(frames[1].record.record_id)]
+        cursor = read_cursor(database, "github")
+        assert cursor is not None
+        assert (cursor.batch_id, cursor.position, cursor.revision) == (successor, "page-7", 1)
+        delivery = database.connection.execute(
+            "SELECT delivery_status FROM _segment_exporters WHERE batch_id = ?", (successor,)
+        ).fetchone()
+        assert delivery == ("delivered",)
+    finally:
+        database.close()
+
+
+def test_pre_intent_successor_recovery_restarts_after_intent_before_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        source, frames = _commit(
+            store, "batch-a", [("expired-1", _EXPIRED_AT), ("live-1", _LIVE_AT)]
+        )
+        target = compaction_module._derive_batch_id(source, [frames[1]])
+        _target_record, content = compaction_module._build_new_segment(source, [frames[1]], target)
+        compaction_module._publish_reserved_successor(_segment_file(spool_root, target), content)
+        _reconcile(database, barrier, spool_root)
+
+        real_swap = compaction_module._swap_ledger
+        monkeypatch.setattr(compaction_module, "_swap_ledger", lambda *_args, **_kwargs: False)
+        first = _compact(database, barrier, spool_root)
+        assert any(item.status == "commit_failed" for item in first.skipped)
+        assert _segment_rows(database) == {"batch-a", target}
+        assert is_recorded_successor(database.connection, target)
+
+        monkeypatch.setattr(compaction_module, "_swap_ledger", real_swap)
+        second = _compact(database, barrier, spool_root)
+        assert any(item.new_batch_id == target for item in second.compacted)
+        assert second.rehomed == ()
+        assert _segment_rows(database) == {target}
+        assert _record_ids(spool_root, target) == [str(frames[1].record.record_id)]
+    finally:
+        database.close()
+
+
+def test_rehome_random_allocation_retries_any_finite_producer_occupation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The allocator has no caller-exhaustible probe bound or SQLite sequence ceiling."""
+
+    assert "_MAX_REHOME_PROBE" not in vars(compaction_module)
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        reserved = "c" + "e" * 64
+        base_frames = _seed_reserved_occupant(
+            database, store, spool_root, reserved, [("r1", _LIVE_AT), ("r2", _LIVE_AT)]
+        )
+        occupied_tokens = ["1" * 64, "2" * 64, "3" * 64]
+        for token in occupied_tokens:
+            _commit(store, "r" + token, [(f"producer-{token[0]}", _LIVE_AT)])
+        tokens = iter([*occupied_tokens, "4" * 64])
+        monkeypatch.setattr(compaction_module, "_random_rehome_suffix", lambda: next(tokens))
+
+        result = _compact(database, barrier, spool_root)
+
+        assert [item.new_batch_id for item in result.rehomed] == ["r" + "4" * 64], [
+            (item.batch_id, item.status, item.code) for item in result.skipped
+        ]
+        assert all("r" + token in _segment_rows(database) for token in occupied_tokens)
+        assert reserved not in _segment_rows(database)
+        assert set(_record_ids(spool_root, "r" + "4" * 64)) == {
             str(frame.record.record_id) for frame in base_frames
         }
     finally:

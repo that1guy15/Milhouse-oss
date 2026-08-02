@@ -1,9 +1,9 @@
-"""Unit tests for compaction/rehome provenance intents + the monotonic counter (A07, migration 12).
+"""Unit tests for compaction/rehome provenance intents and generic sequences (A07, migration 12).
 
 A reserved ``c[0-9a-f]{64}`` id is a genuine compaction successor ONLY if a durable successor intent
 proves it (recorded before the successor is published); the rehome binds a legacy occupant to its
-allocated non-reserved target via a rehome intent so a restart reuses it; and the rehome target is
-from a monotonic control-plane counter. Faults normalize to a fixed ``MH_SPOOL_INTENT`` code.
+allocated non-reserved target via a rehome intent so a restart reuses it. Faults normalize to a
+fixed ``MH_SPOOL_INTENT`` code.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.intents import (
     REHOME_SEQUENCE,
     clear_intents_for_segment,
+    clear_rehome_intent,
     is_recorded_successor,
     read_rehome_target,
     read_sequence,
@@ -87,6 +88,61 @@ def test_rehome_intent_round_trip(tmp_path: Path) -> None:
         assert read_rehome_target(database.connection, _SOURCE) == "r" + "0" * 64
         # A rehome intent is not a successor intent — its target is not classified as a successor.
         assert not is_recorded_successor(database.connection, "r" + "0" * 64)
+    finally:
+        database.close()
+
+
+def test_intents_reject_conflicting_target_or_source_bindings(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    try:
+        target = "r" + "0" * 64
+        with database.transaction() as connection:
+            record_rehome_intent(
+                connection, target_batch_id=target, source_batch_id=_SOURCE, now=_NOW
+            )
+        with pytest.raises(SpoolError) as target_conflict:
+            with database.transaction() as connection:
+                record_successor_intent(
+                    connection,
+                    target_batch_id=target,
+                    source_batch_id="other-source",
+                    now=_NOW,
+                )
+        assert target_conflict.value.code == "MH_SPOOL_INTENT"
+        with pytest.raises(SpoolError) as source_conflict:
+            with database.transaction() as connection:
+                record_rehome_intent(
+                    connection,
+                    target_batch_id="r" + "1" * 64,
+                    source_batch_id=_SOURCE,
+                    now=_NOW,
+                )
+        assert source_conflict.value.code == "MH_SPOOL_INTENT"
+        assert read_rehome_target(database.connection, _SOURCE) == target
+    finally:
+        database.close()
+
+
+def test_rehome_intent_can_be_replaced_only_by_its_exact_mapping(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    try:
+        target = "r" + "0" * 64
+        with database.transaction() as connection:
+            record_rehome_intent(
+                connection, target_batch_id=target, source_batch_id=_SOURCE, now=_NOW
+            )
+            clear_rehome_intent(connection, source_batch_id=_SOURCE, target_batch_id=target)
+            record_rehome_intent(
+                connection,
+                target_batch_id="r" + "1" * 64,
+                source_batch_id=_SOURCE,
+                now=_NOW,
+            )
+        assert read_rehome_target(database.connection, _SOURCE) == "r" + "1" * 64
+        with pytest.raises(SpoolError) as mismatch:
+            with database.transaction() as connection:
+                clear_rehome_intent(connection, source_batch_id=_SOURCE, target_batch_id=target)
+        assert mismatch.value.code == "MH_SPOOL_INTENT"
     finally:
         database.close()
 

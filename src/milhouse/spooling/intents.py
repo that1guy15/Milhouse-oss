@@ -1,18 +1,17 @@
-"""Authoritative compaction/rehome provenance and monotonic target allocation (A07, migration 12).
+"""Authoritative compaction/rehome provenance (A07, migration 12).
 
 A ``c[0-9a-f]{64}`` id was a valid producer batch id before the reservation, so a reserved segment's
 ``origin`` cannot prove whether it is a genuine compaction successor or a legal pre-reservation
 occupant. Compaction therefore records a durable INTENT for each successor BEFORE it publishes the
-successor file, and the reserved-namespace upgrade rehomes every reserved segment that no intent
-proves to be a successor. Because ``_compaction_intents`` is empty at the schema-12 upgrade, every
-pre-existing reserved segment is classified as a legacy occupant; because the successor intent is
-recorded before publication, a crash-published successor is still adoptable (never rehomed, which
-would duplicate its records).
+successor file, and the reserved-namespace upgrade rehomes every reserved segment that no intent or
+verified pre-upgrade source/successor pair proves genuine. Because ``_compaction_intents`` starts
+empty at the schema-12 upgrade, the first exclusive maintenance pass reconstructs any genuine pair
+from its trusted segment bytes before classifying the remaining reserved rows as legacy occupants.
+New successors carry their intent before publication, so every later crash orphan is adoptable.
 
-The rehome allocates its target from a monotonic control-plane counter (``_sequences``), not a
-content-derived predictable id, so a producer cannot pre-occupy it; a ``rehome`` intent binds
-the source to its allocated target so a restart reuses the same target. Every function is
-transaction-scoped on the caller's connection; faults normalize to a fixed ``MH_SPOOL_INTENT`` code.
+A ``rehome`` intent binds the source to its collision-resistant allocated target so a restart reuses
+the same target. Every function is transaction-scoped on the caller's connection; faults normalize
+to a fixed ``MH_SPOOL_INTENT`` code.
 """
 
 from __future__ import annotations
@@ -60,11 +59,18 @@ def record_successor_intent(
     stamp = _timestamp(now)
     failed = False
     try:
-        connection.execute(
-            f"INSERT OR IGNORE INTO {_INTENTS} "
-            "(target_batch_id, source_batch_id, kind, created_at) VALUES (?, ?, ?, ?)",
-            (target_batch_id, source_batch_id, _SUCCESSOR, stamp),
-        )
+        existing = connection.execute(
+            f"SELECT source_batch_id, kind FROM {_INTENTS} WHERE target_batch_id = ?",
+            (target_batch_id,),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                f"INSERT INTO {_INTENTS} "
+                "(target_batch_id, source_batch_id, kind, created_at) VALUES (?, ?, ?, ?)",
+                (target_batch_id, source_batch_id, _SUCCESSOR, stamp),
+            )
+        elif existing != (source_batch_id, _SUCCESSOR):
+            failed = True
     except (sqlite3.Error, OverflowError):
         failed = True
     if failed:
@@ -80,15 +86,46 @@ def record_rehome_intent(
     stamp = _timestamp(now)
     failed = False
     try:
-        connection.execute(
-            f"INSERT OR IGNORE INTO {_INTENTS} "
-            "(target_batch_id, source_batch_id, kind, created_at) VALUES (?, ?, ?, ?)",
-            (target_batch_id, source_batch_id, _REHOME, stamp),
-        )
+        existing_target = connection.execute(
+            f"SELECT source_batch_id, kind FROM {_INTENTS} WHERE target_batch_id = ?",
+            (target_batch_id,),
+        ).fetchone()
+        existing_source = connection.execute(
+            f"SELECT target_batch_id FROM {_INTENTS} WHERE source_batch_id = ? AND kind = ?",
+            (source_batch_id, _REHOME),
+        ).fetchone()
+        if existing_target is None and existing_source is None:
+            connection.execute(
+                f"INSERT INTO {_INTENTS} "
+                "(target_batch_id, source_batch_id, kind, created_at) VALUES (?, ?, ?, ?)",
+                (target_batch_id, source_batch_id, _REHOME, stamp),
+            )
+        elif existing_target != (source_batch_id, _REHOME) or existing_source != (target_batch_id,):
+            failed = True
     except (sqlite3.Error, OverflowError):
         failed = True
     if failed:
         _fail("a rehome intent could not be recorded")
+
+
+def clear_rehome_intent(
+    connection: sqlite3.Connection, *, source_batch_id: str, target_batch_id: str
+) -> None:
+    """Clear exactly one conflicting rehome allocation before atomically replacing it."""
+
+    failed = False
+    try:
+        cursor = connection.execute(
+            f"DELETE FROM {_INTENTS} WHERE source_batch_id = ? AND target_batch_id = ? "
+            "AND kind = ?",
+            (source_batch_id, target_batch_id, _REHOME),
+        )
+        if cursor.rowcount != 1:
+            failed = True
+    except sqlite3.Error:
+        failed = True
+    if failed:
+        _fail("a rehome intent could not be replaced")
 
 
 def is_recorded_successor(connection: sqlite3.Connection, target_batch_id: str) -> bool:
@@ -181,6 +218,7 @@ def clear_intents_for_segment(connection: sqlite3.Connection, batch_id: str) -> 
 __all__ = [
     "REHOME_SEQUENCE",
     "clear_intents_for_segment",
+    "clear_rehome_intent",
     "is_recorded_successor",
     "read_rehome_target",
     "read_sequence",

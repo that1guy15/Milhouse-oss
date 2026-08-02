@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -48,14 +49,12 @@ from milhouse.privacy.keys import load_pseudonym_key
 from milhouse.privacy.pseudonym import PrivacyError, Pseudonymizer
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.intents import (
-    REHOME_SEQUENCE,
     clear_intents_for_segment,
+    clear_rehome_intent,
     is_recorded_successor,
     read_rehome_target,
-    read_sequence,
     record_rehome_intent,
     record_successor_intent,
-    set_sequence,
 )
 from milhouse.spooling.ledger import (
     ORIGIN_RECONCILED,
@@ -106,14 +105,19 @@ _DELIVERED = "delivered"
 # removes the reachable stranding entirely, so no probe is needed).
 _COMPACTED_PREFIX = "c"
 # A07 rehome target prefix: a legacy reserved-namespace occupant is rewritten to an ``r`` +
-# 64-hex namespace — a producer batch-id shape NEVER in the reserved ``c[0-9a-f]{64}`` namespace, so
-# the rehomed segment is an ordinary committed segment. The suffix is a MONOTONIC control-plane
-# counter (not a content-derived predictable id), so a producer cannot pre-occupy the target (G03
-# review #79-P1-1); on the rare conflict the counter increments — unbounded, so it always converges.
+# 64-hex ordinary producer id. The suffix is a cryptographically random 256-bit allocation that is
+# durably bound to the source before publish. Any finite producer-chosen occupied set is retried
+# without a probe bound or SQLite integer ceiling; a conflicting recorded allocation is atomically
+# replaced before another target is selected.
 _REHOME_PREFIX = "r"
-# An infinite-loop guard on the monotonic allocation. Only finitely many ids can be occupied and the
-# counter is unbounded, so a free target is always found long before this bound; it never fires.
-_MAX_REHOME_PROBE = 1 << 20
+_REHOME_RANDOM_BYTES = 32
+
+
+def _random_rehome_suffix() -> str:
+    """Return one cryptographically random 256-bit rehome suffix."""
+
+    return secrets.token_hex(_REHOME_RANDOM_BYTES)
+
 
 STATUS_LIVE = "live"
 STATUS_FULLY_EXPIRED = "fully_expired"
@@ -574,36 +578,49 @@ def _record_successor_intent(
 
 
 def _allocate_rehome_target(
-    database: ControlDatabase, root: Path, record: SegmentRecord, now: datetime
+    database: ControlDatabase,
+    root: Path,
+    record: SegmentRecord,
+    now: datetime,
+    *,
+    abandon_target: str | None = None,
 ) -> str:
     """Return the non-reserved target this rehome will publish ``record`` into.
 
     A durable ``rehome`` intent binds the source to its target, so a re-run REUSES the same target
-    (idempotent, restartable). A first allocation takes the next value of the monotonic
-    ``rehome_target`` counter, skipping any occupied id and advancing the counter past the one used.
-    Because the counter is unbounded and only finitely many ids can be occupied, a free target
-    always exists — the upgrade converges. Recorded in its own committed transaction BEFORE the
-    file is published.
+    (idempotent, restartable). A first allocation samples a collision-resistant 256-bit ordinary id
+    and retries every occupied row/file/intent without a finite terminal. If a recorded target is
+    later proven foreign, ``abandon_target`` replaces exactly that mapping in the same transaction
+    before another target is selected. The final mapping commits BEFORE publication.
     """
 
     day_dir = root / _PENDING / record.day
     with database.transaction() as connection:
         existing = read_rehome_target(connection, record.batch_id)
-        if existing is not None:
+        if existing is not None and existing != abandon_target:
             return existing
-        counter = read_sequence(connection, REHOME_SEQUENCE)
-        target = ""
-        for _probe in range(_MAX_REHOME_PROBE):
-            target = _REHOME_PREFIX + format(counter, "064x")
-            counter += 1
-            occupied = connection.execute(
-                "SELECT 1 FROM _segments WHERE batch_id = ?", (target,)
-            ).fetchone() is not None or os.path.lexists(day_dir / f"{target}.jsonl")
+        if existing is not None:
+            assert abandon_target is not None
+            clear_rehome_intent(
+                connection, source_batch_id=record.batch_id, target_batch_id=abandon_target
+            )
+        while True:
+            target = _REHOME_PREFIX + _random_rehome_suffix()
+            occupied = (
+                connection.execute(
+                    "SELECT 1 FROM _segments WHERE batch_id = ?", (target,)
+                ).fetchone()
+                is not None
+            )
+            allocated = (
+                connection.execute(
+                    "SELECT 1 FROM _compaction_intents WHERE target_batch_id = ?", (target,)
+                ).fetchone()
+                is not None
+            )
+            occupied = occupied or allocated or os.path.lexists(day_dir / f"{target}.jsonl")
             if not occupied:
                 break
-        else:  # pragma: no cover - unreachable: finitely many ids, unbounded counter
-            _fail("MH_SPOOL_COMPACTION", "no free rehome target could be allocated")
-        set_sequence(connection, REHOME_SEQUENCE, counter)
         record_rehome_intent(
             connection, target_batch_id=target, source_batch_id=record.batch_id, now=now
         )
@@ -692,6 +709,131 @@ def _finish_rewrite(
     )
 
 
+def _historical_successor_subset(
+    source_frames: tuple[SpoolFrameV1, ...],
+    target_frames: tuple[SpoolFrameV1, ...],
+    now: datetime,
+) -> list[SpoolFrameV1] | None:
+    """Recover the source-frame subset represented by a pre-intent successor.
+
+    The target must be a strict, order-preserving subset with identical record envelopes, and every
+    omitted source record must already be expired at ``now``. That establishes that collapsing the
+    pair cannot lose a currently live record even when the successor was published at an earlier
+    expiry boundary.
+    """
+
+    if not target_frames or len(target_frames) >= len(source_frames):
+        return None
+    matched: list[SpoolFrameV1] = []
+    omitted: list[SpoolFrameV1] = []
+    target_index = 0
+    for frame in source_frames:
+        if target_index < len(target_frames) and frame.record == target_frames[target_index].record:
+            matched.append(frame)
+            target_index += 1
+        else:
+            omitted.append(frame)
+    if target_index != len(target_frames):
+        return None
+    if any(frame.record.expires_at > now for frame in omitted):
+        return None
+    return matched
+
+
+def _recover_pre_intent_successors(
+    database: ControlDatabase,
+    root: Path,
+    installation_id: str,
+    now: datetime,
+    pseudonymizer: Pseudonymizer,
+) -> tuple[list[CompactedSegment], list[SkippedSegment], set[str]]:
+    """Collapse genuine schema-11 crash-published successor pairs before legacy rehome.
+
+    Migration 12 cannot populate provenance using SQL alone because proving a successor requires the
+    trusted segment bytes. Under the exclusive barrier, this first maintenance pass therefore
+    reconstructs each unproven reserved target from every still-present source, verifies the full
+    deterministic identity and exact files, records the missing successor intent, and atomically
+    finishes the old->new swap. Ambiguous or interrupted pairs are protected from rehome/compaction
+    for this pass and retried later; they are never rehome-then-recreated into duplicate history.
+    """
+
+    records = list_segment_records(database)
+    targets = [
+        record
+        for record in records
+        if is_reserved_compaction_batch_id(record.batch_id)
+        and not is_recorded_successor(database.connection, record.batch_id)
+    ]
+    if not targets:
+        return [], [], set()
+    parsed: dict[str, tuple[SpoolFrameV1, ...]] = {}
+    for record in records:
+        path = root / _PENDING / record.day / f"{record.batch_id}.jsonl"
+        try:
+            segment = read_trusted_segment(path, installation_id=installation_id)
+        except SpoolError:
+            continue
+        if _agrees(segment, record.day, record.batch_id, record):
+            parsed[record.batch_id] = segment.frames
+
+    recovered: list[CompactedSegment] = []
+    skipped: list[SkippedSegment] = []
+    protected: set[str] = set()
+    for target in targets:
+        if target.batch_id not in parsed:
+            continue
+        matches: list[tuple[SegmentRecord, list[SpoolFrameV1], SegmentRecord, bytes]] = []
+        for source in records:
+            if source.batch_id == target.batch_id or source.batch_id not in parsed:
+                continue
+            subset = _historical_successor_subset(
+                parsed[source.batch_id], parsed[target.batch_id], now
+            )
+            if subset is None or _derive_batch_id(source, subset) != target.batch_id:
+                continue
+            intended, content = _build_new_segment(source, subset, target.batch_id)
+            if _is_intended_successor(target, intended):
+                matches.append((source, subset, intended, content))
+        if not matches:
+            continue
+        protected.add(target.batch_id)
+        protected.update(source.batch_id for source, _subset, _intended, _content in matches)
+        if len(matches) != 1:
+            skipped.append(
+                SkippedSegment(target.batch_id, STATUS_RESERVED_CONFLICT, "MH_SPOOL_COMPACTION")
+            )
+            continue
+        source, subset, intended, content = matches[0]
+        if not _record_successor_intent(
+            database, target=target.batch_id, source=source.batch_id, now=now
+        ):
+            skipped.append(
+                SkippedSegment(source.batch_id, STATUS_COMMIT_FAILED, "MH_SPOOL_COMPACTION")
+            )
+            continue
+        done, skip = _finish_rewrite(
+            database,
+            root,
+            installation_id,
+            now,
+            source,
+            (target.batch_id, intended, content, False, False),
+            pseudonymizer=pseudonymizer,
+            publish=_publish_reserved_successor,
+            dropped=source.record_count - len(subset),
+            retained=len(subset),
+            record_successor=False,
+        )
+        if done is not None:
+            recovered.append(done)
+            protected.discard(source.batch_id)
+            protected.discard(target.batch_id)
+        else:
+            assert skip is not None
+            skipped.append(skip)
+    return recovered, skipped, protected
+
+
 def _compact_one(
     database: ControlDatabase,
     root: Path,
@@ -753,9 +895,10 @@ def _rehome_one(
     install can hold a reserved-namespace segment that no successor intent proves genuine — a
     producer-committed row OR a pre-upgrade producer crash's orphan reconciliation registered
     ``origin=reconciled``. Rather than wedge acquisition (the earlier design — G03 review #79-P1-4),
-    compaction rewrites it — preserving EVERY record — to a non-reserved MONOTONIC target a producer
-    cannot pre-occupy (#79-P1-1), retiring the old file under a durable tombstone, so the reserved
-    namespace then holds only genuine compaction successors. The target allocation and its publish →
+    compaction rewrites it — preserving EVERY record — to a collision-resistant non-reserved target
+    that retries any finite producer occupation (#79-P1-1), retiring the old file under a durable
+    tombstone, so the reserved namespace then holds only genuine compaction successors. The target
+    allocation and its publish →
     verify → swap → retire tail are idempotent and restartable across every crash boundary. A rehome
     that cannot complete this pass leaves the occupant intact for the next pass; acquisition is
     never blocked.
@@ -771,10 +914,17 @@ def _rehome_one(
     if not parsed.frames:  # pragma: no cover - a committed segment always carries frames
         return _skipped(record, STATUS_DISAGREEING, "MH_SPOOL_VERIFY")
 
-    # Allocate (or reuse) a MONOTONIC non-reserved target and bind it durably to the source BEFORE
-    # publishing, then resolve that exact target slot (free / this rehome's own crash orphan).
+    # Allocate (or reuse) a collision-resistant non-reserved target and bind it durably to the
+    # source BEFORE publishing. A foreign recorded target is safely abandoned while the old source
+    # remains authoritative, then another allocation is attempted without a finite probe terminal.
     target = _allocate_rehome_target(database, root, record, now)
-    resolved = _resolve_target(database, root, installation_id, record, list(parsed.frames), target)
+    while True:
+        resolved = _resolve_target(
+            database, root, installation_id, record, list(parsed.frames), target
+        )
+        if resolved is not None:
+            break
+        target = _allocate_rehome_target(database, root, record, now, abandon_target=target)
     # ALL frames are retained (dropped=0): the rehome is a pure relocation, not an expiry rewrite.
     # The target is NON-reserved, so it publishes through the ordinary producer path. The rehome
     # intent is already recorded (record_successor=False).
@@ -886,6 +1036,14 @@ def compact_apply(
     skipped: list[SkippedSegment] = []
     rehomed: list[CompactedSegment] = []
     with barrier.exclusive():
+        # Migration 12 starts with no provenance rows. Before classifying any unproven reserved row
+        # as a producer occupant, reconstruct a genuine schema-11 crash-published successor from its
+        # still-present source and finish that swap. This prevents rehome-then-recreate duplication.
+        recovered, recovery_skips, protected = _recover_pre_intent_successors(
+            database, root, installation_id, now, pseudonymizer
+        )
+        compacted.extend(recovered)
+        skipped.extend(recovery_skips)
         # A07 auto-converging remediation FIRST: rehome any reserved-namespace segment that no
         # durable successor intent proves genuine — a legal pre-reservation occupant (a
         # producer-committed row OR a pre-upgrade producer crash's orphan reconciliation registered
@@ -893,8 +1051,10 @@ def compact_apply(
         # provenance is authoritative: a reserved id is a genuine successor ONLY if an intent proves
         # it (G03 review #79-P1-2). No legal upgraded install is ever wedged (#79-P1-4).
         for record in list_segment_records(database):
-            if is_reserved_compaction_batch_id(record.batch_id) and not is_recorded_successor(
-                database.connection, record.batch_id
+            if (
+                record.batch_id not in protected
+                and is_reserved_compaction_batch_id(record.batch_id)
+                and not is_recorded_successor(database.connection, record.batch_id)
             ):
                 done, skip = _rehome_one(
                     database, root, installation_id, now, record, pseudonymizer
@@ -908,6 +1068,8 @@ def compact_apply(
         # compact a still-unproven reserved row in place (a rehome that did not complete this pass)
         # — that would derive another reserved successor instead of converging the namespace.
         for record in list_segment_records(database):
+            if record.batch_id in protected:
+                continue
             if is_reserved_compaction_batch_id(record.batch_id) and not is_recorded_successor(
                 database.connection, record.batch_id
             ):
