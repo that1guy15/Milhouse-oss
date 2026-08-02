@@ -59,24 +59,15 @@ def _validate_consistency(header: SegmentHeaderV1, frames: tuple[SpoolFrameV1, .
             _fail("MH_SPOOL_PRIVACY", "each frame privacy class must match the header")
 
 
-def _reject_reserved_name(path: str | Path) -> None:
-    # The compaction successor namespace (``c`` + 64-hex) is reserved: only compaction may publish
-    # into it (it passes ``allow_reserved=True``). Every producer publish path — the writer and any
-    # direct ``publish_segment_bytes`` caller — is rejected, so no producer can create a
-    # reserved-named file that reconciliation would later adopt as a foreign successor and strand a
-    # real compaction (G03 review finding #2). The batch id is the file stem before ``.jsonl``.
+def _segment_stem(path: str | Path) -> str:
+    # The batch id is the file stem before ``.jsonl``.
     stem = Path(path).name
     if stem.endswith(".jsonl"):
         stem = stem[: -len(".jsonl")]
-    if is_reserved_compaction_batch_id(stem):
-        _fail("MH_SPOOL_RESERVED_ID", "the compaction successor namespace is reserved")
+    return stem
 
 
-def publish_segment_bytes(
-    path: str | Path, content: bytes, *, allow_reserved: bool = False
-) -> None:
-    if not allow_reserved:
-        _reject_reserved_name(path)
+def _create_segment_file(path: str | Path, content: bytes) -> None:
     exists = False
     failed = False
     try:
@@ -92,6 +83,36 @@ def publish_segment_bytes(
         _fail("MH_SPOOL_EXISTS", "a segment already exists at that name")
     if failed:
         _fail("MH_SPOOL_WRITE", "the segment could not be durably published")
+
+
+def publish_segment_bytes(path: str | Path, content: bytes) -> None:
+    # Every producer/general publication path rejects the reserved compaction successor namespace
+    # (``c`` + 64-hex) with NO caller bypass. Only compaction may publish into it, through the
+    # UNEXPORTED :func:`_publish_reserved_successor` authority below. A public boolean bypass let
+    # any caller occupy the predictable successor slot and strand a real compaction (G03 review
+    # finding: the public reserved-namespace escape hatch), so it is removed entirely.
+    if is_reserved_compaction_batch_id(_segment_stem(path)):
+        _fail("MH_SPOOL_RESERVED_ID", "the compaction successor namespace is reserved")
+    _create_segment_file(path, content)
+
+
+def _publish_reserved_successor(path: str | Path, content: bytes) -> None:
+    """Publish one compacted-successor segment into the reserved namespace — UNEXPORTED authority.
+
+    Audited compaction is the ONLY caller. This authority REQUIRES the name to be a reserved
+    compaction id (``c`` + 64-hex) and fails closed otherwise, so it can never publish an ordinary
+    producer name, and because it is module-private and not re-exported, no public/general path can
+    reach the reserved namespace. Compaction derives the successor id from the complete intended
+    identity and verifies the published file against the intended row, so the name is bound to the
+    exact successor.
+    """
+
+    if not is_reserved_compaction_batch_id(_segment_stem(path)):
+        _fail(
+            "MH_SPOOL_RESERVED_ID",
+            "the compaction publication authority accepts only a reserved successor id",
+        )
+    _create_segment_file(path, content)
 
 
 def build_segment_bytes(

@@ -36,6 +36,7 @@ CRITICAL_COVERAGE_FILES = {
     "src/milhouse/state/database.py",
     "src/milhouse/state/derivation.py",
     "src/milhouse/state/errors.py",
+    "src/milhouse/state/installation.py",
     "src/milhouse/state/leases.py",
     "src/milhouse/state/migrations.py",
     "src/milhouse/state/schema.py",

@@ -83,7 +83,6 @@ from milhouse.config.filesystem import (
 )
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
-    ORIGIN_COMMITTED,
     ORIGIN_RECONCILED,
     SEGMENT_COLUMNS,
     ExporterDelivery,
@@ -103,7 +102,6 @@ from milhouse.spooling.segment import (
     FRAME_VERSION,
     MAX_SEGMENT_FILE_BYTES,
     SCHEMA_VERSION,
-    is_reserved_compaction_batch_id,
 )
 from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
 from milhouse.state.database import ControlDatabase, _validated_database_path
@@ -797,23 +795,15 @@ class _Scan:
                 barrier_acquired = True
                 ledger, malformed = self._ledger_index()
                 retirements = self._retirement_index()
-                # A07 reserved-namespace upgrade guard: a COMMITTED-origin segment in the reserved
+                # A07 reserved-namespace upgrade: a COMMITTED-origin segment in the reserved
                 # ``c[0-9a-f]{64}`` namespace is a legacy producer occupant that predates the
-                # reservation — compaction successors are always ``origin='reconciled'``, and the
-                # producer commit ingress now rejects the namespace, so no post-reservation path
-                # produces one. It cannot be safely compacted around, so fail acquisition CLOSED for
-                # operator remediation rather than silently strand a mixed segment (G03 review:
-                # legal pre-upgrade reserved occupants). Runs under the exclusive barrier before any
-                # mutation; on pre-alpha installs (none released) this is a no-op.
-                for _reserved_id, _reserved_row in sorted(ledger.items()):
-                    if _reserved_row.origin == ORIGIN_COMMITTED and is_reserved_compaction_batch_id(
-                        _reserved_id
-                    ):
-                        _fail(
-                            "MH_SPOOL_RESERVED_ID",
-                            "a legacy committed segment occupies the reserved compaction "
-                            "namespace; operator remediation is required before use",
-                        )
+                # reservation (compaction successors are always ``origin='reconciled'``, and the
+                # producer commit ingress now rejects the namespace). Reconciliation does NOT wedge
+                # acquisition on it — the earlier fail-closed guard blocked writers, retention, and
+                # recovery on a legal upgraded install (G03 review #79-P1-4). It is a committed
+                # segment here (verified like any other); audited compaction AUTO-CONVERGES it,
+                # rewriting it to a non-reserved id before compacting, so the namespace holds only
+                # successors. On pre-alpha installs (none released) no such occupant exists.
                 for batch_id in sorted(malformed):
                     # The batch id came from a row that failed validation, so it may not be well
                     # formed.

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import tempfile
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -56,6 +55,7 @@ from milhouse.state import (
     open_control_database,
     read_cursor,
 )
+from milhouse.state.installation import establish_installation_key
 
 _INSTALLATION_ID = "mh_in1_00000000000040008000000000000000"
 _NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
@@ -69,7 +69,6 @@ _APPLY_NOW = _NOW + timedelta(days=1)
 _KEY_BYTES = b"\xa1" * 32
 _PSEUDONYMIZER = Pseudonymizer(_KEY_BYTES)
 _EXAMPLE_CONFIG = Path(__file__).resolve().parents[2] / "config/examples/local-only.toml"
-_RUNTIME_CACHE: list[tuple[MilhouseConfig, RuntimePaths]] = []
 
 
 def _make_runtime(base: Path) -> tuple[MilhouseConfig, RuntimePaths]:
@@ -91,15 +90,22 @@ def _make_runtime(base: Path) -> tuple[MilhouseConfig, RuntimePaths]:
     return config, paths
 
 
-def _shared_runtime() -> tuple[MilhouseConfig, RuntimePaths]:
-    # Build one runtime with a provisioned key (deterministic bytes matching _PSEUDONYMIZER) once
-    # for all tests; the key file's location is independent of each test's control database.
-    if not _RUNTIME_CACHE:
-        base = Path(tempfile.mkdtemp(prefix="mh-compaction-key-"))
-        config, paths = _make_runtime(base)
-        create_pseudonym_key(config, paths, random_bytes=lambda size: _KEY_BYTES)
-        _RUNTIME_CACHE.append((config, paths))
-    return _RUNTIME_CACHE[0]
+# A07 binds compaction to each control database's OWN state root: the config/runtime state root must
+# equal the database's state root, and the key id/epoch loaded there must equal the record in that
+# database. So each test's runtime is co-located with its database (see _spool) and registered
+# by database identity; _compact resolves it. There is no shared, database-independent runtime —
+# exactly the caller-forgeable-key defect this closes (G03 review #79-P1-2).
+_RUNTIMES: dict[int, tuple[MilhouseConfig, RuntimePaths]] = {}
+
+
+def _provision_key(database, config: MilhouseConfig, paths: RuntimePaths) -> Pseudonymizer:
+    """Create the installation key (deterministic bytes) at the config/paths location and record its
+    non-secret id/epoch in the control plane, exactly as `init` (W06) will."""
+
+    pseudonymizer = create_pseudonym_key(config, paths, random_bytes=lambda size: _KEY_BYTES)
+    with database.transaction() as connection:
+        establish_installation_key(connection, key_id=pseudonymizer.key_id, epoch=1, now=_NOW)
+    return pseudonymizer
 
 
 class _FakeExporter:
@@ -175,16 +181,24 @@ def _header(
     )
 
 
-def _spool(tmp_path: Path):
-    control = tmp_path / "control"
-    control.mkdir(mode=0o700)
+def _spool(tmp_path: Path, *, provision_key: bool = True):
+    # Co-locate the control database and spool UNDER the runtime's own state root, so the database's
+    # state root (database_path.parent.parent) equals paths.state_root — the binding A07 requires.
+    # The control dir (the key's parent, ``<state_root>/control``) and the spool (``<state_root>/
+    # spool``) are already created by the runtime; the database, barrier, and key all live
+    # in the control dir alongside the key file.
+    config, paths = _make_runtime(tmp_path)
+    control = paths.pseudonym_key.parent
     os.chmod(control, 0o700)
     database = open_control_database(control / "milhouse.sqlite3")
     barrier = GlobalCommitBarrier(control / "commit.lock")
     initialize_control_state(database, barrier=barrier, applied_at=_NOW)
-    spool_root = tmp_path / "spool"
-    spool_root.mkdir(mode=0o700)
+    spool_root = paths.spool
+    spool_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(spool_root, 0o700)
+    if provision_key:
+        _provision_key(database, config, paths)
+    _RUNTIMES[id(database)] = (config, paths)
     store = DurableSpool(
         database=database, barrier=barrier, spool_root=spool_root, installation_id=_INSTALLATION_ID
     )
@@ -217,7 +231,7 @@ def _reconcile(database, barrier, spool_root) -> None:
 def _compact(
     database, barrier, spool_root, *, now=_APPLY_NOW, confirm=True, runtime=None
 ) -> CompactionResult:
-    config, paths = runtime if runtime is not None else _shared_runtime()
+    config, paths = runtime if runtime is not None else _RUNTIMES[id(database)]
     return compact_apply(
         database,
         barrier,
@@ -302,7 +316,7 @@ def test_a_naive_now_is_rejected(tmp_path: Path) -> None:
 
 def test_a_bad_installation_id_is_rejected(tmp_path: Path) -> None:
     database, barrier, spool_root, store = _spool(tmp_path)
-    config, paths = _shared_runtime()
+    config, paths = _RUNTIMES[id(database)]
     try:
         _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
         with pytest.raises(SpoolError) as captured:
@@ -323,7 +337,7 @@ def test_a_bad_installation_id_is_rejected(tmp_path: Path) -> None:
 
 def test_a_wrong_type_database_or_root_is_rejected(tmp_path: Path) -> None:
     database, barrier, spool_root, _store = _spool(tmp_path)
-    config, paths = _shared_runtime()
+    config, paths = _RUNTIMES[id(database)]
     try:
         with pytest.raises(SpoolError) as bad_db:
             compact_apply(
@@ -355,7 +369,7 @@ def test_a_wrong_type_database_or_root_is_rejected(tmp_path: Path) -> None:
 
 def test_a_wrong_type_barrier_is_rejected(tmp_path: Path) -> None:
     database, _barrier, spool_root, store = _spool(tmp_path)
-    config, paths = _shared_runtime()
+    config, paths = _RUNTIMES[id(database)]
     try:
         _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
         with pytest.raises(SpoolError) as captured:
@@ -375,29 +389,61 @@ def test_a_wrong_type_barrier_is_rejected(tmp_path: Path) -> None:
 
 
 def test_compaction_fails_closed_without_a_provisioned_installation_key(tmp_path: Path) -> None:
-    # P1 (review finding #2, per A07): compaction establishes keyed-lineage authority by LOADING the
-    # installation key inside the config/paths boundary — it accepts NO caller-supplied key object,
-    # so a forged arbitrary-bytes Pseudonymizer can never reach the audit path. An unprovisioned
-    # installation (no key file) fails closed BEFORE the barrier and any mutation; nothing changes.
-    config, paths = _make_runtime(Path(tempfile.mkdtemp(prefix="mh-nokey-")))  # no key created
-    database, barrier, spool_root, store = _spool(tmp_path)
+    # A07 / review #79-P1-2: compaction reads the installation's recorded key id/epoch from the
+    # control plane and loads with them. An UNPROVISIONED installation (no _installation_key record)
+    # fails closed BEFORE the barrier and any mutation — compaction cannot run on an un-init'd
+    # installation. The runtime is co-located with the database (state roots match), so the ONLY
+    # missing thing is the provisioned key identity.
+    database, barrier, spool_root, store = _spool(tmp_path, provision_key=False)
     try:
         _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
         with pytest.raises(SpoolError) as captured:
-            compact_apply(
-                database,
-                barrier,
-                spool_root=spool_root,
-                installation_id=_INSTALLATION_ID,
-                now=_APPLY_NOW,
-                confirm=True,
-                config=config,
-                paths=paths,
-            )
+            _compact(database, barrier, spool_root)
         assert captured.value.code == "MH_SPOOL_COMPACTION"
         assert _segment_rows(database) == {"batch-a"}  # nothing mutated
         assert _segment_file(spool_root, "batch-a").exists()
         assert list_audit(database) == ()  # no audit row written
+    finally:
+        database.close()
+
+
+def test_compaction_fails_closed_on_a_wrong_installation_key(tmp_path: Path) -> None:
+    # A07 / review #79-P1-2 (exact reproduction): loading a valid key at the bound path is NOT proof
+    # of installation identity. After provisioning key A (recorded in the control plane), replacing
+    # the key file with a DIFFERENT valid 32-byte key B fails compaction closed before mutation —
+    # the loaded key's id no longer matches the recorded id, so no unattributable lineage lands.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    _config, paths = _RUNTIMES[id(database)]
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
+        paths.pseudonym_key.write_bytes(b"\xb2" * 32)  # a different valid 32-byte key (key B)
+        os.chmod(paths.pseudonym_key, 0o600)
+        with pytest.raises(SpoolError) as captured:
+            _compact(database, barrier, spool_root)
+        assert captured.value.code == "MH_SPOOL_COMPACTION"
+        assert _segment_rows(database) == {"batch-a"}  # nothing mutated
+        assert list_audit(database) == ()  # no lineage written
+    finally:
+        database.close()
+
+
+def test_compaction_fails_closed_on_a_cross_installation_state_root(tmp_path: Path) -> None:
+    # A07 / review #79-P1-2 (reproduction): the config/runtime state root must equal the control
+    # database's state root, so a config/paths pair from ANOTHER fully provisioned installation (its
+    # own state root + key) cannot key this database's lineage. It fails closed before any mutation.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
+        other_db, _ob, _osr, _ostore = _spool(tmp_path / "other")
+        try:
+            other_runtime = _RUNTIMES[id(other_db)]
+            with pytest.raises(SpoolError) as captured:
+                _compact(database, barrier, spool_root, runtime=other_runtime)
+            assert captured.value.code == "MH_SPOOL_COMPACTION"
+            assert _segment_rows(database) == {"batch-a"}  # nothing mutated
+            assert list_audit(database) == ()  # no lineage written
+        finally:
+            other_db.close()
     finally:
         database.close()
 
@@ -632,20 +678,17 @@ def test_an_interrupted_old_file_unlink_reconverges(
         new_batch_id = first.compacted[0].new_batch_id
         assert first.compacted[0].file_outcome == "orphaned"
         assert [c.old_batch_id for c in first.orphaned_files] == ["batch-a"]
-        # Row-first: old row gone, old file lingers, new segment committed. No data lost.
+        # Row-first: old row gone, old file lingers (with a durable retirement tombstone written in
+        # the swap txn), new segment committed. No data lost.
         assert _segment_rows(database) == {new_batch_id}
         assert _segment_file(spool_root, "batch-a").exists()
 
-        # Reconciliation re-registers the orphaned old file as a committed segment.
+        # Mandatory reconciliation finds the tombstone + the lingering old file and COMPLETES the
+        # retirement (unlink + clear tombstone) rather than re-registering the retired mixed segment
+        # as a live committed segment with its expired frame (G03 review #79-P1-3). It converges in
+        # ONE reconcile pass — no second compaction is required — and never re-adopts the old bytes.
         monkeypatch.undo()
         _reconcile(database, barrier, spool_root)
-        assert _segment_rows(database) == {new_batch_id, "batch-a"}
-
-        # A later pass finds the deterministic new segment already committed and retires the old.
-        second = _compact(database, barrier, spool_root)
-        assert [c.old_batch_id for c in second.compacted] == ["batch-a"]
-        assert second.compacted[0].new_batch_id == new_batch_id  # same identity, idempotent
-        assert second.compacted[0].file_outcome == "removed"
         assert _segment_rows(database) == {new_batch_id}
         assert not _segment_file(spool_root, "batch-a").exists()
         assert _record_ids(spool_root, new_batch_id) == [
@@ -745,7 +788,9 @@ def test_a_publish_failure_leaves_the_old_intact(
         def failing_publish(*args: object, **kwargs: object) -> None:
             raise SpoolError("MH_SPOOL_WRITE", "cannot publish")
 
-        monkeypatch.setattr(compaction_module, "publish_segment_bytes", failing_publish)
+        # Compaction publishes its successor through the unexported reserved-only authority, not the
+        # public publish_segment_bytes (G03 review #79-P1-1), so patch that authority.
+        monkeypatch.setattr(compaction_module, "_publish_reserved_successor", failing_publish)
         result = _compact(database, barrier, spool_root)
         assert result.compacted == ()
         assert result.skipped[0].status == "publish_failed"
@@ -878,30 +923,124 @@ def test_the_writer_rejects_a_reserved_named_segment_file(tmp_path: Path) -> Non
     assert not path.exists()  # nothing published either way
 
 
-def test_a_legacy_reserved_namespace_committed_segment_fails_acquisition_closed(
-    tmp_path: Path,
-) -> None:
-    # P1 (review finding #3, per A07): a committed segment in the reserved c[0-9a-f]{64} namespace
-    # with origin='committed' is a legacy producer occupant that predates the reservation
-    # (compaction successors are always origin='reconciled'). Reconciliation on acquisition fails
-    # closed for operator remediation, rather than silently leaving a mixed segment permanently
-    # uncompactable when an upgraded install carries such a row.
+def test_the_public_publish_surface_has_no_reserved_bypass(tmp_path: Path) -> None:
+    # A07 / review #79-P1-1 (exact reproduction is now unreachable): the public publish surface has
+    # NO caller-selectable reserved bypass (the old allow_reserved=True escape hatch), so a direct
+    # publisher can never occupy the predictable successor slot and strand a real compaction. Only
+    # compaction's UNEXPORTED authority publishes into the reserved namespace, and it refuses any
+    # non-reserved name.
+    import inspect
+
+    from milhouse.spooling import writer as writer_module
+
+    assert "allow_reserved" not in inspect.signature(writer_module.publish_segment_bytes).parameters
+    reserved_path = tmp_path / f"{'c' + 'd' * 64}.jsonl"
+    with pytest.raises(SpoolError) as public:
+        writer_module.publish_segment_bytes(reserved_path, b"x")
+    assert public.value.code == "MH_SPOOL_RESERVED_ID"
+    assert not reserved_path.exists()
+    # The unexported authority is reserved-only: an ordinary producer name is refused.
+    ordinary_path = tmp_path / "ordinary.jsonl"
+    with pytest.raises(SpoolError) as authority:
+        writer_module._publish_reserved_successor(ordinary_path, b"x")
+    assert authority.value.code == "MH_SPOOL_RESERVED_ID"
+    assert not ordinary_path.exists()
+
+
+def _seed_reserved_occupant(
+    database, store, spool_root: Path, reserved: str, specs, *, garbage=False
+):
+    """Seed a legacy committed reserved-namespace segment (matching row + file).
+
+    A ``c[0-9a-f]{64}`` id is a valid producer batch-id shape, so before the reservation a producer
+    could have committed a segment at one. The commit ingress now rejects it, so this builds the
+    segment bytes at the reserved id, publishes them via the compaction authority (garbage bytes
+    when requested, to model an unreadable occupant), and inserts a committed-origin row — the exact
+    pre-reservation upgrade state A07's remediation must auto-converge. Returns the seed's frames.
+    """
+
+    base, base_frames = _commit(store, "batch-seed", specs)
+    legacy_record, content = compaction_module._build_new_segment(base, list(base_frames), reserved)
+    legacy_record = replace(legacy_record, origin=ORIGIN_COMMITTED)
+    with database.transaction() as connection:
+        connection.execute("DELETE FROM _segment_exporters WHERE batch_id = ?", ("batch-seed",))
+        connection.execute("DELETE FROM _segments WHERE batch_id = ?", ("batch-seed",))
+        insert_segment_row(connection, legacy_record)
+    compaction_module._publish_reserved_successor(
+        _segment_file(spool_root, reserved), b"not a valid segment file" if garbage else content
+    )
+    _segment_file(spool_root, "batch-seed").unlink()
+    return base_frames
+
+
+def test_a_legacy_reserved_namespace_committed_segment_is_auto_converged(tmp_path: Path) -> None:
+    # A07 / review #79-P1-4: a committed segment in the reserved c[0-9a-f]{64} namespace with
+    # origin='committed' is a legacy producer occupant that predates the reservation (compaction
+    # successors are always origin='reconciled'). Compaction AUTO-CONVERGES it — rewriting it to a
+    # fresh NON-reserved id, preserving every record — rather than wedging acquisition (the earlier
+    # fail-closed guard blocked a legal upgraded install's writers, retention, and recovery).
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
-        record, _frames = _commit(store, "batch-a", [("a1", _LIVE_AT)])
-        # Simulate a pre-reservation upgrade state: a committed-origin ledger row at a reserved id.
-        legacy = replace(record, batch_id="c" + "e" * 64, origin=ORIGIN_COMMITTED)
-        with database.transaction() as connection:
-            insert_segment_row(connection, legacy)
+        reserved = "c" + "e" * 64
+        base_frames = _seed_reserved_occupant(
+            database, store, spool_root, reserved, [("r1", _LIVE_AT), ("r2", _LIVE_AT)]
+        )
 
-        with pytest.raises(SpoolError) as captured:
-            DurableSpool(
-                database=database,
-                barrier=barrier,
-                spool_root=spool_root,
-                installation_id=_INSTALLATION_ID,
+        # Acquisition is NOT wedged: a fresh acquisition reconciles with the occupant present.
+        _reconcile(database, barrier, spool_root)
+        assert reserved in _segment_rows(database)
+
+        # Compaction auto-converges: the occupant is rehomed to a non-reserved id, records kept.
+        result = _compact(database, barrier, spool_root)
+        assert [r.old_batch_id for r in result.rehomed] == [reserved]
+        new_id = result.rehomed[0].new_batch_id
+        assert not is_reserved_compaction_batch_id(new_id)  # out of the reserved namespace
+        assert result.rehomed[0].dropped_records == 0  # every record preserved
+        assert _segment_rows(database) == {new_id}
+        assert not _segment_file(spool_root, reserved).exists()  # old file retired
+        assert set(_record_ids(spool_root, new_id)) == {
+            str(frame.record.record_id) for frame in base_frames
+        }
+    finally:
+        database.close()
+
+
+def test_a_rehome_of_an_unreadable_occupant_is_skipped(tmp_path: Path) -> None:
+    # A07 / review #79-P1-4: if a legacy reserved-namespace occupant's file cannot be read, the
+    # rehome fails closed for THIS pass (reported, never wedging) and leaves the occupant fully
+    # intact for a later pass — a live record is never lost.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        reserved = "c" + "a" * 64
+        _seed_reserved_occupant(
+            database, store, spool_root, reserved, [("r1", _LIVE_AT)], garbage=True
+        )
+        result = _compact(database, barrier, spool_root)
+        assert result.rehomed == ()  # the unreadable occupant was not rehomed
+        assert any(skip.status == "unreadable" for skip in result.skipped)
+        assert reserved in _segment_rows(database)  # left fully intact
+        assert _segment_file(spool_root, reserved).exists()
+    finally:
+        database.close()
+
+
+def test_a_rehome_of_a_disagreeing_occupant_is_skipped(tmp_path: Path) -> None:
+    # A07 / review #79-P1-4: if a legacy occupant's file no longer agrees with its ledger row, the
+    # rehome fails closed for this pass rather than retiring it against a mismatched file.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        reserved = "c" + "b" * 64
+        _seed_reserved_occupant(database, store, spool_root, reserved, [("r1", _LIVE_AT)])
+        # Mangle the ledger row so it disagrees with the (valid) file.
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE _segments SET record_count = record_count + 1 WHERE batch_id = ?",
+                (reserved,),
             )
-        assert captured.value.code == "MH_SPOOL_RESERVED_ID"
+        result = _compact(database, barrier, spool_root)
+        assert result.rehomed == ()  # the disagreeing occupant was not rehomed
+        assert any(skip.status == "disagreeing" for skip in result.skipped)
+        assert reserved in _segment_rows(database)  # left intact
     finally:
         database.close()
 
@@ -1156,8 +1295,9 @@ def test_a_crash_after_publish_restores_mixed_exporter_states(tmp_path: Path) ->
 
 def test_a_delivered_successor_is_never_regressed_by_a_reregistered_old(tmp_path: Path) -> None:
     # P1 (review), the other direction: after a successful swap whose old-file unlink was
-    # interrupted, reconciliation re-registers the OLD file with exporters pending. The retry must
-    # retire that stale old without regressing the already-delivered successor to pending.
+    # interrupted, mandatory reconciliation must retire the stale OLD file (via its tombstone),
+    # than re-registering it as live — and the already-delivered successor must never be touched
+    # (G03 review #79-P1-3).
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
         record, frames = _commit(
@@ -1182,15 +1322,13 @@ def test_a_delivered_successor_is_never_regressed_by_a_reregistered_old(tmp_path
         new_batch_id = first.compacted[0].new_batch_id
         assert first.compacted[0].file_outcome == "orphaned"
         assert _exporter_states(database, new_batch_id) == {"clickhouse": "delivered"}
+        assert _segment_file(spool_root, "batch-a").exists()
 
-        # Reconciliation re-registers the orphaned OLD file (with the exporter pending).
+        # Mandatory reconciliation completes the old segment's retirement (its tombstone), never
+        # re-registering it, and never touches the delivered successor.
         _reconcile(database, barrier, spool_root)
-        assert _exporter_states(database, "batch-a") == {"clickhouse": "pending"}
-
-        # The retry retires the stale old and must NOT regress the delivered successor.
-        second = _compact(database, barrier, spool_root)
-        assert [c.old_batch_id for c in second.compacted] == ["batch-a"]
         assert _segment_rows(database) == {new_batch_id}
+        assert not _segment_file(spool_root, "batch-a").exists()
         assert _exporter_states(database, new_batch_id) == {"clickhouse": "delivered"}
     finally:
         database.close()

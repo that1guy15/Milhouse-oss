@@ -236,6 +236,31 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "CHECK (length(file_sha256) = 64))",
         ),
     ),
+    Migration(
+        11,
+        "create_installation_key",
+        (
+            # Durable installation pseudonym-key identity (ADR 0007 addendum A07, §4.7). A keyed
+            # audit derivative is trustworthy only if produced by THIS installation's own key, and a
+            # `Pseudonymizer` is constructible from any 32 bytes, so loading a file at that path
+            # proves file hygiene, not installation identity. `init` (W06) records the
+            # NON-SECRET key ID and epoch here when it creates the key file; audited compaction then
+            # loads with these exact expected values and fails closed before any mutation on a
+            # missing record (unprovisioned), a missing/malformed key, or ID/epoch mismatch — so a
+            # wrong, restored, rotated, or cross-installation key can never write unattributable
+            # lineage. Singleton (`id = 1`): one identity per control plane. No secret is
+            # stored — only the public key ID (`mh_pk1_` + 16 hex) and the 1..2^31-1 epoch.
+            "CREATE TABLE _installation_key ("
+            "id INTEGER PRIMARY KEY NOT NULL, "
+            "key_id TEXT NOT NULL, "
+            "epoch INTEGER NOT NULL, "
+            "established_at TEXT NOT NULL, "
+            "CHECK (id = 1), "
+            "CHECK (length(key_id) = 23), "
+            "CHECK (key_id GLOB 'mh_pk1_*'), "
+            "CHECK (epoch BETWEEN 1 AND 2147483647))",
+        ),
+    ),
 )
 
 

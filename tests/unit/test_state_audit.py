@@ -113,7 +113,7 @@ def _audit_bytes(database) -> bytes:
 def test_the_migration_creates_the_audit_table(tmp_path: Path) -> None:
     database = _database(tmp_path)
     try:
-        assert schema_version(database) == 10
+        assert schema_version(database) == 11
         tables = {
             row[0]
             for row in database.connection.execute(
@@ -261,8 +261,8 @@ def test_migration_8_clears_legacy_unsalted_audit_resources(tmp_path: Path) -> N
         # At v7 the digest columns migration 9 adds do not exist yet, so read the resource directly.
         assert database.connection.execute("SELECT resource FROM _audit").fetchone()[0] == legacy
 
-        migrate(database, CONTROL_MIGRATIONS, barrier=barrier, applied_at=_NOW)  # apply 8, 9, 10
-        assert schema_version(database) == 10
+        migrate(database, CONTROL_MIGRATIONS, barrier=barrier, applied_at=_NOW)  # apply 8..11
+        assert schema_version(database) == 11
         assert list_audit(database)[0].resource is None  # reversible hash cleared
         assert legacy.encode("utf-8") not in _audit_bytes(database)
     finally:

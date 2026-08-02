@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ from milhouse.privacy.keys import load_pseudonym_key
 from milhouse.privacy.pseudonym import PrivacyError, Pseudonymizer
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
+    ORIGIN_COMMITTED,
     ORIGIN_RECONCILED,
     ExporterDelivery,
     SegmentRecord,
@@ -64,11 +66,16 @@ from milhouse.spooling.segment import (
     spool_content_sha256,
     spool_frame_line,
 )
-from milhouse.spooling.writer import build_segment_bytes, publish_segment_bytes
+from milhouse.spooling.writer import (
+    _publish_reserved_successor,
+    build_segment_bytes,
+    publish_segment_bytes,
+)
 from milhouse.state.audit import record_compaction
 from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
 from milhouse.state.database import ControlDatabase, _validated_database_path
 from milhouse.state.errors import StateError
+from milhouse.state.installation import read_installation_key
 
 if TYPE_CHECKING:
     from milhouse.config._models import MilhouseConfig
@@ -89,6 +96,10 @@ _DELIVERED = "delivered"
 # #1: a bounded probe over predictable ids could still be exhausted and strand; the reservation
 # removes the reachable stranding entirely, so no probe is needed).
 _COMPACTED_PREFIX = "c"
+# A07 rehome successor prefix: a legacy reserved-namespace committed occupant is rewritten to a
+# deterministic id in the ``r`` + 64-hex namespace — a producer batch-id shape NEVER in the reserved
+# ``c[0-9a-f]{64}`` namespace, so the rehomed segment is an ordinary committed segment.
+_REHOME_PREFIX = "r"
 
 STATUS_LIVE = "live"
 STATUS_FULLY_EXPIRED = "fully_expired"
@@ -135,10 +146,15 @@ class SkippedSegment:
 
 @dataclass(frozen=True, slots=True)
 class CompactionResult:
-    """The outcome of one compaction apply pass."""
+    """The outcome of one compaction apply pass.
+
+    ``rehomed`` holds legacy reserved-namespace committed occupants that this pass auto-converged to
+    a fresh non-reserved id before compacting (A07); each is a zero-dropped old→new rewrite.
+    """
 
     compacted: tuple[CompactedSegment, ...]
     skipped: tuple[SkippedSegment, ...]
+    rehomed: tuple[CompactedSegment, ...] = ()
 
     @property
     def dropped_records(self) -> int:
@@ -181,7 +197,7 @@ def _validate_common(database: object, spool_root: object, installation_id: obje
         _fail("MH_SPOOL_COMPACTION", "a spool root path is required")
     try:
         resolved_spool = lexical_absolute_path(cast("str | Path", spool_root))
-    except SecureFileError:
+    except SecureFileError:  # pragma: no cover - defensive: a str/PathLike rarely fails lexically
         _fail("MH_SPOOL_COMPACTION", "a spool root path is required")
     # Bind the spool root to this database's state root, exactly as commit/retention do, so a
     # misconfigured root cannot silently rewrite nothing (fail closed with privacy weight).
@@ -240,6 +256,32 @@ def _derive_batch_id(record: SegmentRecord, live_frames: list[SpoolFrameV1]) -> 
     if not is_reserved_compaction_batch_id(batch_id):  # pragma: no cover - defensive invariant
         _fail("MH_SPOOL_COMPACTION", "the derived successor id is not in the reserved namespace")
     return batch_id
+
+
+def _derive_rehome_id(record: SegmentRecord) -> str:
+    # A legacy reserved-namespace committed occupant is rehomed to a deterministic NON-reserved id,
+    # so the reserved namespace then holds only compaction successors (A07). The id is derived from
+    # the source's full identity (idempotent re-runs, distinct per source) and lands in the
+    # ``r`` + 64-hex namespace — a producer batch-id shape that never matches the reserved
+    # ``c[0-9a-f]{64}`` pattern — so the rehomed segment is an ordinary committed segment.
+    exporter_ids = sorted({exporter.exporter_id for exporter in record.exporters})
+    material = "\n".join(
+        [
+            "milhouse-reserved-rehome-v1",
+            record.batch_id,
+            record.config_generation,
+            record.scope,
+            record.target_id or "",
+            record.privacy_class,
+            str(record.retention_days),
+            str(len(exporter_ids)),
+            *exporter_ids,
+        ]
+    )
+    new_id = _REHOME_PREFIX + hashlib.sha256(material.encode("utf-8")).hexdigest()
+    if is_reserved_compaction_batch_id(new_id):  # pragma: no cover - 'r' + hex is never reserved
+        _fail("MH_SPOOL_COMPACTION", "the rehome id must not be in the reserved namespace")
+    return new_id
 
 
 def _build_new_segment(
@@ -311,6 +353,18 @@ def _remove_old_file(path: Path) -> str:
     return FILE_REMOVED
 
 
+def _clear_retirement(database: ControlDatabase, batch_id: str) -> None:
+    """Clear the old segment's retirement tombstone once its file is durably gone. Best-effort: on
+    any failure the tombstone is left for mandatory reconciliation to finish, so the intent is never
+    lost (mirrors retention)."""
+
+    try:
+        with database.transaction() as connection:
+            connection.execute("DELETE FROM _retirements WHERE batch_id = ?", (batch_id,))
+    except (sqlite3.Error, StateError):  # pragma: no cover - best-effort; reconciliation finishes
+        pass
+
+
 def _is_intended_successor(existing: SegmentRecord, intended: SegmentRecord) -> bool:
     """Whether an existing row at the derived id is EXACTLY the successor this compaction intends.
 
@@ -364,10 +418,26 @@ def _swap_ledger(
     a prior pass already confirmed delivered is never regressed to pending (which would re-expose an
     acknowledged record to duplicate external delivery).
 
-    ``pseudonymizer`` (when supplied) keys the old→new lineage identifiers recorded in ``_audit``;
-    when it is ``None`` (no installation key wired) the lineage resources are OMITTED as ``NULL``,
-    never stored as a reversible hash (plan §4.7).
+    ``pseudonymizer`` keys the old→new lineage identifiers recorded in ``_audit`` and is bound to
+    the installation's control-plane key identity (A07); a caller-supplied key never reaches here.
+
+    A durable RETIREMENT TOMBSTONE for the OLD segment (``_retirements``, scoped to the old
+    ``file_sha256``) is written in this SAME transaction as the swap, so a crash between the commit
+    and the old-file unlink cannot resurrect the retired mixed segment: mandatory reconciliation
+    finds the tombstone and finishes the deletion (or fences it) instead of re-registering the old
+    file as a live committed segment with its expired frame present (G03 review: commit-uncertain
+    re-adoption). It is cleared by the caller only after a durable ``removed`` outcome; on any
+    non-removed outcome it stays for reconciliation.
     """
+
+    invalid_time = False
+    retired_at = ""
+    try:
+        retired_at = format_timestamp(now)
+    except (OverflowError, TimeError):  # pragma: no cover - now is validated before the barrier
+        invalid_time = True
+    if invalid_time:  # pragma: no cover - now is validated by _require_now before the barrier
+        return False  # a bad instant cannot produce a valid tombstone; leave the segment intact
 
     failed = False
     try:
@@ -394,6 +464,13 @@ def _swap_ledger(
                 "DELETE FROM _segment_exporters WHERE batch_id = ?", (old_record.batch_id,)
             )
             connection.execute("DELETE FROM _segments WHERE batch_id = ?", (old_record.batch_id,))
+            # Durable retirement intent for the old file, in the swap transaction (see docstring).
+            # OR REPLACE keeps a re-run idempotent if a prior uncleared tombstone lingers.
+            connection.execute(
+                "INSERT OR REPLACE INTO _retirements (batch_id, day, file_sha256, retired_at) "
+                "VALUES (?, ?, ?, ?)",
+                (old_record.batch_id, old_record.day, old_record.file_sha256, retired_at),
+            )
             record_compaction(
                 connection,
                 now=now,
@@ -439,25 +516,119 @@ def _resolve_successor(
     Returns ``(batch_id, new_record, content, needs_publish, insert_new)`` or ``None``.
     """
 
-    candidate = _derive_batch_id(record, live_frames)
-    new_record, content = _build_new_segment(record, live_frames, candidate)
+    return _resolve_target(
+        database, root, installation_id, record, live_frames, _derive_batch_id(record, live_frames)
+    )
+
+
+def _resolve_target(
+    database: ControlDatabase,
+    root: Path,
+    installation_id: str,
+    record: SegmentRecord,
+    frames: list[SpoolFrameV1],
+    candidate: str,
+) -> tuple[str, SegmentRecord, bytes, bool, bool] | None:
+    """Resolve the single deterministic ``candidate`` target slot for an old→new segment rewrite.
+
+    Shared by audited compaction (reserved-namespace successor) and the A07 reserved-occupant rehome
+    (non-reserved successor). The ``candidate`` id is a function of the source's complete intended
+    identity, so any occupant is either exactly this rewrite's intended target (crash recovery) or a
+    SHA-256 collision (no finite/predictable input produces one); a non-target fails closed
+    (``None``). Returns ``(batch_id, new_record, content, needs_publish, insert_new)`` or ``None``.
+    """
+
+    new_record, content = _build_new_segment(record, frames, candidate)
     existing = read_segment_record(database, candidate)
     if existing is not None:
         if _is_intended_successor(existing, new_record):
-            return candidate, new_record, content, False, False  # reuse committed successor
-        return None  # reserved id holds a non-successor committed row (SHA-256 collision only)
+            return candidate, new_record, content, False, False  # reuse committed target
+        return None  # id holds a non-target committed row (SHA-256 collision only)
     candidate_path = root / _PENDING / record.day / f"{candidate}.jsonl"
     if not os.path.lexists(candidate_path):
         return candidate, new_record, content, True, True  # free slot — publish and insert
-    # A name exists with no ledger row (this compaction's crash orphan under the reserved id). Adopt
-    # it only if it is exactly this compaction's intended successor; otherwise fail closed.
+    # A name exists with no ledger row (this rewrite's crash orphan under the target id). Adopt it
+    # only if it is exactly this rewrite's intended target; otherwise fail closed.
     try:
         parsed = read_trusted_segment(candidate_path, installation_id=installation_id)
     except SpoolError:
-        return None  # reserved id holds an unreadable file (SHA-256 collision only)
+        return None  # id holds an unreadable file (SHA-256 collision only)
     if _agrees(parsed, new_record.day, candidate, new_record):
         return candidate, new_record, content, False, True  # our orphan — adopt (insert row)
-    return None  # reserved id holds a non-successor file (SHA-256 collision only)
+    return None  # id holds a non-target file (SHA-256 collision only)
+
+
+def _skipped(record: SegmentRecord, status: str, code: str | None) -> tuple[None, SkippedSegment]:
+    return None, SkippedSegment(record.batch_id, status, code)
+
+
+def _finish_rewrite(
+    database: ControlDatabase,
+    root: Path,
+    installation_id: str,
+    now: datetime,
+    record: SegmentRecord,
+    resolved: tuple[str, SegmentRecord, bytes, bool, bool] | None,
+    *,
+    pseudonymizer: Pseudonymizer,
+    publish: Callable[[Path, bytes], None],
+    dropped: int,
+    retained: int,
+) -> tuple[CompactedSegment | None, SkippedSegment | None]:
+    """Publish (if needed), verify, swap, and retire — the shared crash-safe tail of a rewrite.
+
+    Used by audited compaction (reserved-namespace successor, ``publish`` = the reserved authority)
+    and the A07 reserved-occupant rehome (non-reserved successor, ``publish`` = the ordinary
+    path). ``resolved`` is the target slot from :func:`_resolve_target` (``None`` → a non-target
+    occupant, fail closed); ``dropped``/``retained`` label the reported result. Every failure
+    normalizes to a skip that leaves the OLD segment fully intact — a live record is never lost, and
+    the new file is verified against the INTENDED target (never a pre-existing row) before the
+    retired.
+    """
+
+    if resolved is None:
+        return _skipped(record, STATUS_RESERVED_CONFLICT, "MH_SPOOL_COMPACTION")
+    new_batch_id, new_record, content, needs_publish, insert_new = resolved
+    new_path = root / _PENDING / record.day / f"{new_batch_id}.jsonl"
+
+    if needs_publish:
+        # The resolver only returns needs_publish for a slot with no name present, so publication
+        # onto that free slot under the exclusive hold cannot collide; any failure (including a
+        # surprise existing name) leaves the old segment fully intact.
+        try:
+            publish(new_path, content)
+        except SpoolError as error:
+            return _skipped(record, STATUS_PUBLISH_FAILED, error.code)
+
+    try:
+        parsed_new = read_trusted_segment(new_path, installation_id=installation_id)
+    except SpoolError as error:
+        return _skipped(record, STATUS_VERIFY_FAILED, error.code)
+    if not _agrees(parsed_new, new_record.day, new_batch_id, new_record):
+        return _skipped(record, STATUS_VERIFY_FAILED, "MH_SPOOL_VERIFY")
+
+    if not _swap_ledger(
+        database, record, new_record, now=now, insert_new=insert_new, pseudonymizer=pseudonymizer
+    ):
+        return _skipped(record, STATUS_COMMIT_FAILED, "MH_SPOOL_COMPACTION")
+
+    file_outcome = _remove_old_file(root / _PENDING / record.day / f"{record.batch_id}.jsonl")
+    if file_outcome == FILE_REMOVED:
+        # The old file is durably gone, so the retirement is complete: clear the tombstone. On any
+        # non-removed outcome it REMAINS and mandatory reconciliation finishes the deletion behind a
+        # durability fence, so a commit-uncertain unlink can never resurrect the retired segment.
+        _clear_retirement(database, record.batch_id)
+    return (
+        CompactedSegment(
+            old_batch_id=record.batch_id,
+            new_batch_id=new_batch_id,
+            dropped_records=dropped,
+            retained_records=retained,
+            retained_bytes=new_record.byte_size,
+            file_outcome=file_outcome,
+        ),
+        None,
+    )
 
 
 def _compact_one(
@@ -471,94 +642,144 @@ def _compact_one(
     """Compact one segment iff it is mixed-expiry; else return why it was skipped."""
 
     old_path = root / _PENDING / record.day / f"{record.batch_id}.jsonl"
-
-    def _skip(status: str, code: str | None) -> tuple[None, SkippedSegment]:
-        return None, SkippedSegment(record.batch_id, status, code)
-
     try:
         parsed = read_trusted_segment(old_path, installation_id=installation_id)
     except SpoolError as error:
-        return _skip(STATUS_UNREADABLE, error.code)
+        return _skipped(record, STATUS_UNREADABLE, error.code)
     if not _agrees(parsed, record.day, record.batch_id, record):
-        return _skip(STATUS_DISAGREEING, "MH_SPOOL_VERIFY")
+        return _skipped(record, STATUS_DISAGREEING, "MH_SPOOL_VERIFY")
 
     live_frames = [frame for frame in parsed.frames if frame.record.expires_at > now]
     dropped = len(parsed.frames) - len(live_frames)
     if dropped == 0:
-        return _skip(STATUS_LIVE, None)  # nothing expired — not a compaction candidate
+        return _skipped(record, STATUS_LIVE, None)  # nothing expired — not a candidate
     if not live_frames:
-        return _skip(
-            STATUS_FULLY_EXPIRED, None
-        )  # all expired — retention prunes it, not compaction
+        return _skipped(record, STATUS_FULLY_EXPIRED, None)  # all expired — retention prunes it
 
-    # Resolve the single reserved-namespace successor id. It is free or already this compaction's
-    # successor; only a SHA-256 collision could place a non-successor there, so ``None`` is a
-    # fail-closed integrity outcome, never a routine occupancy. A failure leaves the old segment
+    # Resolve the single reserved-namespace successor id (free / this compaction's own successor);
+    # only a SHA-256 collision could place a non-successor there. A failure leaves the old segment
     # fully intact — a live record is never lost.
     try:
         resolved = _resolve_successor(database, root, installation_id, record, live_frames)
     except SpoolError as error:
-        return _skip(STATUS_VERIFY_FAILED, error.code)
-    if resolved is None:
-        return _skip(STATUS_RESERVED_CONFLICT, "MH_SPOOL_COMPACTION")
-    new_batch_id, new_record, content, needs_publish, insert_new = resolved
-    new_path = root / _PENDING / record.day / f"{new_batch_id}.jsonl"
-
-    if needs_publish:
-        # The resolver only returns needs_publish for a slot with no name present, so publication
-        # onto that free slot under the exclusive hold cannot collide; any failure (including a
-        # surprise existing name) leaves the old segment fully intact. Compaction is the ONLY writer
-        # permitted into the reserved successor namespace, so it opts in explicitly.
-        try:
-            publish_segment_bytes(new_path, content, allow_reserved=True)
-        except SpoolError as error:
-            return _skip(STATUS_PUBLISH_FAILED, error.code)
-
-    # Verify the on-disk file agrees with the INTENDED successor (``new_record``) — never with a
-    # pre-existing row — BEFORE the old segment is retired, so a foreign or corrupt file at the
-    # chosen name can never cause the live data to be lost.
-    try:
-        parsed_new = read_trusted_segment(new_path, installation_id=installation_id)
-    except SpoolError as error:
-        return _skip(STATUS_VERIFY_FAILED, error.code)
-    if not _agrees(parsed_new, new_record.day, new_batch_id, new_record):
-        return _skip(STATUS_VERIFY_FAILED, "MH_SPOOL_VERIFY")
-
-    if not _swap_ledger(
-        database, record, new_record, now=now, insert_new=insert_new, pseudonymizer=pseudonymizer
-    ):
-        return _skip(STATUS_COMMIT_FAILED, "MH_SPOOL_COMPACTION")
-
-    file_outcome = _remove_old_file(old_path)
-    return (
-        CompactedSegment(
-            old_batch_id=record.batch_id,
-            new_batch_id=new_batch_id,
-            dropped_records=dropped,
-            retained_records=len(live_frames),
-            retained_bytes=new_record.byte_size,
-            file_outcome=file_outcome,
-        ),
-        None,
+        return _skipped(record, STATUS_VERIFY_FAILED, error.code)
+    return _finish_rewrite(
+        database,
+        root,
+        installation_id,
+        now,
+        record,
+        resolved,
+        pseudonymizer=pseudonymizer,
+        publish=_publish_reserved_successor,
+        dropped=dropped,
+        retained=len(live_frames),
     )
 
 
-def _load_installation_key(config: MilhouseConfig, paths: RuntimePaths) -> Pseudonymizer:
-    """Load the installation's own pseudonym key inside the validated config/runtime-path boundary —
-    the only way compaction obtains keyed-lineage authority (ADR 0007 addendum A07).
-    :func:`load_pseudonym_key` enforces the config-bound key path plus owner/mode/``nlink``/ACL
-    checks, so the key is the installation's own; a missing (unprovisioned installation — ``init``/
-    W06 has not run), unloadable, or invalid key fails closed. Because the caller never supplies a
-    key object, a forged arbitrary-bytes ``Pseudonymizer`` can never reach the audit path (G03
-    review: caller-forgeable key)."""
+def _rehome_one(
+    database: ControlDatabase,
+    root: Path,
+    installation_id: str,
+    now: datetime,
+    record: SegmentRecord,
+    pseudonymizer: Pseudonymizer,
+) -> tuple[CompactedSegment | None, SkippedSegment | None]:
+    """Rehome one legacy reserved-namespace committed occupant to a fresh NON-reserved id (A07).
+
+    A ``c[0-9a-f]{64}`` id was a valid producer batch id before the reservation, so a pre-upgrade
+    install can hold a committed segment in what is now the reserved compaction-successor namespace.
+    Rather than wedge acquisition (the earlier design's fail-closed guard — G03 review #79-P1-4),
+    compaction rewrites it — preserving EVERY record — to a non-reserved id, retiring the old
+    file under a durable tombstone, so the reserved namespace then holds only successors
+    and the single-slot allocation stays collision-safe. It reuses the same
+    resolve→publish→verify→swap→retire machinery as compaction, so it is idempotent and restartable
+    across every crash boundary. A rehome that cannot complete this pass leaves the occupant fully
+    intact for the next pass; acquisition is never blocked.
+    """
+
+    old_path = root / _PENDING / record.day / f"{record.batch_id}.jsonl"
+    try:
+        parsed = read_trusted_segment(old_path, installation_id=installation_id)
+    except SpoolError as error:
+        return _skipped(record, STATUS_UNREADABLE, error.code)
+    if not _agrees(parsed, record.day, record.batch_id, record):
+        return _skipped(record, STATUS_DISAGREEING, "MH_SPOOL_VERIFY")
+    if not parsed.frames:  # pragma: no cover - a committed segment always carries frames
+        return _skipped(record, STATUS_DISAGREEING, "MH_SPOOL_VERIFY")
+
+    # Resolve the deterministic NON-reserved target slot; a non-target occupant fails closed (the
+    # shared tail reports it), leaving the source intact.
+    try:
+        resolved = _resolve_target(
+            database, root, installation_id, record, list(parsed.frames), _derive_rehome_id(record)
+        )
+    except SpoolError as error:  # pragma: no cover - _build_new_segment never raises for valid src
+        return _skipped(record, STATUS_VERIFY_FAILED, error.code)
+    # ALL frames are retained (dropped=0): the rehome is a pure relocation, not an expiry rewrite.
+    # The target is NON-reserved, so it publishes through the ordinary producer path.
+    return _finish_rewrite(
+        database,
+        root,
+        installation_id,
+        now,
+        record,
+        resolved,
+        pseudonymizer=pseudonymizer,
+        publish=publish_segment_bytes,
+        dropped=0,
+        retained=len(parsed.frames),
+    )
+
+
+def _load_installation_key(
+    database: ControlDatabase, config: MilhouseConfig, paths: RuntimePaths
+) -> Pseudonymizer:
+    """Load the installation's own pseudonym key, BOUND to the control-plane key identity (A07).
+
+    Provenance is not established merely by loading a file at the config-bound path: a
+    :class:`Pseudonymizer` is constructible from any 32 bytes, and a wrong, restored, rotated, or
+    cross-installation valid key can sit at that path. So compaction (a) binds the config/runtime
+    ``state_root`` to THIS control database's state root — exactly as ``spool_root`` is bound — so a
+    foreign config/paths pair cannot key lineage; (b) reads the recorded non-secret key
+    id/epoch from the control plane (``_installation_key``, established by ``init``/W06); and (c)
+    loads the key with those exact ``expected_key_id``/epoch. An absent record (unprovisioned), a
+    missing/unloadable/malformed key, a cross-installation state root, or id/epoch mismatch all fail
+    closed HERE, before the barrier and before any file/ledger/cursor/audit mutation. Because the
+    caller supplies no key object, a forged ``Pseudonymizer`` can never reach the audit
+    path (G03 review: caller-forgeable key not bound to the installation)."""
+
+    database_path = _validated_database_path(database)
+    if database_path is None:  # pragma: no cover - _validate_common already rejects this
+        _fail("MH_SPOOL_COMPACTION", "a control database is required")
+    # Bind the runtime state root to the control database's state root, so a config/paths pair from
+    # another installation (a different key at a valid path) cannot pass provenance.
+    expected_state_root = database_path.parent.parent
+    try:
+        actual_state_root = lexical_absolute_path(cast("str | Path", paths.state_root))
+    except SecureFileError:  # pragma: no cover - defensive: a resolved state_root rarely fails
+        _fail("MH_SPOOL_COMPACTION", "the runtime state root is invalid")
+    if actual_state_root != expected_state_root:
+        _fail("MH_SPOOL_COMPACTION", "the runtime state root must match the control database")
+
+    try:
+        recorded = read_installation_key(database)
+    except StateError:  # pragma: no cover - defensive: the database type is already validated
+        _fail("MH_SPOOL_COMPACTION", "the installation key identity could not be read")
+    if recorded is None:
+        _fail("MH_SPOOL_COMPACTION", "compaction requires the provisioned installation key")
+    key_id, epoch = recorded
 
     loaded: Pseudonymizer | None = None
     try:
-        loaded = load_pseudonym_key(config, paths)
+        loaded = load_pseudonym_key(config, paths, epoch=epoch, expected_key_id=key_id)
     except PrivacyError:
         loaded = None
     if loaded is None:
-        _fail("MH_SPOOL_COMPACTION", "compaction requires the provisioned installation key")
+        _fail(
+            "MH_SPOOL_COMPACTION",
+            "the provisioned installation key could not be loaded or verified",
+        )
     return loaded
 
 
@@ -590,22 +811,51 @@ def compact_apply(
     audit mutation; compaction therefore cannot run on an un-``init``'d installation.
     """
 
-    pseudonymizer = _load_installation_key(config, paths)
     _validate_common(database, spool_root, installation_id)
     _validate_barrier(database, barrier)
     _require_now(now)
     if confirm is not True:
         _fail("MH_SPOOL_COMPACTION", "compaction apply requires an explicit confirmation")
+    # Establish keyed-lineage provenance (A07) only after the inputs validate, but still before the
+    # barrier and any mutation: an unprovisioned/wrong/cross-installation key fails closed here.
+    pseudonymizer = _load_installation_key(database, config, paths)
     root = Path(spool_root)
 
     compacted: list[CompactedSegment] = []
     skipped: list[SkippedSegment] = []
+    rehomed: list[CompactedSegment] = []
     with barrier.exclusive():
+        # A07 auto-converging remediation FIRST: rehome any legacy reserved-namespace committed
+        # occupant to a non-reserved id, so the reserved namespace holds only compaction successors
+        # and no legal upgraded install is ever wedged (the earlier design aborted acquisition — G03
+        # review #79-P1-4). Compaction successors are always ``origin='reconciled'``, so a
+        # committed-origin reserved row is unambiguously a pre-reservation producer occupant.
         for record in list_segment_records(database):
+            if record.origin == ORIGIN_COMMITTED and is_reserved_compaction_batch_id(
+                record.batch_id
+            ):
+                done, skip = _rehome_one(
+                    database, root, installation_id, now, record, pseudonymizer
+                )
+                if done is not None:
+                    rehomed.append(done)
+                else:
+                    assert skip is not None
+                    skipped.append(skip)
+        # Then compact mixed-expiry segments. Re-read the ledger (the rehome changed it) and never
+        # compact a still-reserved committed row in place (a rehome that could not complete this
+        # pass) — that would derive another reserved successor instead of converging the namespace.
+        for record in list_segment_records(database):
+            if record.origin == ORIGIN_COMMITTED and is_reserved_compaction_batch_id(
+                record.batch_id
+            ):
+                continue
             done, skip = _compact_one(database, root, installation_id, now, record, pseudonymizer)
             if done is not None:
                 compacted.append(done)
             else:
                 assert skip is not None
                 skipped.append(skip)
-    return CompactionResult(compacted=tuple(compacted), skipped=tuple(skipped))
+    return CompactionResult(
+        compacted=tuple(compacted), skipped=tuple(skipped), rehomed=tuple(rehomed)
+    )
