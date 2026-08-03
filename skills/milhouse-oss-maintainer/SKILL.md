@@ -38,12 +38,20 @@ changes.
 3. Run required validation and inspect the exact staged diff.
 4. Create a coherent DCO-signed commit.
 5. Re-read authorization, branch, remote, and PR state before each mutation.
-6. Push or open/update the PR only when authorized.
+6. Push or open/update the PR only when authorized, linking its tracking Issue (`Closes #N` /
+   `Refs #N`) so the roadmap Project item follows the PR.
 7. Wait for every required check; treat skipped, stale, or missing checks as failure.
 8. Re-review after corrections and confirm provenance and status evidence.
 9. Merge only when authorized, mergeable, required checks pass, required conversations are resolved,
    and no P0/P1 remains.
-10. Verify protected `main` after merge and update the durable evidence ledger.
+10. Verify protected `main` after merge, update the durable evidence ledger first, then close the
+    tracking Issue and set its roadmap Project item `State` — `Passed` only after the gate is
+    accepted, otherwise `In progress`; move a deferred obligation to the `Deferred` lane. Post an
+    engineering-journal Discussion only under separately recorded public-messaging authority.
+
+Record a merge honestly: an owner-directed merge is owner acceptance, never an independent review;
+never record a Claude-run or subagent review as an independent gate PASS, and never mark a gate
+`Passed` (in the ledger or the Project) without a fresh independent review and owner acceptance.
 
 Use `references/pr-lifecycle.md` for terminal states and externally pending behavior. Do not invent
 self-approval evidence for a sole maintainer.
