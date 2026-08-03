@@ -23,7 +23,7 @@ A durable commit is deliberately reconciled across the filesystem and SQLite:
 
 All durable writers take the shared global commit barrier; backup, restore, migration, and declared maintenance take the exclusive side. Startup and writer acquisition register valid orphan segments, report a ledger row with a missing segment as unhealthy corruption, and recover or quarantine stale temporary artifacts. Derived records use the same spool protocol and idempotent per-rule/version checkpoints before projections advance.
 
-Delivery is physically at least once and logically effectively once through deterministic IDs, conflict detection, destination confirmation, and checkpoints. Pending records remain retryable until delivered or their hard privacy expiry. Delivered records remain in the redacted spool until each record's class expiry. Audited restartable compaction removes only expired frames. Full mode never prunes the last recoverable unexpired copy.
+Delivery is physically at least once and logically effectively once through deterministic IDs, conflict detection, destination confirmation, and checkpoints. Pending records remain retryable until delivered or their hard privacy expiry. Delivered records remain in the redacted spool until each record's class expiry. Audited restartable compaction — which removes only expired frames from a mixed-expiry segment — is deferred out of W03 by amendment A09; until it lands a mixed-expiry segment is withheld from egress and never pruned, so no expired record leaks and no unexpired record is lost. Full mode never prunes the last recoverable unexpired copy.
 
 ## Consequences
 
