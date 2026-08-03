@@ -259,7 +259,7 @@ def test_each_real_amendment_maps_to_exactly_one_canonical_paragraph() -> None:
     declarations, violations = _declarations(_register(_PLAN))
     assert violations == []
     ids = [aid for aid, _kind, _block in declarations]
-    assert ids == ["A01", "A02", "A03", "A04", "A05", "A06", "A07"]
+    assert ids == ["A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08"]
 
 
 def test_the_process_allowlist_reads_as_process_or_disposition() -> None:
