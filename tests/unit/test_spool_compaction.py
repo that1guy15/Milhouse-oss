@@ -446,6 +446,53 @@ def test_key_file_to_control_row_interruption_is_adopted_on_retry(
         database.close()
 
 
+def test_key_establishment_reuses_identity_completed_while_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, barrier, _spool_root, _store = _spool(tmp_path, provision_key=False)
+    config, paths = _RUNTIMES[id(database)]
+    observed = iter((None, _PSEUDONYMIZER))
+    monkeypatch.setattr(
+        compaction_module,
+        "_load_recorded_installation_key",
+        lambda *_args: next(observed),
+    )
+    try:
+        loaded = compaction_module._load_or_establish_installation_key(
+            database, barrier, config, paths, _APPLY_NOW
+        )
+        assert loaded is _PSEUDONYMIZER
+        assert read_installation_key(database) is None
+    finally:
+        database.close()
+
+
+def test_key_establishment_rejects_an_invalid_existing_key_before_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, barrier, _spool_root, _store = _spool(tmp_path, provision_key=False)
+    config, paths = _RUNTIMES[id(database)]
+    monkeypatch.setattr(
+        compaction_module,
+        "_load_recorded_installation_key",
+        lambda *_args: None,
+    )
+
+    def invalid_key(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise compaction_module.PrivacyError("MH_PRIVACY_KEY_MODE", "synthetic invalid key")
+
+    monkeypatch.setattr(compaction_module, "load_pseudonym_key", invalid_key)
+    try:
+        with pytest.raises(SpoolError) as captured:
+            compaction_module._load_or_establish_installation_key(
+                database, barrier, config, paths, _APPLY_NOW
+            )
+        assert captured.value.code == "MH_SPOOL_COMPACTION"
+        assert read_installation_key(database) is None
+    finally:
+        database.close()
+
+
 def test_compaction_fails_closed_on_a_wrong_installation_key(tmp_path: Path) -> None:
     # A07 / review #79-P1-2 (exact reproduction): loading a valid key at the bound path is NOT proof
     # of installation identity. After provisioning key A (recorded in the control plane), replacing
@@ -1321,11 +1368,13 @@ def test_schema11_successive_crash_successors_collapse_to_one_authoritative_copy
         assert is_recorded_successor(database.connection, latest)
 
         monkeypatch.setattr(compaction_module, "_swap_ledger", real_swap)
+        monkeypatch.setattr(compaction_module, "_remove_old_file", lambda _path: "orphaned")
         result = _compact(database, barrier, spool_root)
 
         assert result.rehomed == ()
         assert {item.old_batch_id for item in result.compacted} == {"batch-a", earlier}
         assert {item.new_batch_id for item in result.compacted} == {latest}
+        assert {item.file_outcome for item in result.compacted} == {"orphaned"}
         assert _segment_rows(database) == {latest}
         assert _record_ids(spool_root, latest) == [str(frames[2].record.record_id)]
         assert (
@@ -1342,6 +1391,43 @@ def test_schema11_successive_crash_successors_collapse_to_one_authoritative_copy
             "SELECT target_batch_id, source_batch_id, kind FROM _compaction_intents"
         ).fetchall()
         assert intents == [(latest, "batch-a", "successor")]
+        assert database.connection.execute("SELECT count(*) FROM _retirements").fetchone() == (2,)
+    finally:
+        database.close()
+
+
+def test_historical_successor_subset_rejects_foreign_or_live_omissions() -> None:
+    source = tuple(_frames("source", [("a", _EXPIRED_AT), ("b", _LIVE_AT)]))
+    foreign = tuple(_frames("target", [("foreign", _LIVE_AT)]))
+    assert compaction_module._historical_successor_subset(source, foreign, _APPLY_NOW) is None
+
+    all_live = tuple(_frames("source", [("a", _LIVE_AT), ("b", _LIVE_AT)]))
+    retained = tuple(_frames("target", [("b", _LIVE_AT)]))
+    assert compaction_module._historical_successor_subset(all_live, retained, _APPLY_NOW) is None
+
+
+def test_fully_expired_pre_intent_successor_set_stays_protected_for_retention(
+    tmp_path: Path,
+) -> None:
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        source, frames = _commit(
+            store,
+            "batch-a",
+            [("expired-first", _EXPIRED_AT), ("expired-second", _NOW + timedelta(hours=12))],
+        )
+        target = compaction_module._derive_batch_id(source, [frames[1]])
+        _target_record, content = compaction_module._build_new_segment(source, [frames[1]], target)
+        compaction_module._publish_reserved_successor(_segment_file(spool_root, target), content)
+        _reconcile(database, barrier, spool_root)
+
+        result = _compact(database, barrier, spool_root)
+
+        assert any(
+            item.batch_id == "batch-a" and item.status == "reserved_conflict"
+            for item in result.skipped
+        )
+        assert _segment_rows(database) == {"batch-a", target}
     finally:
         database.close()
 
