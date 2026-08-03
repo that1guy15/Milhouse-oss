@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 
 import click
 from platformdirs import user_config_path, user_data_path
 
 from milhouse import __version__
-from milhouse.cli import bootstrap
+from milhouse.cli import bootstrap, demo
 from milhouse.config import (
     ConfigError,
     RuntimePaths,
@@ -19,6 +18,7 @@ from milhouse.config import (
     load_config,
     resolve_runtime_paths,
 )
+from milhouse.core.clock import SystemClock
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -138,7 +138,7 @@ def init_command(state: CliState, as_json: bool) -> None:
 
     paths = _resolve_paths(state)
     try:
-        report = bootstrap.initialize(paths, now=datetime.now(UTC))
+        report = bootstrap.initialize(paths, now=SystemClock().now())
     except bootstrap.BootstrapError as error:
         raise BootstrapCommandError(error) from None
     if as_json:
@@ -173,7 +173,7 @@ def health_command(context: click.Context, as_json: bool) -> None:
 
     state = context.ensure_object(CliState)
     paths = _resolve_paths(state)
-    report = bootstrap.health(paths, now=datetime.now(UTC))
+    report = bootstrap.health(paths, now=SystemClock().now())
     if as_json:
         click.echo(
             json.dumps(
@@ -192,4 +192,38 @@ def health_command(context: click.Context, as_json: bool) -> None:
             click.echo(f"[{'ok' if check.ok else 'FAIL'}] {check.name}: {check.detail}")
         click.echo(f"status: {report.status}")
     if not report.healthy:
+        context.exit(1)
+
+
+@main.command(name="demo")
+@click.option("--json", "as_json", is_flag=True, help="Emit the result as stable JSON.")
+@click.pass_context
+def demo_command(context: click.Context, as_json: bool) -> None:
+    """Run a credential-free, spool-only end-to-end data-flow demo."""
+
+    state = context.ensure_object(CliState)
+    paths = _resolve_paths(state)
+    try:
+        report = demo.run_demo(paths, now=SystemClock().now())
+    except bootstrap.BootstrapError as error:
+        raise BootstrapCommandError(error) from None
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "batch_id": report.batch_id,
+                    "day": report.day,
+                    "records_spooled": report.records_spooled,
+                    "read_back_ok": report.read_back_ok,
+                },
+                sort_keys=True,
+            )
+        )
+    else:
+        outcome = "ok" if report.read_back_ok else "FAILED"
+        click.echo(
+            f"demo: spooled {report.records_spooled} record(s) to "
+            f"{report.day}/{report.batch_id}; read-back {outcome}"
+        )
+    if not report.read_back_ok:
         context.exit(1)
