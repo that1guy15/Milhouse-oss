@@ -77,12 +77,30 @@ The spooled segment is a self-describing JSONL file under `<state root>/spool/pe
 header (frame/schema versions, batch id, config-generation digest, privacy/retention class, required
 exporters, record count, and the ordered-frame SHA-256) followed by the redacted record frame.
 
+## 5. Inspect what you spooled
+
+These commands are read-only and report privacy-safe **metadata only** — never the raw record
+payload — consistent with the local-query egress policy.
+
+```console
+$ milhouse --config ./config.toml spool list
+2026-08-03/demo-4eaebcb4...  records=1 bytes=1854 class=internal origin=committed delivered=False
+
+$ milhouse --config ./config.toml events
+mh_bkjjxhze...  event/source.event occurred=2026-08-03T21:12:51.732Z expires=... target=demo-target class=internal severity=info
+
+$ milhouse --config ./config.toml spool show demo-4eaebcb4...   # one segment's header + record metadata
+$ milhouse --config ./config.toml doctor                        # health + spool totals; nonzero exit on a problem
+```
+
+Add `--json` to any of them for a stable machine-readable form.
+
 ## Exit codes
 
 | Code | Meaning |
 |---:|---|
-| `0` | Success; `health` reports **healthy**; `demo` spooled and read back its record. |
-| `1` | `health` reports **unhealthy**, or `init`/`demo` could not establish or exercise the state root. |
+| `0` | Success; `health`/`doctor` report **healthy**; `demo` spooled and read back its record. |
+| `1` | `health`/`doctor` report a problem; `init`/`demo` could not establish or exercise the state root; or an inspect command was run before `init`. |
 | `2` | The configuration is missing or invalid. |
 
 ## What this is (and is not)

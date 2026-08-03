@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import click
 from platformdirs import user_config_path, user_data_path
 
 from milhouse import __version__
-from milhouse.cli import bootstrap, demo
+from milhouse.cli import bootstrap, demo, views
 from milhouse.config import (
     ConfigError,
     RuntimePaths,
@@ -226,4 +226,141 @@ def demo_command(context: click.Context, as_json: bool) -> None:
             f"{report.day}/{report.batch_id}; read-back {outcome}"
         )
     if not report.read_back_ok:
+        context.exit(1)
+
+
+def _require_installation_id(paths: RuntimePaths) -> str:
+    installation_id = bootstrap.read_installation_id(paths)
+    if installation_id is None:
+        raise BootstrapCommandError(
+            bootstrap.BootstrapError("MH_NOT_INITIALIZED", "run milhouse init first")
+        )
+    return installation_id
+
+
+@main.group(name="spool")
+def spool_group() -> None:
+    """Inspect committed spool segments (read-only)."""
+
+
+@spool_group.command(name="list")
+@click.option("--json", "as_json", is_flag=True, help="Emit the listing as stable JSON.")
+@click.pass_obj
+def spool_list_command(state: CliState, as_json: bool) -> None:
+    """List every committed spool segment with privacy-safe metadata."""
+
+    paths = _resolve_paths(state)
+    segments = views.list_segments(paths)
+    if as_json:
+        click.echo(json.dumps([asdict(segment) for segment in segments], sort_keys=True))
+        return
+    if not segments:
+        click.echo("no committed segments")
+        return
+    for segment in segments:
+        click.echo(
+            f"{segment.day}/{segment.batch_id}  records={segment.record_count} "
+            f"bytes={segment.byte_size} class={segment.privacy_class} "
+            f"origin={segment.origin} delivered={segment.delivered}"
+        )
+
+
+@spool_group.command(name="show")
+@click.argument("batch_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit the detail as stable JSON.")
+@click.pass_context
+def spool_show_command(context: click.Context, batch_id: str, as_json: bool) -> None:
+    """Show one segment's header summary and per-record metadata."""
+
+    state = context.ensure_object(CliState)
+    paths = _resolve_paths(state)
+    installation_id = _require_installation_id(paths)
+    detail = views.show_segment(paths, batch_id, installation_id)
+    if detail is None:
+        click.echo(f"no segment {batch_id}")
+        context.exit(1)
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "summary": asdict(detail.summary),
+                    "readable": detail.readable,
+                    "events": [asdict(event) for event in detail.events],
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    summary = detail.summary
+    click.echo(
+        f"segment {summary.day}/{summary.batch_id}: records={summary.record_count} "
+        f"bytes={summary.byte_size} class={summary.privacy_class} origin={summary.origin} "
+        f"delivered={summary.delivered} readable={detail.readable}"
+    )
+    for event in detail.events:
+        click.echo(
+            f"  {event.record_id} {event.record_type}/{event.name} "
+            f"occurred={event.occurred_at} expires={event.expires_at} "
+            f"target={event.target_id} severity={event.severity}"
+        )
+
+
+@main.command(name="events")
+@click.option("--json", "as_json", is_flag=True, help="Emit the events as stable JSON.")
+@click.pass_context
+def events_command(context: click.Context, as_json: bool) -> None:
+    """Read spooled records back and list their privacy-safe metadata."""
+
+    state = context.ensure_object(CliState)
+    paths = _resolve_paths(state)
+    installation_id = _require_installation_id(paths)
+    events = views.read_events(paths, installation_id)
+    if as_json:
+        click.echo(json.dumps([asdict(event) for event in events], sort_keys=True))
+        return
+    if not events:
+        click.echo("no spooled records")
+        return
+    for event in events:
+        click.echo(
+            f"{event.record_id} {event.record_type}/{event.name} "
+            f"occurred={event.occurred_at} expires={event.expires_at} "
+            f"target={event.target_id} class={event.privacy_class} severity={event.severity}"
+        )
+
+
+@main.command(name="doctor")
+@click.option("--json", "as_json", is_flag=True, help="Emit the diagnostic as stable JSON.")
+@click.pass_context
+def doctor_command(context: click.Context, as_json: bool) -> None:
+    """Run a richer redacted diagnostic (health plus spool totals); exit non-zero on a problem."""
+
+    state = context.ensure_object(CliState)
+    paths = _resolve_paths(state)
+    report = views.doctor(paths, now=SystemClock().now())
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "ok": report.ok,
+                    "health": {
+                        "status": report.health.status,
+                        "checks": [asdict(check) for check in report.health.checks],
+                    },
+                    "segment_count": report.segment_count,
+                    "record_count": report.record_count,
+                    "spool_readable": report.spool_readable,
+                },
+                sort_keys=True,
+            )
+        )
+    else:
+        for check in report.health.checks:
+            click.echo(f"[{'ok' if check.ok else 'FAIL'}] {check.name}: {check.detail}")
+        click.echo(
+            f"spool: segments={report.segment_count} records={report.record_count} "
+            f"readable={report.spool_readable}"
+        )
+        click.echo(f"status: {'ok' if report.ok else 'problem'}")
+    if not report.ok:
         context.exit(1)
