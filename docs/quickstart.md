@@ -57,17 +57,37 @@ $ milhouse --config ./config.toml health --json
 {"checks": [ ... ], "status": "healthy"}
 ```
 
+## 4. Run the spool-only demo
+
+`demo` exercises the whole local data path end to end without any network, credentials, or ClickHouse:
+it builds one synthetic "site canary healthy" event, classifies it into a canonical record, writes it
+to the durable spool through the commit barrier, and reads it back through the trusted reader to
+verify it round-trips. It initializes the state root first if needed, and each run spools a fresh
+uniquely-named segment (it never mutates or deletes prior spool data).
+
+```console
+$ milhouse --config ./config.toml demo
+demo: spooled 1 record(s) to 2026-08-03/demo-5897ecb7364a4b3f; read-back ok
+
+$ milhouse --config ./config.toml demo --json
+{"batch_id": "demo-...", "day": "2026-08-03", "read_back_ok": true, "records_spooled": 1}
+```
+
+The spooled segment is a self-describing JSONL file under `<state root>/spool/pending/<day>/`, with a
+header (frame/schema versions, batch id, config-generation digest, privacy/retention class, required
+exporters, record count, and the ordered-frame SHA-256) followed by the redacted record frame.
+
 ## Exit codes
 
 | Code | Meaning |
 |---:|---|
-| `0` | Success; `health` reports **healthy**. |
-| `1` | `health` reports **unhealthy**, or `init` could not establish the state root/identity. |
+| `0` | Success; `health` reports **healthy**; `demo` spooled and read back its record. |
+| `1` | `health` reports **unhealthy**, or `init`/`demo` could not establish or exercise the state root. |
 | `2` | The configuration is missing or invalid. |
 
 ## What this is (and is not)
 
 This is a preparatory product vertical built on the accepted W02 (configuration, identity, privacy)
 and W03 (SQLite control state and durable spool) foundations. It is tracked as a roadmap feature and
-does **not** claim the W05 runtime or W06 initialization gates. A spool-only data-flow demo and the
-full CLI surface follow in later increments.
+does **not** claim the W05 runtime or W06 initialization gates. The full CLI surface, real collectors,
+and ClickHouse-backed query follow in later work packages.
