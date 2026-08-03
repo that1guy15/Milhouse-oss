@@ -50,13 +50,14 @@ from milhouse.spooling.ledger import ORIGIN_COMMITTED, insert_segment_row, read_
 from milhouse.spooling.segment import is_reserved_compaction_batch_id
 from milhouse.state import (
     GlobalCommitBarrier,
+    StateError,
     advance_cursor,
     initialize_control_state,
     list_audit,
     open_control_database,
     read_cursor,
 )
-from milhouse.state.installation import establish_installation_key
+from milhouse.state.installation import establish_installation_key, read_installation_key
 
 _INSTALLATION_ID = "mh_in1_00000000000040008000000000000000"
 _NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
@@ -389,21 +390,58 @@ def test_a_wrong_type_barrier_is_rejected(tmp_path: Path) -> None:
         database.close()
 
 
-def test_compaction_fails_closed_without_a_provisioned_installation_key(tmp_path: Path) -> None:
-    # A07 / review #79-P1-2: compaction reads the installation's recorded key id/epoch from the
-    # control plane and loads with them. An UNPROVISIONED installation (no _installation_key record)
-    # fails closed BEFORE the barrier and any mutation — compaction cannot run on an un-init'd
-    # installation. The runtime is co-located with the database (state roots match), so the ONLY
-    # missing thing is the provisioned key identity.
+def test_compaction_establishes_the_installation_key_on_first_use(tmp_path: Path) -> None:
+    # W03 owns a usable maintenance lifecycle before the later CLI work packages exist. A newly
+    # initialized or upgraded control plane with migration 11 but no key row/file therefore creates
+    # and records its key under the barrier before compacting.
     database, barrier, spool_root, store = _spool(tmp_path, provision_key=False)
+    _config, paths = _RUNTIMES[id(database)]
     try:
         _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
+        assert read_installation_key(database) is None
+        assert not paths.pseudonym_key.exists()
+
+        result = _compact(database, barrier, spool_root)
+
+        assert len(result.compacted) == 1
+        recorded = read_installation_key(database)
+        assert recorded is not None
+        assert recorded[1] == 1
+        assert paths.pseudonym_key.is_file()
+        assert _segment_rows(database) != {"batch-a"}
+    finally:
+        database.close()
+
+
+def test_key_file_to_control_row_interruption_is_adopted_on_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The key file is durably published before its non-secret identity row. A database failure in
+    # that window leaves a valid unrecorded file, never a row-without-key. The next production call
+    # adopts that exact file and converges before touching spool state.
+    database, barrier, spool_root, store = _spool(tmp_path, provision_key=False)
+    _config, paths = _RUNTIMES[id(database)]
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT), ("a2", _LIVE_AT)])
+
+        def fail_establishment(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise StateError("MH_STATE_INSTALLATION_KEY", "synthetic establishment failure")
+
+        monkeypatch.setattr(compaction_module, "establish_installation_key", fail_establishment)
         with pytest.raises(SpoolError) as captured:
             _compact(database, barrier, spool_root)
         assert captured.value.code == "MH_SPOOL_COMPACTION"
-        assert _segment_rows(database) == {"batch-a"}  # nothing mutated
-        assert _segment_file(spool_root, "batch-a").exists()
-        assert list_audit(database) == ()  # no audit row written
+        assert paths.pseudonym_key.is_file()
+        assert read_installation_key(database) is None
+        assert _segment_rows(database) == {"batch-a"}
+        assert list_audit(database) == ()
+
+        monkeypatch.setattr(
+            compaction_module, "establish_installation_key", establish_installation_key
+        )
+        result = _compact(database, barrier, spool_root)
+        assert len(result.compacted) == 1
+        assert read_installation_key(database) is not None
     finally:
         database.close()
 
@@ -1211,6 +1249,99 @@ def test_schema11_crash_published_successor_is_adopted_without_duplicate_history
             "SELECT delivery_status FROM _segment_exporters WHERE batch_id = ?", (successor,)
         ).fetchone()
         assert delivery == ("delivered",)
+    finally:
+        database.close()
+
+
+def test_schema11_successive_crash_successors_collapse_to_one_authoritative_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discover the complete pre-intent set, then retain one most-current successor."""
+
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        old_record, frames = _commit(
+            store,
+            "batch-a",
+            [
+                ("expired-first", _EXPIRED_AT),
+                ("expired-second", _NOW + timedelta(hours=12)),
+                ("live", _LIVE_AT),
+            ],
+        )
+        deliver_segment(
+            database,
+            barrier,
+            old_record,
+            frames,
+            {"clickhouse": _FakeExporter("clickhouse")},
+            now=_NOW,
+        )
+        advance_cursor(
+            database,
+            "github",
+            position="page-8",
+            batch_id="batch-a",
+            now=_NOW,
+            expected_revision=0,
+        )
+        source = read_segment_record(database, "batch-a")
+        assert source is not None
+        earlier = compaction_module._derive_batch_id(source, list(frames[1:]))
+        latest = compaction_module._derive_batch_id(source, [frames[2]])
+        _earlier_record, earlier_content = compaction_module._build_new_segment(
+            source, list(frames[1:]), earlier
+        )
+        _latest_record, latest_content = compaction_module._build_new_segment(
+            source, [frames[2]], latest
+        )
+
+        # Schema 11 can legally contain both names: one pass published [B,C] and crashed; after B
+        # expired, a later pass against the still-authoritative source published [C] and crashed.
+        with database.transaction() as connection:
+            connection.execute("DROP TABLE _sequences")
+            connection.execute("DROP TABLE _compaction_intents")
+            connection.execute("DELETE FROM _schema_migrations WHERE version = 12")
+        compaction_module._publish_reserved_successor(
+            _segment_file(spool_root, earlier), earlier_content
+        )
+        compaction_module._publish_reserved_successor(
+            _segment_file(spool_root, latest), latest_content
+        )
+        initialize_control_state(database, barrier=barrier, applied_at=_APPLY_NOW)
+        _reconcile(database, barrier, spool_root)
+        assert _segment_rows(database) == {"batch-a", earlier, latest}
+
+        real_swap = compaction_module._swap_ledger
+        monkeypatch.setattr(compaction_module, "_swap_ledger", lambda *_args, **_kwargs: False)
+        interrupted = _compact(database, barrier, spool_root)
+        assert any(item.status == "commit_failed" for item in interrupted.skipped)
+        assert _segment_rows(database) == {"batch-a", earlier, latest}
+        assert database.connection.execute("SELECT count(*) FROM _retirements").fetchone() == (0,)
+        assert is_recorded_successor(database.connection, latest)
+
+        monkeypatch.setattr(compaction_module, "_swap_ledger", real_swap)
+        result = _compact(database, barrier, spool_root)
+
+        assert result.rehomed == ()
+        assert {item.old_batch_id for item in result.compacted} == {"batch-a", earlier}
+        assert {item.new_batch_id for item in result.compacted} == {latest}
+        assert _segment_rows(database) == {latest}
+        assert _record_ids(spool_root, latest) == [str(frames[2].record.record_id)]
+        assert (
+            sum(len(_record_ids(spool_root, batch_id)) for batch_id in _segment_rows(database)) == 1
+        )
+        cursor = read_cursor(database, "github")
+        assert cursor is not None
+        assert (cursor.batch_id, cursor.position, cursor.revision) == (latest, "page-8", 1)
+        delivery = database.connection.execute(
+            "SELECT delivery_status FROM _segment_exporters WHERE batch_id = ?", (latest,)
+        ).fetchone()
+        assert delivery == ("delivered",)
+        intents = database.connection.execute(
+            "SELECT target_batch_id, source_batch_id, kind FROM _compaction_intents"
+        ).fetchall()
+        assert intents == [(latest, "batch-a", "successor")]
     finally:
         database.close()
 

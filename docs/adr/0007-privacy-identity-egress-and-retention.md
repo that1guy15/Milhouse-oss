@@ -2,7 +2,7 @@
 
 - Status: Accepted (ratification)
 - Date: 2026-07-18
-- Amended by: ADR 0016 (adds the `local_log` egress surface and the persisted structured-log contract, 2026-07-22); Addendum A07 (installation-key provenance and reserved compaction-namespace upgrade, 2026-08-01)
+- Amended by: ADR 0016 (adds the `local_log` egress surface and the persisted structured-log contract, 2026-07-22); Addendum A07 (installation-key provenance and reserved compaction-namespace upgrade, 2026-08-01); Addendum A08 (dependency-ready key lifecycle and complete successor-set recovery, 2026-08-02)
 
 ## Context
 
@@ -73,6 +73,37 @@ this addendum states the resulting contract.
   deletion only behind a positive day-directory durability fence and never re-adopts the retired bytes,
   so a commit-uncertain unlink cannot resurrect a privacy-expired segment. In pre-alpha (no released
   installs) the legacy-occupant state is empty and the remediation is a deterministic, crash-safe no-op.
+
+## Addendum A08 (2026-08-02) — dependency-ready key lifecycle and complete successor-set recovery
+
+Owner-approved 2026-08-02 to close the remaining P1s reproduced by the independent exact-head PR
+#79 review. The formal reason, alternatives, compatibility/migration, security, and revised-test
+record is in [plan section 1](../implementation-plan.md#1-authority-and-change-control). This
+addendum narrowly supersedes A07 where A07 deferred key establishment to W06 and described recovery
+as independent old-source/successor pairs.
+
+- **W03 establishes its own installation-key prerequisite.** When migration 11 is applied but the
+  `_installation_key` singleton is unset, the first confirmed compaction validates the canonical
+  config/runtime/control-database state-root binding and takes the installation commit barrier. It
+  securely loads a valid existing key at the bound owner-only path (including a file durably
+  published before an interrupted row commit), or creates and durably publishes a new key. Only
+  after a verified key exists does it transactionally record the non-secret ID and epoch. Retry
+  adopts the exact unrecorded file; it never writes a row first or overwrites an existing key. Once
+  recorded, the A07 expected-ID/epoch verification remains binding and wrong, missing, malformed,
+  stale-epoch, or cross-installation key material fails before spool mutation. No caller-provided
+  key object or arbitrary caller bytes are accepted.
+
+- **Schema-11 recovery is set-based and atomic.** Under the exclusive barrier, recovery discovers
+  and verifies the complete set of reserved successors uniquely derived from every still-present
+  source before changing the ledger. This includes multiple successors published from that source
+  at successive expiry boundaries. Recovery selects or publishes the deterministic successor for
+  the frames live at recovery time, verifies it, and atomically re-points cursors, preserves any
+  delivered exporter acknowledgement, removes the source and every redundant verified successor
+  row, records each old-to-final audit lineage, and writes a digest-scoped retirement tombstone for
+  every old file. Only after commit are the old files unlinked. Cross-source ambiguity or inability
+  to prove the exact final target protects the complete affected set and fails closed without
+  partial rehome/compaction. Repeated restart, reconciliation, and maintenance therefore converge
+  to exactly one ledger/file copy of each live record.
 
 ## Plan references
 

@@ -2,11 +2,12 @@
 
 A keyed audit derivative is trustworthy only if produced by *this* installation's own key. Because a
 :class:`~milhouse.privacy.pseudonym.Pseudonymizer` is constructible from any 32 bytes, loading a key
-file at the config-bound path proves file hygiene, not installation identity. `init` (W06) records
-the installation's NON-SECRET key ID and epoch (migration 11, the singleton ``_installation_key``
-table) when it creates the key file, and audited compaction loads the key with these exact expected
-values, failing closed before any mutation on an absent record (unprovisioned), a missing/malformed
-key, or an ID/epoch mismatch.
+file at the config-bound path proves file hygiene, not installation identity. W03's dependency-ready
+maintenance lifecycle creates or adopts the bound key under exclusive authority and records the
+installation's NON-SECRET key ID and epoch (migration 11, the singleton ``_installation_key``
+table). Audited compaction loads the key with these exact expected values; after establishment it
+fails closed before spool mutation on a missing/malformed key or an ID/epoch mismatch. W06 ``init``
+reuses the same established identity rather than owning a prerequisite that would make W03 unusable.
 
 The record carries no secret — only the public key ID (``mh_pk1_`` + 16 hex) and epoch. Writing is
 transaction-scoped: :func:`establish_installation_key` runs on the caller's open connection, in the

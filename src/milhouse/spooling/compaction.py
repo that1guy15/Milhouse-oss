@@ -45,7 +45,12 @@ from milhouse.config.filesystem import (
 from milhouse.core.clock import TimeError, format_timestamp
 from milhouse.domain.identity import ScopeV1
 from milhouse.domain.records import PrivacyClassV1
-from milhouse.privacy.keys import load_pseudonym_key
+from milhouse.privacy.keys import (
+    PseudonymKeyCommitUncertain,
+    create_pseudonym_key,
+    load_pseudonym_key,
+    recover_pseudonym_key_creation,
+)
 from milhouse.privacy.pseudonym import PrivacyError, Pseudonymizer
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.intents import (
@@ -83,7 +88,7 @@ from milhouse.state.audit import record_compaction
 from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
 from milhouse.state.database import ControlDatabase, _validated_database_path
 from milhouse.state.errors import StateError
-from milhouse.state.installation import read_installation_key
+from milhouse.state.installation import establish_installation_key, read_installation_key
 
 if TYPE_CHECKING:
     from milhouse.config._models import MilhouseConfig
@@ -396,8 +401,9 @@ def _swap_ledger(
     now: datetime,
     insert_new: bool,
     pseudonymizer: Pseudonymizer,
+    additional_old_records: tuple[SegmentRecord, ...] = (),
 ) -> bool:
-    """Atomically publish/restore the successor, re-point cursors, delete the old row, and audit.
+    """Atomically publish/restore the successor, retire old rows, re-point cursors, and audit.
 
     Returns whether the transaction committed. Cursors are RE-POINTED to the new segment (not
     detached), since the live records they checkpoint survive in it; the new row is inserted before
@@ -413,13 +419,17 @@ def _swap_ledger(
     ``pseudonymizer`` keys the old→new lineage identifiers recorded in ``_audit`` and is bound to
     the installation's control-plane key identity (A07); a caller-supplied key never reaches here.
 
-    A durable RETIREMENT TOMBSTONE for the OLD segment (``_retirements``, scoped to the old
+    ``additional_old_records`` supports schema-11 recovery where several verified crash-published
+    successors exist for one source. They and the source are collapsed to one current successor in
+    this SAME transaction. Delivery acknowledgement is never regressed: any retired variant that
+    was delivered promotes the surviving exporter row to delivered. Every retired row receives its
+    own cursor repoint, audit lineage, and digest-scoped retirement tombstone.
+
+    A durable RETIREMENT TOMBSTONE for every OLD segment (``_retirements``, scoped to its
     ``file_sha256``) is written in this SAME transaction as the swap, so a crash between the commit
-    and the old-file unlink cannot resurrect the retired mixed segment: mandatory reconciliation
-    finds the tombstone and finishes the deletion (or fences it) instead of re-registering the old
-    file as a live committed segment with its expired frame present (G03 review: commit-uncertain
-    re-adoption). It is cleared by the caller only after a durable ``removed`` outcome; on any
-    non-removed outcome it stays for reconciliation.
+    and an old-file unlink cannot resurrect any retired mixed/redundant segment. Tombstones are
+    cleared by the caller only after a durable ``removed`` outcome; on any non-removed outcome they
+    stay for reconciliation.
     """
 
     invalid_time = False
@@ -432,6 +442,7 @@ def _swap_ledger(
         return False  # a bad instant cannot produce a valid tombstone; leave the segment intact
 
     failed = False
+    old_records = (old_record, *additional_old_records)
     try:
         with database.transaction() as connection:
             if insert_new:
@@ -448,45 +459,53 @@ def _swap_ledger(
                             _DELIVERED,
                         ),
                     )
-            connection.execute(
-                "UPDATE _cursors SET batch_id = ? WHERE batch_id = ?",
-                (new_record.batch_id, old_record.batch_id),
-            )
-            connection.execute(
-                "DELETE FROM _segment_exporters WHERE batch_id = ?", (old_record.batch_id,)
-            )
-            connection.execute("DELETE FROM _segments WHERE batch_id = ?", (old_record.batch_id,))
-            # The old segment is retired: drop any intents naming it, so the intents
-            # table stays ~one row per live reserved segment / pending rehome. If the old was a
-            # genuine successor its successor-intent goes; a rehome source its rehome-intent
-            # goes (its target is the segment that survives). The NEW successor's own intent
-            # was recorded before publication and is untouched.
-            clear_intents_for_segment(connection, old_record.batch_id)
-            # Durable retirement intent for the old file, in the swap transaction (see docstring).
-            # OR REPLACE keeps a re-run idempotent if a prior uncleared tombstone lingers.
-            connection.execute(
-                "INSERT OR REPLACE INTO _retirements (batch_id, day, file_sha256, retired_at) "
-                "VALUES (?, ?, ?, ?)",
-                (old_record.batch_id, old_record.day, old_record.file_sha256, retired_at),
-            )
-            record_compaction(
-                connection,
-                now=now,
-                old_batch_id=old_record.batch_id,
-                new_batch_id=new_record.batch_id,
-                old_record_count=old_record.record_count,
-                old_byte_size=old_record.byte_size,
-                new_record_count=new_record.record_count,
-                new_byte_size=new_record.byte_size,
-                # Immutable evidence of the exact retired/replacement bytes (plan §§4.8-4.9): old
-                # digests were verified against the file by ``_agrees`` at the start of this
-                # compaction; the new digests were verified by reading the published successor back.
-                old_content_sha256=old_record.content_sha256,
-                old_file_sha256=old_record.file_sha256,
-                new_content_sha256=new_record.content_sha256,
-                new_file_sha256=new_record.file_sha256,
-                pseudonymizer=pseudonymizer,
-            )
+            # A crash-published variant may have been delivered before the source was rediscovered.
+            # Preserve that acknowledgement on the one surviving row; never regress it to pending.
+            for retired in old_records:
+                for exporter in retired.exporters:
+                    if exporter.delivery_status == _DELIVERED:
+                        connection.execute(
+                            "UPDATE _segment_exporters SET delivery_status = ? "
+                            "WHERE batch_id = ? AND exporter_id = ?",
+                            (_DELIVERED, new_record.batch_id, exporter.exporter_id),
+                        )
+
+            for retired in old_records:
+                connection.execute(
+                    "UPDATE _cursors SET batch_id = ? WHERE batch_id = ?",
+                    (new_record.batch_id, retired.batch_id),
+                )
+                connection.execute(
+                    "DELETE FROM _segment_exporters WHERE batch_id = ?", (retired.batch_id,)
+                )
+                connection.execute("DELETE FROM _segments WHERE batch_id = ?", (retired.batch_id,))
+                # The old segment is retired: drop any intent naming it as a target. The NEW
+                # successor's own source->target intent was recorded before publication and is
+                # untouched because its target is the surviving row.
+                clear_intents_for_segment(connection, retired.batch_id)
+                connection.execute(
+                    "INSERT OR REPLACE INTO _retirements "
+                    "(batch_id, day, file_sha256, retired_at) VALUES (?, ?, ?, ?)",
+                    (retired.batch_id, retired.day, retired.file_sha256, retired_at),
+                )
+                record_compaction(
+                    connection,
+                    now=now,
+                    old_batch_id=retired.batch_id,
+                    new_batch_id=new_record.batch_id,
+                    old_record_count=retired.record_count,
+                    old_byte_size=retired.byte_size,
+                    new_record_count=new_record.record_count,
+                    new_byte_size=new_record.byte_size,
+                    # Immutable evidence of the exact retired/replacement bytes (plan §§4.8-4.9):
+                    # every old digest was verified from its file during discovery, and the new
+                    # digests were verified by reading the published successor back.
+                    old_content_sha256=retired.content_sha256,
+                    old_file_sha256=retired.file_sha256,
+                    new_content_sha256=new_record.content_sha256,
+                    new_file_sha256=new_record.file_sha256,
+                    pseudonymizer=pseudonymizer,
+                )
     except (sqlite3.Error, StateError):
         failed = True
     return not failed
@@ -747,14 +766,17 @@ def _recover_pre_intent_successors(
     now: datetime,
     pseudonymizer: Pseudonymizer,
 ) -> tuple[list[CompactedSegment], list[SkippedSegment], set[str]]:
-    """Collapse genuine schema-11 crash-published successor pairs before legacy rehome.
+    """Collapse complete schema-11 crash-published successor sets before legacy rehome.
 
     Migration 12 cannot populate provenance using SQL alone because proving a successor requires the
     trusted segment bytes. Under the exclusive barrier, this first maintenance pass therefore
-    reconstructs each unproven reserved target from every still-present source, verifies the full
-    deterministic identity and exact files, records the missing successor intent, and atomically
-    finishes the old->new swap. Ambiguous or interrupted pairs are protected from rehome/compaction
-    for this pass and retried later; they are never rehome-then-recreated into duplicate history.
+    reconstructs every unproven reserved target from every still-present source and verifies its
+    full deterministic identity and exact file. Discovery completes BEFORE mutation. All targets
+    uniquely belonging to one source are then atomically collapsed with that source into the exact
+    successor for the records live *now*. This handles several legal crash-published successors from
+    successive expiry boundaries (for example ``[B,C]`` and later ``[C]``) without turning either
+    into a second authoritative segment. Ambiguous or interrupted sets remain completely protected
+    from rehome/compaction for this pass and retry later.
     """
 
     records = list_segment_records(database)
@@ -776,13 +798,15 @@ def _recover_pre_intent_successors(
         if _agrees(segment, record.day, record.batch_id, record):
             parsed[record.batch_id] = segment.frames
 
-    recovered: list[CompactedSegment] = []
+    records_by_id = {record.batch_id: record for record in records}
+    groups: dict[str, list[tuple[SegmentRecord, list[SpoolFrameV1]]]] = {}
     skipped: list[SkippedSegment] = []
     protected: set[str] = set()
+    ambiguous_sources: set[str] = set()
     for target in targets:
         if target.batch_id not in parsed:
             continue
-        matches: list[tuple[SegmentRecord, list[SpoolFrameV1], SegmentRecord, bytes]] = []
+        matches: list[tuple[SegmentRecord, list[SpoolFrameV1]]] = []
         for source in records:
             if source.batch_id == target.batch_id or source.batch_id not in parsed:
                 continue
@@ -791,46 +815,105 @@ def _recover_pre_intent_successors(
             )
             if subset is None or _derive_batch_id(source, subset) != target.batch_id:
                 continue
-            intended, content = _build_new_segment(source, subset, target.batch_id)
+            intended, _content = _build_new_segment(source, subset, target.batch_id)
             if _is_intended_successor(target, intended):
-                matches.append((source, subset, intended, content))
+                matches.append((source, subset))
         if not matches:
             continue
         protected.add(target.batch_id)
-        protected.update(source.batch_id for source, _subset, _intended, _content in matches)
+        protected.update(source.batch_id for source, _subset in matches)
         if len(matches) != 1:
+            ambiguous_sources.update(source.batch_id for source, _subset in matches)
             skipped.append(
                 SkippedSegment(target.batch_id, STATUS_RESERVED_CONFLICT, "MH_SPOOL_COMPACTION")
             )
             continue
-        source, subset, intended, content = matches[0]
-        if not _record_successor_intent(
-            database, target=target.batch_id, source=source.batch_id, now=now
+        source, subset = matches[0]
+        groups.setdefault(source.batch_id, []).append((target, subset))
+
+    recovered: list[CompactedSegment] = []
+    for source_id, matches in groups.items():
+        source = records_by_id[source_id]
+        source_frames = parsed[source_id]
+        group_ids = {source_id, *(target.batch_id for target, _subset in matches)}
+        # A target involved in any cross-source ambiguity stays protected as a complete set. Never
+        # partially collapse a group whose ownership cannot be proved uniquely.
+        if source_id in ambiguous_sources:
+            continue
+
+        live_frames = [frame for frame in source_frames if frame.record.expires_at > now]
+        if not live_frames or len(live_frames) == len(source_frames):
+            skipped.append(
+                SkippedSegment(source.batch_id, STATUS_RESERVED_CONFLICT, "MH_SPOOL_COMPACTION")
+            )
+            continue
+        final_id = _derive_batch_id(source, live_frames)
+        try:
+            resolved = _resolve_target(
+                database, root, installation_id, source, live_frames, final_id
+            )
+        except SpoolError as error:
+            skipped.append(SkippedSegment(source.batch_id, STATUS_VERIFY_FAILED, error.code))
+            continue
+        if resolved is None:
+            skipped.append(
+                SkippedSegment(source.batch_id, STATUS_RESERVED_CONFLICT, "MH_SPOOL_COMPACTION")
+            )
+            continue
+        final_id, final_record, content, needs_publish, insert_new = resolved
+        if not _record_successor_intent(database, target=final_id, source=source.batch_id, now=now):
+            skipped.append(
+                SkippedSegment(source.batch_id, STATUS_COMMIT_FAILED, "MH_SPOOL_COMPACTION")
+            )
+            continue
+        final_path = root / _PENDING / source.day / f"{final_id}.jsonl"
+        if needs_publish:
+            try:
+                _publish_reserved_successor(final_path, content)
+            except SpoolError as error:
+                skipped.append(SkippedSegment(source.batch_id, STATUS_PUBLISH_FAILED, error.code))
+                continue
+        try:
+            parsed_final = read_trusted_segment(final_path, installation_id=installation_id)
+        except SpoolError as error:
+            skipped.append(SkippedSegment(source.batch_id, STATUS_VERIFY_FAILED, error.code))
+            continue
+        if not _agrees(parsed_final, final_record.day, final_id, final_record):
+            skipped.append(SkippedSegment(source.batch_id, STATUS_VERIFY_FAILED, "MH_SPOOL_VERIFY"))
+            continue
+
+        redundant = tuple(target for target, _subset in matches if target.batch_id != final_id)
+        if not _swap_ledger(
+            database,
+            source,
+            final_record,
+            now=now,
+            insert_new=insert_new,
+            pseudonymizer=pseudonymizer,
+            additional_old_records=redundant,
         ):
             skipped.append(
                 SkippedSegment(source.batch_id, STATUS_COMMIT_FAILED, "MH_SPOOL_COMPACTION")
             )
             continue
-        done, skip = _finish_rewrite(
-            database,
-            root,
-            installation_id,
-            now,
-            source,
-            (target.batch_id, intended, content, False, False),
-            pseudonymizer=pseudonymizer,
-            publish=_publish_reserved_successor,
-            dropped=source.record_count - len(subset),
-            retained=len(subset),
-            record_successor=False,
-        )
-        if done is not None:
-            recovered.append(done)
-            protected.discard(source.batch_id)
-            protected.discard(target.batch_id)
-        else:
-            assert skip is not None
-            skipped.append(skip)
+
+        for retired in (source, *redundant):
+            file_outcome = _remove_old_file(
+                root / _PENDING / retired.day / f"{retired.batch_id}.jsonl"
+            )
+            if file_outcome == FILE_REMOVED:
+                _clear_retirement(database, retired.batch_id)
+            recovered.append(
+                CompactedSegment(
+                    old_batch_id=retired.batch_id,
+                    new_batch_id=final_id,
+                    dropped_records=retired.record_count - final_record.record_count,
+                    retained_records=final_record.record_count,
+                    retained_bytes=final_record.byte_size,
+                    file_outcome=file_outcome,
+                )
+            )
+        protected.difference_update(group_ids)
     return recovered, skipped, protected
 
 
@@ -943,21 +1026,21 @@ def _rehome_one(
     )
 
 
-def _load_installation_key(
+def _load_recorded_installation_key(
     database: ControlDatabase, config: MilhouseConfig, paths: RuntimePaths
-) -> Pseudonymizer:
-    """Load the installation's own pseudonym key, BOUND to the control-plane key identity (A07).
+) -> Pseudonymizer | None:
+    """Load the installation key bound to its durable identity, or report an unset identity.
 
     Provenance is not established merely by loading a file at the config-bound path: a
     :class:`Pseudonymizer` is constructible from any 32 bytes, and a wrong, restored, rotated, or
     cross-installation valid key can sit at that path. So compaction (a) binds the config/runtime
     ``state_root`` to THIS control database's state root — exactly as ``spool_root`` is bound — so a
     foreign config/paths pair cannot key lineage; (b) reads the recorded non-secret key
-    id/epoch from the control plane (``_installation_key``, established by ``init``/W06); and (c)
-    loads the key with those exact ``expected_key_id``/epoch. An absent record (unprovisioned), a
-    missing/unloadable/malformed key, a cross-installation state root, or id/epoch mismatch all fail
-    closed HERE, before the barrier and before any file/ledger/cursor/audit mutation. Because the
-    caller supplies no key object, a forged ``Pseudonymizer`` can never reach the audit
+    id/epoch from the control plane; and (c) loads the key with those exact
+    ``expected_key_id``/epoch. A missing/unloadable/malformed key, a cross-installation state root,
+    or id/epoch mismatch fails closed. ``None`` means only that the durable identity has not yet
+    been established; :func:`_load_or_establish_installation_key` owns that upgrade path. Because
+    the caller supplies no key object, a forged :class:`Pseudonymizer` can never reach the audit
     path (G03 review: caller-forgeable key not bound to the installation)."""
 
     database_path = _validated_database_path(database)
@@ -978,7 +1061,7 @@ def _load_installation_key(
     except StateError:  # pragma: no cover - defensive: the database type is already validated
         _fail("MH_SPOOL_COMPACTION", "the installation key identity could not be read")
     if recorded is None:
-        _fail("MH_SPOOL_COMPACTION", "compaction requires the provisioned installation key")
+        return None
     key_id, epoch = recorded
 
     loaded: Pseudonymizer | None = None
@@ -992,6 +1075,86 @@ def _load_installation_key(
             "the provisioned installation key could not be loaded or verified",
         )
     return loaded
+
+
+def _load_or_establish_installation_key(
+    database: ControlDatabase,
+    barrier: GlobalCommitBarrier,
+    config: MilhouseConfig,
+    paths: RuntimePaths,
+    now: datetime,
+) -> Pseudonymizer:
+    """Return this installation's key, provisioning or adopting it on first maintenance use.
+
+    W03 compaction must be usable before the later CLI work packages exist. An upgraded or newly
+    initialized control plane can therefore have migration 11 but no ``_installation_key`` row.
+    This dependency-ready production lifecycle closes that gap:
+
+    * an already-recorded identity is loaded and verified without mutation;
+    * an unrecorded but valid key file (including a crash after file publication) is adopted; or
+    * a missing key is securely created and then bound to the control plane.
+
+    Establishment runs under the same installation barrier as compaction. File publication happens
+    first and is durable before the SQLite identity is committed. A crash or database failure in
+    between leaves one recoverable unrecorded file; the next call loads that exact file and records
+    its ID. The row is never written before a verifiable key exists, and a recorded wrong/missing
+    key continues to fail closed before compaction mutates spool state.
+    """
+
+    loaded = _load_recorded_installation_key(database, config, paths)
+    if loaded is not None:
+        return loaded
+
+    with barrier.exclusive():
+        # Another process using the same barrier may have completed establishment while this caller
+        # waited. Re-read under authority before creating or recording anything.
+        loaded = _load_recorded_installation_key(database, config, paths)
+        if loaded is not None:
+            return loaded
+
+        try:
+            loaded = load_pseudonym_key(config, paths, epoch=1)
+        except PrivacyError as error:
+            if error.code != "MH_PRIVACY_KEY_NOT_FOUND":
+                _fail(
+                    "MH_SPOOL_COMPACTION",
+                    "the installation key could not be safely established",
+                )
+            try:
+                loaded = create_pseudonym_key(config, paths, epoch=1)
+            except PseudonymKeyCommitUncertain as uncertain:
+                try:
+                    loaded = recover_pseudonym_key_creation(
+                        config, paths, expected_key_id=uncertain.key_id, epoch=1
+                    )
+                except PrivacyError:
+                    _fail(
+                        "MH_SPOOL_COMPACTION",
+                        "the installation key publication could not be recovered",
+                    )
+            except PrivacyError:
+                _fail(
+                    "MH_SPOOL_COMPACTION",
+                    "the installation key could not be safely established",
+                )
+
+        try:
+            with database.transaction() as connection:
+                establish_installation_key(
+                    connection, key_id=loaded.key_id, epoch=loaded.epoch, now=now
+                )
+        except StateError:
+            _fail(
+                "MH_SPOOL_COMPACTION",
+                "the installation key identity could not be established",
+            )
+
+    # Re-load through the recorded identity boundary. This proves the committed row and on-disk key
+    # agree rather than returning the object that happened to create/adopt the file.
+    verified = _load_recorded_installation_key(database, config, paths)
+    if verified is None:  # pragma: no cover - the transaction above establishes the singleton
+        _fail("MH_SPOOL_COMPACTION", "the installation key identity was not established")
+    return verified
 
 
 def compact_apply(
@@ -1017,9 +1180,10 @@ def compact_apply(
     Keyed old→new lineage is a W03 deliverable (plan §4.7), and per ADR 0007 addendum A07 its
     authority is established by LOADING the installation's own pseudonym key inside the validated
     ``config``/``paths`` boundary (:func:`milhouse.privacy.keys.load_pseudonym_key`) — compaction
-    accepts no caller-supplied key object. A missing (unprovisioned installation), unloadable, or
-    cross-installation key fails closed HERE, before the barrier and before any file, ledger, or
-    audit mutation; compaction therefore cannot run on an un-``init``'d installation.
+    accepts no caller-supplied key object. If the identity is unset, this W03 production path
+    securely creates or adopts the bound key under the barrier and records its ID/epoch before
+    compaction. Once recorded, an unloadable, wrong, or cross-installation key fails closed before
+    any spool mutation.
     """
 
     _validate_common(database, spool_root, installation_id)
@@ -1027,9 +1191,10 @@ def compact_apply(
     _require_now(now)
     if confirm is not True:
         _fail("MH_SPOOL_COMPACTION", "compaction apply requires an explicit confirmation")
-    # Establish keyed-lineage provenance (A07) only after the inputs validate, but still before the
-    # barrier and any mutation: an unprovisioned/wrong/cross-installation key fails closed here.
-    pseudonymizer = _load_installation_key(database, config, paths)
+    # Establish keyed-lineage provenance (A07) only after the inputs validate. An upgraded/new
+    # installation atomically provisions or adopts its key under the barrier; a recorded
+    # wrong/missing/cross-installation key still fails closed before any spool mutation.
+    pseudonymizer = _load_or_establish_installation_key(database, barrier, config, paths, now)
     root = Path(spool_root)
 
     compacted: list[CompactedSegment] = []

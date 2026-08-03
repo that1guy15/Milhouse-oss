@@ -251,7 +251,7 @@ def test_the_real_register_and_index_are_compliant() -> None:
 
 def test_every_expected_amendment_is_enumerated() -> None:
     blocks = _amendment_blocks(_register(_PLAN))
-    for amendment in ("A01", "A02", "A03", "A04", "A05", "A06", "A07"):
+    for amendment in ("A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08"):
         assert amendment in blocks, f"{amendment} is not enumerated from the section-1 register"
 
 

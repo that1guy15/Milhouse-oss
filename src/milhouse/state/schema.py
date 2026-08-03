@@ -184,8 +184,8 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             # installation-local HMAC pseudonym, never a public unsalted hash — a plain SHA-256 of a
             # low-entropy batch id is dictionary-recoverable and correlates across installations.
             # Slice 5b's retention audit stored such plain digests in resource. The keyed pseudonym
-            # key is created by `init` (W06), not yet wired into the control plane, so the audit
-            # writers now OMIT the derivative (store NULL) until keying is available. This clears
+            # key was not yet wired into the control plane at this migration, so the audit writers
+            # OMIT the derivative (store NULL) until a bound key identity is available. This clears
             # any already-written unsalted resource so no reversible id survives the upgrade;
             # keyed tokens written later carry an mh_fp1_ prefix and are never produced before this.
             "UPDATE _audit SET resource = NULL WHERE resource IS NOT NULL",
@@ -243,12 +243,13 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             # Durable installation pseudonym-key identity (ADR 0007 addendum A07, §4.7). A keyed
             # audit derivative is trustworthy only if produced by THIS installation's own key, and a
             # `Pseudonymizer` is constructible from any 32 bytes, so loading a file at that path
-            # proves file hygiene, not installation identity. `init` (W06) records the
-            # NON-SECRET key ID and epoch here when it creates the key file; audited compaction then
-            # loads with these exact expected values and fails closed before any mutation on a
-            # missing record (unprovisioned), a missing/malformed key, or ID/epoch mismatch — so a
-            # wrong, restored, rotated, or cross-installation key can never write unattributable
-            # lineage. Singleton (`id = 1`): one identity per control plane. No secret is
+            # proves file hygiene, not installation identity. W03's first confirmed compaction
+            # creates or adopts the bound key under the global barrier, then records the NON-SECRET
+            # key ID and epoch here; W06 init reuses that identity. Later audited compaction loads
+            # with these exact expected values and fails closed before spool mutation on a
+            # missing/malformed key or ID/epoch mismatch — so a wrong, restored, rotated, or
+            # cross-installation key can never write unattributable lineage. Singleton (`id = 1`):
+            # one identity per control plane. No secret is
             # stored — only the public key ID (`mh_pk1_` + 16 hex) and the 1..2^31-1 epoch.
             "CREATE TABLE _installation_key ("
             "id INTEGER PRIMARY KEY NOT NULL, "
@@ -273,8 +274,9 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             # records an INTENT for each successor BEFORE publishing it, so a reserved id is
             # successor ONLY if an intent proves it — and a crash-published successor is still
             # adoptable, never rehomed (which would duplicate its records). The table starts empty
-            # on schema-12 upgrade, so the first exclusive compaction pass reconstructs and verifies
-            # any genuine pre-upgrade old-source/successor pair before treating the remaining
+            # on schema-12 upgrade, so the first exclusive compaction pass discovers and verifies
+            # the complete successor set for every old source, then atomically collapses the source
+            # and every redundant successor to one current target before treating the remaining
             # reserved rows as legacy occupants. A rehome intent binds its source to a
             # collision-resistant target so a restart reuses the same allocation.
             "CREATE TABLE _compaction_intents ("
