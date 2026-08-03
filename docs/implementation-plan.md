@@ -34,9 +34,24 @@ Plan amendment A02, approved by the owner on 2026-07-22 and ratified by ADR 0016
 persisted local structured-log contract in section 4.15 and adds the `local_log` egress surface to
 section 4.7. It authorizes installation-scoped local operational metadata only, adds no external
 egress, record, or publication authority, and expands no retention beyond the existing 14-day log
-class. Amendment A03, approved by the owner on 2026-07-22 and ratified by ADR 0017, records the exact
-bounded historical DCO disposition for the D01 PR #21 squash incident without weakening future
-enforcement.
+class. Reason: section 1 forbids locking a stored contract inside implementation, and the persisted
+local structured-log wire is a new locked storage/lifecycle contract that must be recorded as a
+numbered amendment. Alternatives considered: leaving the log surface unstructured or provider-defined
+(rejected because W03, W06, and W16 need a stable, self-describing, bounded wire to persist, rotate,
+recover, and retire), and folding it into the existing record spool (rejected because operational logs
+are a distinct 14-day class with their own file surface and must not enter the record/egress
+pipeline). Compatibility and migration: no public stored-log format has shipped, so the contract is v1
+with no migration and no implicit adoption of preexisting files, split across W02 (wire, encoder,
+sink), W03 (file surface, recovery, retention), W06 (CLI/stderr), and W16 (backup, restore, purge).
+Security: the wire carries installation-scoped operational metadata only — never secrets, PII, paths,
+prompts, transcripts, or tool output — and adds no external egress, record, publication, or retention
+authority beyond the existing 14-day log class. Revised tests: ADR 0016's revised validation plus the
+section 4.15 file-surface, rotation, recovery, concurrency, bound, and retention gate assertions
+exercise the contract at G03.
+
+Amendment A03, approved by the owner on 2026-07-22 and ratified by
+ADR 0017, records the exact bounded historical DCO disposition for the D01 PR #21 squash incident
+without weakening future enforcement.
 
 Plan amendment A04, approved by the owner on 2026-07-23, resolves defect D02 by re-scoping the W02 gate
 G02 assertions to certify the W02 redaction, rendering, structured-error, structured-event, and
@@ -76,7 +91,7 @@ a mixed-line JSONL stream requires every line to be self-describing). Compatibil
 public stored-log format has shipped, so the schema is v1 with no migration and no implicit adoption of
 preexisting files, and A05 changes no already-implemented wire byte. Security: the exact schema keeps
 arbitrary text, exception detail, secrets, and provider content out of every line, stderr, exception,
-and traceback, unchanged from A02. Revised tests: a schema-lock test asserts each declared key,
+and traceback, unchanged from the prior stored-log amendment. Revised tests: a schema-lock test asserts each declared key,
 literal, scalar type, and optionality rule for the minimal and maximal header, event, non-empty
 trailer, and empty trailer, together with the digest-coverage and the `expires_at` normative vector.
 
@@ -98,10 +113,68 @@ required). Compatibility and migration: documentation-only, with no source, wire
 retention, egress, product-scope, or migration change. Security impact: A06 explicitly narrows the
 literal attacker model; it retains every containment requirement within the defended boundary,
 requires uncertain outcomes rather than success after detected namespace drift, and recommends a
-dedicated service account. Revised tests retain traversal, symlink, different-user,
+dedicated service account. Revised tests: retain traversal, symlink, different-user,
 cooperating-writer, deterministic directory-displacement, recovery-copy-preservation, and retry
 coverage; no acceptance test may claim containment against hostile code already executing as the
 Milhouse account.
+
+Plan amendment A07, approved by the owner on 2026-08-01 and ratified by an ADR 0007 addendum, resolves
+the deep P1s independent reviews reproduced in the W03 audited-compaction remediation (defects
+D07/D08): installation-key provenance and the reserved compaction-successor namespace upgrade. **(1)
+Installation-key provenance.** A persisted keyed audit derivative is trustworthy only if produced by
+the installation's own key; because `Pseudonymizer` is constructible from any 32 caller-supplied bytes,
+neither an exact-type gate nor merely loading a file at the config-bound path proves installation
+identity. W03 records the installation's non-secret pseudonym key ID and epoch in the SQLite control
+plane (migration 11, the singleton `_installation_key` table), and compaction (a) binds the
+config/runtime `state_root` to the control database's state root, (b) reads the recorded key ID/epoch,
+and (c) loads the key with `load_pseudonym_key(config, paths, epoch=<recorded>,
+expected_key_id=<recorded>)`, failing closed before any file, ledger, cursor, or audit mutation when the
+record is absent (unprovisioned), the key is missing/unloadable/malformed, or its derived ID/epoch does
+not match. Compaction accepts no caller-supplied key and its audit constructor is non-optional. `init`
+(W06) establishes the recorded key ID/epoch when it creates the key file; until then compaction fails
+closed and cannot run. **(2) Reserved compaction-successor namespace and upgrade.** The `c[0-9a-f]{64}`
+successor namespace is reserved from schema 10; the producer commit ingress rejects it, and only
+compaction publishes into it through an unexported, reserved-only publication authority — the public
+`publish_segment_bytes`/`write_spool_segment` surface rejects reserved names with no caller bypass.
+Because a `c`+64-hex id is a legal producer batch id, a pre-reservation schema could hold a committed
+reserved-namespace segment; on acquisition a restartable exclusive-barrier remediation auto-converges
+such a legacy occupant by rewriting it to a fresh non-reserved id (all records preserved, cursors
+re-pointed, the old file retired under a durable tombstone), so a legal install is never wedged and
+expired data is never retained. Migration 12 records authoritative successor/rehome intents. Because
+that table begins empty on upgrade, the first exclusive pass reconstructs and verifies every genuine
+pre-intent old-source/successor crash pair from the trusted segment bytes and atomically finishes that
+swap before it classifies any remaining reserved row as a legacy occupant; ambiguity fails safely.
+Rehome uses a durably bound collision-resistant 256-bit ordinary ID, retries any finite set of
+producer-occupied rows/files/intents without a probe bound or SQLite sequence ceiling, and atomically
+replaces a recorded target only after proving it foreign while the old source remains authoritative.
+Compaction also records a durable retirement tombstone for the
+superseded old segment in the same transaction as the ledger swap, and reconciliation completes that
+deletion only behind a positive day-directory durability fence, never re-adopting the retired bytes.
+Reason: the first remediation established provenance only by loading a file and guarded legacy occupants
+by aborting all spool acquisition, which independent review reproduced as, respectively, caller-forgeable
+lineage and a permanent acquisition wedge of a legal install. Alternatives considered: deferring keyed
+audit lineage entirely to W06/`init` (rejected by the owner in favor of binding it now); trust-on-first-use
+recording of the key ID at first compaction (rejected because it cannot prove installation authority);
+and a bounded operator-run remediation for legacy occupants (rejected by the owner in favor of an
+auto-converging migration needing no operator step). Compatibility and migration: migration 11 adds the
+singleton `_installation_key` table (schema 11); migration 12 adds the successor/rehome intent table and
+generic sequence table, while its first exclusive maintenance pass reconstructs pre-intent successors
+before rehome. The remediation and compaction retirement tombstone are crash-restartable and, in
+pre-alpha where no install has shipped, normally no-ops; A07 changes no wire byte, retention rule,
+product scope, tag, publication, or release authority and preserves every privacy invariant. Security impact: audit lineage becomes
+attributable to the installation's own key (wrong, cross-installation, and forged keys fail before any
+mutation), the successor namespace is reserved end to end so a reachable expired-data stranding vector is
+removed, and a commit-uncertain resurrection of privacy-expired bytes is closed behind a durability
+fence — while a legal upgraded install stays usable. Revised tests: a wrong/cross-installation key and an
+unprovisioned key each fail compaction before the barrier while the exact recorded key/epoch passes; a
+schema-11 old source plus its valid crash-published successor migrates to exactly one authoritative
+copy with cursor and exporter state preserved; a legacy reserved occupant auto-converges across every
+allocation/publish/swap/retire crash boundary, including finite producer occupation and a foreign
+recorded target, with no live-record loss or expired retention; every exported/direct writer path rejects a
+reserved name while the unexported compaction authority still publishes; a commit-uncertain compaction
+unlink never re-adopts the old segment and clears its tombstone only after a durability fence; and a
+change-control test asserts every numbered amendment records its required fields and is registered in the
+ADR index.
 
 ## 2. Product contract
 
@@ -838,7 +911,7 @@ Default retention:
 | Pending spool | Until successful delivery or the record-class privacy expiry, whichever comes first |
 | Backups | Manual policy |
 
-Spool, ClickHouse, and SQLite projections retain records for their data-class periods. Pending records remain retryable until delivered or until their data-class privacy expiry. Compaction rewrites only expired frames into a new fsynced segment, records old/new hashes and lineage transactionally, and unlinks the superseded file only after verification; interruption is restartable. Milhouse does not promise forensic secure erasure on SSD, copy-on-write, snapshot, or journaled storage. Privacy-sensitive operators must use encrypted volumes and apply platform/media sanitization when retiring storage. `retention preview` lists exact counts and bytes without mutation. `retention apply --confirm` records an audit event.
+Spool, ClickHouse, and SQLite projections retain records for their data-class periods. Pending records remain retryable until delivered or until their data-class privacy expiry. Compaction rewrites only expired frames into a new fsynced segment, records old/new hashes and lineage transactionally, and unlinks the superseded file only after verification; interruption is restartable. Per ADR 0007 addendum A07 (2026-08-01): compaction's keyed lineage is bound to the installation's own pseudonym key by IDENTITY, not merely by loading a file — W03 records the installation's non-secret key ID and epoch in the SQLite control plane (migration 11, `_installation_key`), and compaction binds its config/runtime `state_root` to the control database's state root, reads that record, loads the key with the recorded `expected_key_id`/epoch, and fails closed before any file, ledger, cursor, or audit mutation on an absent record (unprovisioned), a missing/unloadable/malformed key, or an ID/epoch mismatch (no caller-supplied key). The reserved `c[0-9a-f]{64}` successor namespace is reserved from schema 10: the commit ingress rejects it and only compaction publishes into it through an unexported reserved-only authority (no public bypass); because `c`+64-hex is a legal producer batch id, a restartable exclusive-barrier remediation auto-converges any legacy committed reserved-namespace segment by rewriting it to a fresh non-reserved id (all records preserved, cursors re-pointed, old file retired under a durable tombstone), so a legal install is never wedged and expired data is never retained. Compaction records a durable retirement tombstone for the superseded old segment in the same transaction as the ledger swap, and reconciliation completes that deletion only after a positive day-directory durability fence, never re-adopting the retired bytes. Retention's crash-safe prune likewise persists a durable retirement tombstone before unlink, and reconciliation completes the deletion only after a positive durability fence, never re-adopting a privacy-expired segment. Milhouse does not promise forensic secure erasure on SSD, copy-on-write, snapshot, or journaled storage. Privacy-sensitive operators must use encrypted volumes and apply platform/media sanitization when retiring storage. `retention preview` lists exact counts and bytes without mutation. `retention apply --confirm` records an audit event.
 
 Target purge is an explicit destructive workflow. `milhouse targets purge TARGET --dry-run` produces an exact manifest and digest. Confirmation requires both `--confirm TARGET` and that manifest digest. The command acquires an exclusive target maintenance fence plus the compaction/retention fence, blocks every scheduler, receiver, CLI, MCP, manual-collection, notifier, audit, and plugin write for that target, and revalidates the manifest before mutation. It then removes that target's pending, delivered, and quarantine segments; SQLite projections; ClickHouse rows using a mutation that is waited on and verified; and generated briefs. The fences remain held through verification and the final metadata-only purge audit tombstone. Immutable backups containing the target are listed separately. Partial deletion is resumable, makes health unhealthy until resolved, and is covered by race and interrupted-purge tests.
 
