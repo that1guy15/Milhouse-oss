@@ -14,7 +14,9 @@ against adversarial synthetic inputs (which must be rejected), so an omission ca
 
 from __future__ import annotations
 
+import html
 import re
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -64,8 +66,10 @@ _AMENDMENT_DECLARATION = re.compile(
     r"^(?P<kind>process amendment|plan amendment|amendment)[ \t\r\n]+(?P<token>\S+)",
     flags=re.IGNORECASE,
 )
-_CANONICAL_ID = re.compile(r"A(?P<number>0[1-9]|[1-9][0-9]+),?", re.IGNORECASE)
+_CANONICAL_ID = re.compile(r"A(?P<number>0[1-9]|[1-9][0-9]+),?")
 _AMENDMENT_ID_LIKE = re.compile(r"(?<![A-Za-z0-9])A[0-9]+", re.IGNORECASE)
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_HTML_TAG = re.compile(r"</?[A-Za-z][^>]*>")
 _ADR_ROW = re.compile(
     r"^\|\s*\[(?P<adr>[0-9]{4})\]\([^)]+\)\s*\|(?P<decision>.*?)\|\s*$",
     flags=re.MULTILINE,
@@ -94,14 +98,26 @@ def _declarations(register: str) -> tuple[list[tuple[str, str, str]], list[str]]
     # second declaration; it leaves both A-IDs in one paragraph and the exact-one check rejects it.
     paragraphs = re.split(r"(?:\r?\n[ \t]*){2,}", register)
     for paragraph in paragraphs:
-        ids = _AMENDMENT_ID_LIKE.findall(paragraph)
-        # Any A-ID-bearing register paragraph is declaration-shaped authority and must be canonical.
-        # This remains fail-closed even when HTML entities/tags obscure the word "amendment" itself.
-        if not ids:
+        # Classification happens on a conservative rendered-text approximation BEFORE canonical
+        # raw parsing. HTML comments cannot split a token, character references are decoded, HTML
+        # tags are removed, and NFKC exposes compatibility/confusable forms such as full-width
+        # A/0/8.
+        # This view is used only to decide that a paragraph MUST be rejected or parsed; it can never
+        # make a malformed raw declaration authoritative.
+        rendered = _HTML_COMMENT.sub("", paragraph)
+        rendered = html.unescape(rendered)
+        rendered = _HTML_TAG.sub("", rendered)
+        rendered = unicodedata.normalize("NFKC", rendered)
+        ids = _AMENDMENT_ID_LIKE.findall(rendered)
+        # Any rendered A-ID or amendment-shaped register paragraph must be one raw canonical
+        # declaration. A malformed/confusable declaration therefore becomes a violation instead of
+        # disappearing at an ASCII-only early continue.
+        rendered_declaration = _AMENDMENT_DECLARATION.match(rendered)
+        if not ids and rendered_declaration is None:
             continue
         match = _AMENDMENT_DECLARATION.match(paragraph)
         if match is None:
-            aid = f"A{int(ids[0][1:]):02d}"
+            aid = f"A{int(ids[0][1:]):02d}" if ids else "amendment"
             violations.append(
                 f"{aid} has an amendment/A-ID paragraph that is not one canonical declaration"
             )
@@ -382,6 +398,36 @@ def test_markdown_html_and_unicode_wrappers_cannot_hide_a_declaration(amendment:
     violations = evaluate(_synth_plan(f"{amendment} {_ALL_FIELDS}"), _ADR_INDEX)
     assert any("A08" in v and "not one canonical declaration" in v for v in violations), (
         amendment,
+        violations,
+    )
+
+
+@pytest.mark.parametrize(
+    "token",
+    (
+        "A&#48;8",
+        "&#65;08",
+        "A0&#56;",
+        "<!--x-->A08",
+        "A<!--x-->08",
+        "A0<!--x-->8",
+        "A08<!--x-->",
+        "\uff2108",
+        "A\uff10\uff18",
+        "\uff21\uff10\uff18",
+    ),
+)
+def test_rendered_or_confusable_amendment_ids_are_rejected_before_ascii_parsing(
+    token: str,
+) -> None:
+    plan = _synth_plan(f"Plan amendment {token}, approved by the owner. {_ALL_FIELDS}")
+    violations = evaluate(plan, _ADR_INDEX)
+    assert violations, token
+    assert any(
+        "A08" in violation or "malformed amendment identifier" in violation
+        for violation in violations
+    ), (
+        token,
         violations,
     )
 
