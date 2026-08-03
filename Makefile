@@ -20,7 +20,7 @@ ifneq ($(strip $(findstring i,$(_MILHOUSE_SHORT_MAKEFLAGS))$(findstring n,$(_MIL
 $(error Milhouse gates refuse make dry-run, ignore-error, question, or touch modes)
 endif
 
-_MILHOUSE_TARGETS := setup lock lock-check format format-check lint type-check test test-coverage \
+_MILHOUSE_TARGETS := setup worktree-check lock lock-check format format-check lint type-check test test-coverage \
 	identity-portability \
 	repo-check docs-check workflow-check skill-check quality build package-check \
 	artifact-smoke audit license-check private-identifier-check secret-scan \
@@ -35,6 +35,9 @@ $(_MILHOUSE_TARGETS): override UV_RUN := $(UV) run --locked --all-groups --all-e
 
 setup:
 	./setup.sh
+
+worktree-check:
+	$(PYTHON) -I scripts/check_worktree_hygiene.py
 
 lock:
 	$(UV) lock
@@ -121,6 +124,7 @@ test-coverage:
 		--critical 'scripts/check_dco.py' \
 		--critical 'scripts/check_links.py' \
 		--critical 'scripts/check_private_identifiers.py' \
+		--critical 'scripts/check_worktree_hygiene.py' \
 		--critical 'scripts/gitleaks.py' \
 		--critical 'scripts/prepare_environment.py' \
 		--critical 'scripts/required_ci.py' \
