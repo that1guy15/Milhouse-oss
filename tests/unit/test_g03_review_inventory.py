@@ -23,6 +23,12 @@ class ReviewArtifact:
 _LATEST_REMEDIATION_REVIEWS = (
     ReviewArtifact(
         pr=78,
+        head="f9e67870a54daa20971065bce74448eddd16d364",
+        comment="5160141657",
+        verdict="FAIL",
+    ),
+    ReviewArtifact(
+        pr=78,
         head="aac8fc92085a81d1069145e6b9dd6fb677b7d68b",
         comment="5159451366",
         verdict="FAIL",
@@ -72,7 +78,10 @@ def test_fixture_rejects_the_stale_two_head_snapshot() -> None:
     )
     missing = _missing(stale)
     assert missing == [
+        "PR #78 f9e67870a54daa20971065bce74448eddd16d364: "
+        "['f9e67870a54daa20971065bce74448eddd16d364', "
+        "'issuecomment-5160141657']",
         "PR #79 fde0cc6f5fac43da137e9a6eb39aef825623a325: "
         "['fde0cc6f5fac43da137e9a6eb39aef825623a325', "
-        "'issuecomment-5159628362']"
+        "'issuecomment-5159628362']",
     ]

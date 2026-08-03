@@ -111,7 +111,7 @@ required). Compatibility and migration: documentation-only, with no source, wire
 retention, egress, product-scope, or migration change. Security impact: A06 explicitly narrows the
 literal attacker model; it retains every containment requirement within the defended boundary,
 requires uncertain outcomes rather than success after detected namespace drift, and recommends a
-dedicated service account. Revised tests retain traversal, symlink, different-user,
+dedicated service account. Revised tests: retain traversal, symlink, different-user,
 cooperating-writer, deterministic directory-displacement, recovery-copy-preservation, and retry
 coverage; no acceptance test may claim containment against hostile code already executing as the
 Milhouse account.

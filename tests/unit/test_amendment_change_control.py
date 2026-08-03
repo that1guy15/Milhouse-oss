@@ -32,17 +32,22 @@ _REGISTER_END = "## 2. Product contract"
 # proves each exempt entry actually reads as a process/disposition amendment.
 _PROCESS_EXEMPT = frozenset({"A01", "A03"})
 
-# Required change-control fields (plan section 1 rule 3) as case-insensitive LABEL markers — the
-# labels every compliant amendment uses, so a fieldless block that merely mentions "migration" or
-# "security" in prose is not mistaken for a completed field. "Compatibility and migration:" is the
-# template's combined label for the compatibility and migration impacts.
-_REQUIRED_FIELDS: dict[str, str] = {
-    "reason": r"\breason:",
-    "alternatives considered": r"\balternatives considered:",
-    "compatibility and migration": r"\bcompatibility and migration:",
-    "security impact": r"\bsecurity(?: impact)?:",
-    "revised tests": r"\brevised tests\b",
-}
+# Required change-control fields (plan section 1 rule 3) in their canonical order. Presence alone is
+# insufficient: each label must occur exactly once, in order, and own a non-empty bounded value up
+# to the next label/block boundary. That prevents ``Reason: Alternatives considered: ...`` from
+# certifying a content-free amendment.
+_REQUIRED_FIELDS: tuple[tuple[str, str], ...] = (
+    ("reason", r"\breason\s*:"),
+    ("alternatives considered", r"\balternatives considered\s*:"),
+    ("compatibility and migration", r"\bcompatibility and migration\s*:"),
+    ("security impact", r"\bsecurity(?: impact)?\s*:"),
+    ("revised tests", r"\brevised tests\s*:"),
+)
+_FIELD_LABEL = re.compile(
+    "|".join(f"(?P<f{index}>{pattern})" for index, (_name, pattern) in enumerate(_REQUIRED_FIELDS)),
+    flags=re.IGNORECASE,
+)
+_MAX_FIELD_VALUE_CHARS = 20_000
 
 # An amendment ratified by (or amending) an ADR. Every match matters: one amendment may ratify
 # multiple ADRs, and every associated ADR row must name it.
@@ -57,7 +62,13 @@ _AMENDMENT_DECLARATION = re.compile(
     flags=re.IGNORECASE | re.MULTILINE,
 )
 _CANONICAL_ID = re.compile(r"A(?P<number>0[1-9]|[1-9][0-9]+),?", re.IGNORECASE)
-_AMENDMENT_REFERENCE = re.compile(r"\bamendment\s+[*_`]*(?P<aid>A[1-9][0-9]*)[*_`]*", re.IGNORECASE)
+# Broader than the canonical declaration parser on purpose: Markdown around the declaration phrase,
+# a list/heading prefix, or styling around the id still produces an amendment-like occurrence, which
+# must be consumed by exactly one canonical declaration or fail closed.
+_AMENDMENT_LIKE = re.compile(
+    r"(?P<kind>(?:process\s+|plan\s+)?amendment)[*_`]*\s+[*_`]*(?P<aid>A[0-9]+)[*_`]*",
+    re.IGNORECASE,
+)
 _ADR_ROW = re.compile(
     r"^\|\s*\[(?P<adr>[0-9]{4})\]\([^)]+\)\s*\|(?P<decision>.*?)\|\s*$",
     flags=re.MULTILINE,
@@ -83,6 +94,7 @@ def _declarations(register: str) -> tuple[list[tuple[str, str, str]], list[str]]
     matches = list(_AMENDMENT_DECLARATION.finditer(register))
     declarations: list[tuple[str, str, str]] = []
     violations: list[str] = []
+    consumed: set[tuple[int, str]] = set()
     for index, match in enumerate(matches):
         token = match.group("token")
         canonical = _CANONICAL_ID.fullmatch(token)
@@ -92,10 +104,45 @@ def _declarations(register: str) -> tuple[list[tuple[str, str, str]], list[str]]
             violations.append(f"{subject} has a malformed amendment identifier token {token!r}")
             continue
         aid = f"A{int(canonical.group('number')):02d}"
+        consumed.add((match.start("kind"), aid))
         start = match.start("kind")
         end = matches[index + 1].start("kind") if index + 1 < len(matches) else len(register)
         declarations.append((aid, match.group("kind").lower(), register[start:end]))
+    for match in _AMENDMENT_LIKE.finditer(register):
+        aid = f"A{int(match.group('aid')[1:]):02d}"
+        if (match.start("kind"), aid) not in consumed:
+            violations.append(
+                f"{aid} has an amendment-like occurrence that is not one canonical declaration"
+            )
     return declarations, violations
+
+
+def _field_violations(aid: str, block: str) -> list[str]:
+    """Validate one contract amendment's exact field structure and substantive values."""
+
+    matches = list(_FIELD_LABEL.finditer(block))
+    observed: list[str] = []
+    violations: list[str] = []
+    for match in matches:
+        index = next(i for i in range(len(_REQUIRED_FIELDS)) if match.group(f"f{i}") is not None)
+        observed.append(_REQUIRED_FIELDS[index][0])
+    expected = [name for name, _pattern in _REQUIRED_FIELDS]
+    if observed != expected:
+        missing = [name for name in expected if name not in observed]
+        violations.append(
+            f"{aid} change-control fields have invalid order/count; "
+            f"missing={missing}, observed={observed}"
+        )
+        return violations
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(block)
+        value = block[match.end() : end].strip()
+        name = expected[index]
+        if not value or re.search(r"[A-Za-z0-9]", value, flags=re.ASCII) is None:
+            violations.append(f"{aid} has an empty change-control field: {name}")
+        elif len(value) > _MAX_FIELD_VALUE_CHARS:
+            violations.append(f"{aid} has an overlong change-control field: {name}")
+    return violations
 
 
 def _amendment_blocks(register: str) -> dict[str, str]:
@@ -149,12 +196,6 @@ def evaluate(plan_text: str, adr_index_text: str) -> list[str]:
     ):
         violations.append("amendment sequence contains an unexpected gap")
 
-    declared_ids = set(counts)
-    for reference in _AMENDMENT_REFERENCE.finditer(register):
-        aid = f"A{int(reference.group('aid')[1:]):02d}"
-        if aid not in declared_ids:
-            violations.append(f"{aid} reference has no canonical amendment declaration")
-
     first: dict[str, tuple[str, str]] = {}
     for aid, kind, block in declarations:
         first.setdefault(aid, (kind, block))
@@ -168,10 +209,7 @@ def evaluate(plan_text: str, adr_index_text: str) -> list[str]:
                     f"{aid} does not match its approved process-exemption declaration"
                 )
             continue
-        low = block.lower()
-        missing = [name for name, pat in _REQUIRED_FIELDS.items() if re.search(pat, low) is None]
-        if missing:
-            violations.append(f"{aid} omits change-control fields: {missing}")
+        violations.extend(_field_violations(aid, block))
         ratified_adrs = {match.group(1) for match in _ADR_RATIFIED.finditer(block)}
         for adr in sorted(ratified_adrs):
             decision = rows.get(adr)
@@ -229,8 +267,8 @@ def test_a_fieldless_contract_amendment_is_rejected() -> None:
 
 
 def test_each_required_field_missing_individually_is_rejected() -> None:
-    for dropped in _REQUIRED_FIELDS:
-        kept = "; ".join(f"{name}: ok" for name in _REQUIRED_FIELDS if name != dropped)
+    for dropped, _pattern in _REQUIRED_FIELDS:
+        kept = "; ".join(f"{name}: ok" for name, _candidate in _REQUIRED_FIELDS if name != dropped)
         plan = _synth_plan(
             f"Plan amendment A08, approved by the owner, changes a contract. {kept}."
         )
@@ -238,6 +276,47 @@ def test_each_required_field_missing_individually_is_rejected() -> None:
         assert any("A08" in v and "fields" in v for v in violations), (
             f"dropping {dropped!r} was not rejected: {violations}"
         )
+
+
+def test_each_required_field_with_an_empty_value_is_rejected() -> None:
+    for empty, _pattern in _REQUIRED_FIELDS:
+        fields = " ".join(
+            f"{name}: {'   ' if name == empty else 'substantive value.'}"
+            for name, _candidate in _REQUIRED_FIELDS
+        )
+        plan = _synth_plan(
+            f"Plan amendment A08, approved by the owner, changes a contract. {fields}"
+        )
+        violations = evaluate(plan, _ADR_INDEX)
+        assert any("A08" in v and "empty" in v and empty in v for v in violations), (
+            f"empty {empty!r} was not rejected: {violations}"
+        )
+
+
+def test_reordered_or_duplicated_field_labels_are_rejected() -> None:
+    cases = (
+        "Reason: value. Compatibility and migration: value. "
+        "Alternatives considered: value. Security impact: value. Revised tests: value.",
+        "Reason: value. Reason: duplicate. Alternatives considered: value. "
+        "Compatibility and migration: value. Security impact: value. Revised tests: value.",
+    )
+    for fields in cases:
+        plan = _synth_plan(
+            f"Plan amendment A08, approved by the owner, changes a contract. {fields}"
+        )
+        violations = evaluate(plan, _ADR_INDEX)
+        assert any("A08" in v and "order/count" in v for v in violations), violations
+
+
+def test_an_overlong_field_value_is_rejected() -> None:
+    overlong = "x" * (_MAX_FIELD_VALUE_CHARS + 1)
+    plan = _synth_plan(
+        "Plan amendment A08, approved by the owner, changes a contract. "
+        f"Reason: {overlong} Alternatives considered: value. "
+        "Compatibility and migration: value. Security impact: value. Revised tests: value."
+    )
+    violations = evaluate(plan, _ADR_INDEX)
+    assert any("A08" in v and "overlong" in v and "reason" in v for v in violations), violations
 
 
 def test_a_multi_digit_amendment_id_is_enumerated_and_checked() -> None:
@@ -251,6 +330,20 @@ def test_a_styled_amendment_id_is_rejected_instead_of_skipped() -> None:
     plan = _synth_plan("Plan amendment **A08**, approved by the owner, changes a locked contract.")
     violations = evaluate(plan, _ADR_INDEX)
     assert any("A08" in v and "identifier" in v for v in violations), violations
+
+
+def test_styled_heading_or_list_declarations_are_rejected_instead_of_hidden() -> None:
+    cases = (
+        f"**Plan amendment** A08, approved by the owner, changes a contract. {_ALL_FIELDS}",
+        f"## Plan amendment A08, approved by the owner, changes a contract. {_ALL_FIELDS}",
+        f"- Plan amendment A08, approved by the owner, changes a contract. {_ALL_FIELDS}",
+    )
+    for amendment in cases:
+        violations = evaluate(_synth_plan(amendment), _ADR_INDEX)
+        assert any("A08" in v and "not one canonical declaration" in v for v in violations), (
+            amendment,
+            violations,
+        )
 
 
 def test_a_reused_process_exemption_is_rejected() -> None:
