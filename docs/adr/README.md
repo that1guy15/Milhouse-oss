@@ -18,7 +18,10 @@ the installation's control-plane pseudonym key ID/epoch and adding the reserved
 compaction-successor namespace with its auto-converging upgrade remediation. A
 second ADR 0007 addendum ratifies owner-approved amendment A08 dated 2026-08-02,
 making key establishment dependency-ready in W03 and schema-11 successor recovery
-complete-set and atomic.
+complete-set and atomic. A third ADR 0007 addendum ratifies owner-approved
+amendment A09 dated 2026-08-03, deferring the W03 audited mixed-expiry compaction
+rewrite and withdrawing its reserved namespace and migrations 11–12 (control schema
+returns to version 10), while retention keeps its durable-tombstone crash-safe prune.
 
 | ADR | Ratified decision |
 |---|---|
@@ -28,7 +31,7 @@ complete-set and atomic.
 | [0004](0004-spool-sqlite-commit-and-recovery.md) | Durable spool, SQLite control state, commit, replay, recovery, and the A06 installation-account filesystem-containment boundary |
 | [0005](0005-clickhouse-analytical-storage.md) | ClickHouse analytical storage, migrations, and recovery |
 | [0006](0006-alert-incident-and-feedback-state.md) | Alert, incident, and verified-feedback state machines |
-| [0007](0007-privacy-identity-egress-and-retention.md) | Trust, privacy, installation identity, egress, retention, and purge, the A07 installation-key-provenance and reserved compaction-namespace upgrade addendum, and the A08 dependency-ready key lifecycle and complete successor-set recovery addendum |
+| [0007](0007-privacy-identity-egress-and-retention.md) | Trust, privacy, installation identity, egress, retention, and purge, the A07 installation-key-provenance and reserved compaction-namespace upgrade addendum, the A08 dependency-ready key lifecycle and complete successor-set recovery addendum, and the A09 addendum deferring the W03 audited mixed-expiry compaction rewrite (withdrawing its reserved namespace and migrations 11–12; retention keeps its durable-tombstone prune) |
 | [0008](0008-trusted-plugin-boundary.md) | Trusted in-process plugin boundary and collector API |
 | [0009](0009-scheduler-process-and-service-model.md) | Scheduler, processes, jobs, and explicit OS services |
 | [0010](0010-local-stdio-mcp.md) | Local stdio MCP with bounded, read-first tools |

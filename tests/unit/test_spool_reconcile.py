@@ -655,14 +655,7 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
     # records an audit row per prune. It therefore does not bypass the barrier discipline — it IS
     # that discipline applied to retention.
     # RetentionPreview/RetentionResult/SegmentRetention/PrunedSegment are inert value types.
-    # The slice-5c compaction surface (compact_apply) is likewise a declared MAINTENANCE operation
-    # on the EXCLUSIVE side: it validates the barrier is the control-plane commit lock and acquires
-    # barrier.exclusive() before any rewrite, gated on a confirm token, publishing the new segment
-    # and deleting the old row+file under that hold. It does not bypass the barrier discipline.
-    # CompactionResult/CompactedSegment/SkippedSegment are inert value types.
     assert set(spooling.__all__) == {
-        "CompactedSegment",
-        "CompactionResult",
         "DurableSpool",
         "Exporter",
         "ExporterAttempt",
@@ -680,13 +673,11 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
         "SegmentRecord",
         "SegmentRetention",
         "SegmentVerification",
-        "SkippedSegment",
         "SpoolError",
         "SpoolFrameV1",
         "SpoolReconciler",
         "VerifyReport",
         "build_segment_bytes",
-        "compact_apply",
         "deliver_segment",
         "parse_segment_bytes",
         "publish_segment_bytes",
