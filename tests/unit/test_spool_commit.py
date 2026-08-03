@@ -135,7 +135,7 @@ def _spool(tmp_path: Path):
 def test_migration_creates_the_segment_and_exporter_ledgers(tmp_path: Path) -> None:
     database, _store, _spool_root = _spool(tmp_path)
     try:
-        assert schema_version(database) == 8
+        assert schema_version(database) == 12
         tables = {
             row[0]
             for row in database.connection.execute(

@@ -1,10 +1,11 @@
 """Behavioural + crash guarantees for destructive retention apply (W03 slice 5b part 2).
 
 retention_apply prunes fully-expired committed segments under exclusive maintenance authority with a
-confirm token. It re-verifies each segment under the lock, prunes row-first (ledger row + audit in
-one transaction, then the durable file), leaves mixed/live/unreadable/disagreeing segments alone,
-and converges after an interrupted prune (a leftover orphan file is re-registered by reconciliation
-and re-pruned on a later pass).
+confirm token. It re-verifies each segment under the lock, prunes row-first (ledger row + audit +
+a retirement tombstone in one transaction, then the durable file), leaves
+mixed/live/unreadable/disagreeing segments alone, and converges after an interrupted prune: a
+leftover orphan file plus its tombstone is FINISHED by mandatory reconciliation (unlinked and the
+tombstone cleared) within one acquisition cycle, never re-adopted as a live segment (finding #1).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from milhouse.spooling import (
     spool_content_sha256,
     spool_frame_line,
 )
+from milhouse.spooling import reconcile as reconcile_module
 from milhouse.spooling import retention as retention_module
 from milhouse.spooling.errors import SpoolError
 from milhouse.state import (
@@ -48,6 +50,7 @@ from milhouse.state import (
 _INSTALLATION_ID = "mh_in1_00000000000040008000000000000000"
 _NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
 _DAY = "2026-07-28"
+_STAMP = "2026-07-28T12:00:00.000Z"
 _GENERATION = "a" * 64
 _EXPIRED_AT = _NOW + timedelta(hours=1)
 _LIVE_AT = _NOW + timedelta(days=30)
@@ -154,6 +157,28 @@ def _segment_rows(database) -> set[str]:
     return {
         row[0] for row in database.connection.execute("SELECT batch_id FROM _segments").fetchall()
     }
+
+
+def _retirements(database) -> set[str]:
+    return {
+        row[0]
+        for row in database.connection.execute("SELECT batch_id FROM _retirements").fetchall()
+    }
+
+
+def _reconcile(database, barrier, spool_root):
+    # A fresh writer acquisition runs mandatory reconciliation; return its report.
+    return DurableSpool(
+        database=database, barrier=barrier, spool_root=spool_root, installation_id=_INSTALLATION_ID
+    ).last_reconciliation
+
+
+def _insert_tombstone(database, batch_id: str, file_sha256: str) -> None:
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO _retirements (batch_id, day, file_sha256, retired_at) VALUES (?, ?, ?, ?)",
+            (batch_id, _DAY, file_sha256, _STAMP),
+        )
 
 
 def _apply(database, barrier, spool_root, *, now=_APPLY_NOW, confirm=True):
@@ -411,14 +436,21 @@ def test_a_failed_transactional_prune_leaves_the_segment_intact(tmp_path: Path) 
         database.close()
 
 
-def test_an_interrupted_unlink_leaves_a_re_registerable_orphan_that_reconverges(
+def test_a_crash_before_unlink_self_completes_via_reconciliation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # P1 (review finding #1): retention deletes the ledger row and writes a retirement tombstone in
+    # one transaction, BEFORE unlinking the durable file. A crash between the commit and the unlink
+    # leaves an orphan file, but mandatory reconciliation recognizes the tombstone and FINISHES the
+    # deletion (unlink + clear tombstone) within one acquisition cycle — repeated restart alone
+    # completes it, with NO separate retention pass — so the privacy-expired bytes can never be
+    # re-adopted as a live segment and outlive their hard privacy deadline (the reviewer's exact
+    # kill-after-commit/before-unlink reproduction).
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
         _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
 
-        # Simulate a crash/failure AFTER the ledger row + audit commit but BEFORE the unlink.
+        # Kill AFTER the ledger row + tombstone commit but BEFORE the unlink.
         def failing_remove(*args: object, **kwargs: object) -> None:
             raise SecureFileError(SecureFileErrorKind.WRITE_FAILED)
 
@@ -427,26 +459,214 @@ def test_an_interrupted_unlink_leaves_a_re_registerable_orphan_that_reconverges(
         assert len(first.pruned) == 1
         assert first.pruned[0].file_outcome == "orphaned"  # the durable file lingers
         assert [p.batch_id for p in first.orphaned_files] == ["batch-a"]
-        # Row-first: the ledger row is gone but the file remains — NOT a row-without-file.
+        # Row-first: the ledger row is gone but the file remains — NOT a row-without-file — and the
+        # tombstone durably records the intent to finish removing it.
         assert _segment_rows(database) == set()
         assert _segment_file(spool_root, "batch-a").exists()
+        assert _retirements(database) == {"batch-a"}
 
-        # Reconciliation (run on a fresh writer acquisition) re-registers the orphan file.
+        # Only normal restart/reconciliation (a fresh writer acquisition) — NO retention pass.
+        monkeypatch.undo()
         DurableSpool(
             database=database,
             barrier=barrier,
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
         )
-        assert _segment_rows(database) == {"batch-a"}  # re-registered as a committed segment
+        # The expired file and row are gone within the bound, and the segment was NOT re-adopted.
+        assert _segment_rows(database) == set()  # never re-registered as a live segment
+        assert not _segment_file(spool_root, "batch-a").exists()  # expired bytes removed
+        assert _retirements(database) == set()  # tombstone cleared
 
-        # A later retention pass (unlink working again) re-prunes it to convergence.
-        monkeypatch.undo()
-        second = _apply(database, barrier, spool_root)
-        assert len(second.pruned) == 1
-        assert second.pruned[0].file_outcome == "removed"
+        # A second reconciliation is a stable no-op (idempotent convergence).
+        DurableSpool(
+            database=database,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=_INSTALLATION_ID,
+        )
         assert _segment_rows(database) == set()
+        assert _retirements(database) == set()
+    finally:
+        database.close()
+
+
+def test_reconciliation_clears_a_stale_tombstone_whose_file_is_gone(tmp_path: Path) -> None:
+    # The crash-after-unlink/before-tombstone-delete window: a tombstone lingers with no file.
+    # Reconciliation clears it (there is nothing to unlink) — the retirement is already complete.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+        _apply(database, barrier, spool_root)  # normal prune: row + file gone, tombstone cleared
+        assert _retirements(database) == set()
+        _insert_tombstone(database, "batch-a", "0" * 64)  # re-create the stale tombstone
+        _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == set()  # stale tombstone with no file is cleared
+    finally:
+        database.close()
+
+
+def test_reconciliation_clears_a_tombstone_when_the_id_was_reused(tmp_path: Path) -> None:
+    # A stale tombstone whose id was reused by a now-committed segment must be cleared WITHOUT
+    # touching the new segment's file (the retired file is long gone; the digest would not match).
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _LIVE_AT)])  # a live committed segment reusing the id
+        _insert_tombstone(database, "batch-a", "0" * 64)  # stale tombstone for a prior retired file
+        _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == set()  # stale tombstone cleared
+        assert _segment_rows(database) == {"batch-a"}  # committed segment untouched
+        assert _segment_file(spool_root, "batch-a").exists()
+    finally:
+        database.close()
+
+
+def test_reconciliation_keeps_a_different_orphan_and_clears_a_mismatched_tombstone(
+    tmp_path: Path,
+) -> None:
+    # A tombstone plus a DIFFERENT orphan file at the same name (the retired file is gone, this is a
+    # reused-id orphan whose digest does not match): reconciliation clears the stale tombstone and
+    # reconciles the orphan normally (registers it) rather than deleting live bytes.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _LIVE_AT)])
+        with database.transaction() as connection:
+            connection.execute("DELETE FROM _segment_exporters WHERE batch_id = ?", ("batch-a",))
+            connection.execute("DELETE FROM _segments WHERE batch_id = ?", ("batch-a",))
+        _insert_tombstone(database, "batch-a", "0" * 64)  # digest does NOT match the orphan file
+        _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == set()  # stale tombstone cleared
+        assert _segment_rows(database) == {"batch-a"}  # the different orphan is registered
+        assert _segment_file(spool_root, "batch-a").exists()  # its bytes are preserved
+    finally:
+        database.close()
+
+
+def test_a_retirement_completion_unlink_failure_keeps_the_tombstone_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # If reconciliation's own unlink of a retired orphan fails, the tombstone is KEPT (reported as
+    # retirement_incomplete) so the NEXT mandatory reconciliation retries — intent is not lost.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+
+        def failing_remove(*args: object, **kwargs: object) -> None:
+            raise SecureFileError(SecureFileErrorKind.WRITE_FAILED)
+
+        monkeypatch.setattr(retention_module, "remove_regular_file_no_follow", failing_remove)
+        _apply(database, barrier, spool_root)  # crash before unlink -> tombstone + orphan
+        assert _retirements(database) == {"batch-a"}
+
+        # Reconciliation's unlink ALSO fails: keep the tombstone and the file, report the anomaly.
+        monkeypatch.setattr(reconcile_module, "remove_regular_file_no_follow", failing_remove)
+        report = _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == {"batch-a"}  # kept for retry
+        assert _segment_file(spool_root, "batch-a").exists()
+        assert any(a.kind == "retirement_incomplete" for a in report.anomalies)
+
+        # With the unlink working again, the next reconciliation completes the retirement.
+        monkeypatch.undo()
+        _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == set()
         assert not _segment_file(spool_root, "batch-a").exists()
+    finally:
+        database.close()
+
+
+def test_an_absent_file_tombstone_clears_only_after_a_durability_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # P1 (review: commit-uncertain unlink loses the tombstone): reconciliation must NOT clear an
+    # absent-file tombstone from bare namespace observation — a power loss rolling back an
+    # un-fsync'd unlink would resurrect the expired file with no intent and re-adopt it. The
+    # tombstone is cleared only after a SUCCESSFUL day-directory durability fence.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        record, _frames = _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+        # Model the commit-uncertain state: the ledger row is gone and the file is (non-durably)
+        # unlinked, so the tombstone is present with no file.
+        with database.transaction() as connection:
+            connection.execute("DELETE FROM _segment_exporters WHERE batch_id = ?", ("batch-a",))
+            connection.execute("DELETE FROM _segments WHERE batch_id = ?", ("batch-a",))
+        _segment_file(spool_root, "batch-a").unlink()
+        _insert_tombstone(database, "batch-a", record.file_sha256)
+
+        # A FAILED day-directory fsync must KEEP the tombstone (no durable proof of absence).
+        monkeypatch.setattr(reconcile_module, "_fsync_descriptor", lambda fd: False)
+        report = _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == {"batch-a"}  # kept — the absence is not proven durable
+        assert any(a.kind == "retirement_incomplete" for a in report.anomalies)
+
+        # With a working fence the absence is durable, so the tombstone is cleared.
+        monkeypatch.undo()
+        _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == set()
+    finally:
+        database.close()
+
+
+def test_a_commit_uncertain_retirement_completion_keeps_the_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A commit-uncertain unlink during reconciliation (the entry may be gone but not durably) keeps
+    # the tombstone (reported ``uncertain``) so the next mandatory reconciliation reconfirms it and
+    # the intent is never dropped on an unconfirmed removal.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+
+        def write_fail(*args: object, **kwargs: object) -> None:
+            raise SecureFileError(SecureFileErrorKind.WRITE_FAILED)
+
+        monkeypatch.setattr(retention_module, "remove_regular_file_no_follow", write_fail)
+        _apply(database, barrier, spool_root)  # crash before unlink -> tombstone + orphan
+        monkeypatch.undo()
+
+        def uncertain_remove(*args: object, **kwargs: object) -> None:
+            raise SecureFileError(SecureFileErrorKind.COMMIT_UNCERTAIN)
+
+        monkeypatch.setattr(reconcile_module, "remove_regular_file_no_follow", uncertain_remove)
+        report = _reconcile(database, barrier, spool_root)
+        assert _retirements(database) == {"batch-a"}  # kept for reconfirmation
+        assert any(
+            a.kind == "retirement_incomplete" and a.detail == "uncertain" for a in report.anomalies
+        )
+    finally:
+        database.close()
+
+
+def test_retirement_completion_does_not_unlink_a_file_changed_since_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Defense-in-depth: if the orphan file's digest matches the tombstone at classification but has
+    # CHANGED by the time reconciliation re-verifies it before unlinking (only reachable via a
+    # hostile same-UID swap), the retired bytes are no longer here — reconciliation must NOT unlink
+    # the now-different file; it clears the stale tombstone and leaves the file untouched.
+    database, barrier, spool_root, store = _spool(tmp_path)
+    try:
+        _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
+
+        def failing_remove(*args: object, **kwargs: object) -> None:
+            raise SecureFileError(SecureFileErrorKind.WRITE_FAILED)
+
+        monkeypatch.setattr(retention_module, "remove_regular_file_no_follow", failing_remove)
+        _apply(database, barrier, spool_root)  # crash before unlink -> tombstone + orphan
+        monkeypatch.undo()
+
+        # Match at classification (call 1), then a DIFFERENT digest at the mutation re-verify.
+        real = reconcile_module._raw_sha256
+        calls = {"n": 0}
+
+        def counting(path: Path) -> str | None:
+            calls["n"] += 1
+            return real(path) if calls["n"] == 1 else "f" * 64
+
+        monkeypatch.setattr(reconcile_module, "_raw_sha256", counting)
+        _reconcile(database, barrier, spool_root)
+
+        assert _retirements(database) == set()  # stale tombstone cleared
+        assert _segment_file(spool_root, "batch-a").exists()  # the changed file was NOT unlinked
     finally:
         database.close()
 
@@ -494,9 +714,13 @@ def test_prunes_a_cursor_referenced_delivered_expired_segment(tmp_path: Path) ->
         database.close()
 
 
-def test_a_detached_cursor_survives_crash_reregistration_and_reprune(
+def test_a_detached_cursor_survives_crash_and_reconciliation_self_completion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A privacy-expired segment referenced by an idle source's cursor is detached (batch_id -> NULL,
+    # position/revision preserved) at prune time. If the prune crashes before the unlink, mandatory
+    # reconciliation self-completes the retirement (finding #1) and the detached cursor checkpoint
+    # stays intact and resumable throughout — the segment is never re-adopted.
     database, barrier, spool_root, store = _spool(tmp_path)
     try:
         _commit(store, "batch-a", [("a1", _EXPIRED_AT)])
@@ -511,27 +735,23 @@ def test_a_detached_cursor_survives_crash_reregistration_and_reprune(
         first = _apply(database, barrier, spool_root)
         assert first.pruned[0].file_outcome == "orphaned"  # orphan file lingers; ledger row gone
         assert _segment_rows(database) == set()
+        assert _retirements(database) == {"batch-a"}
         detached = read_cursor(database, "github")
         assert detached is not None and detached.batch_id is None
         assert (detached.position, detached.revision) == ("page-7", 1)
 
-        # Reconciliation re-registers the orphan; the cursor stays detached (position/revision).
+        # Reconciliation FINISHES the retirement (no separate retention pass): the file and row are
+        # gone, the segment is never re-registered, and the detached cursor checkpoint is preserved.
+        monkeypatch.undo()
         DurableSpool(
             database=database,
             barrier=barrier,
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
         )
-        assert _segment_rows(database) == {"batch-a"}
-        still = read_cursor(database, "github")
-        assert still is not None and still.batch_id is None
-        assert (still.position, still.revision) == ("page-7", 1)
-
-        # A later pass re-prunes to convergence; the cursor checkpoint stays intact and resumable.
-        monkeypatch.undo()
-        second = _apply(database, barrier, spool_root)
-        assert len(second.pruned) == 1
         assert _segment_rows(database) == set()
+        assert not _segment_file(spool_root, "batch-a").exists()
+        assert _retirements(database) == set()
         final = read_cursor(database, "github")
         assert final is not None and final.batch_id is None
         assert (final.position, final.revision) == ("page-7", 1)

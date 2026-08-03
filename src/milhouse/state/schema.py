@@ -184,11 +184,122 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             # installation-local HMAC pseudonym, never a public unsalted hash — a plain SHA-256 of a
             # low-entropy batch id is dictionary-recoverable and correlates across installations.
             # Slice 5b's retention audit stored such plain digests in resource. The keyed pseudonym
-            # key is created by `init` (W06), not yet wired into the control plane, so the audit
-            # writers now OMIT the derivative (store NULL) until keying is available. This clears
+            # key was not yet wired into the control plane at this migration, so the audit writers
+            # OMIT the derivative (store NULL) until a bound key identity is available. This clears
             # any already-written unsalted resource so no reversible id survives the upgrade;
             # keyed tokens written later carry an mh_fp1_ prefix and are never produced before this.
             "UPDATE _audit SET resource = NULL WHERE resource IS NOT NULL",
+        ),
+    ),
+    Migration(
+        9,
+        "add_audit_content_digests",
+        (
+            # Plan sections 4.8-4.9 require compaction to record the OLD/NEW content and file HASHES
+            # transactionally — immutable evidence of the exact retired and replacement BYTES, which
+            # a keyed batch-id pseudonym (lineage) is not (G03 review finding #4). A full-segment
+            # SHA-256 is a high-entropy digest of many records, not a low-entropy identifier, so it
+            # is privacy-safe to store raw (unlike the batch id, which stays a keyed pseudonym in
+            # ``resource``). Each compaction audit row carries ITS OWN segment's digests: the
+            # ``compacted_from`` row the old segment's, the ``compacted_into`` the new segment's.
+            # Both are NULL for non-compaction audit rows (e.g. retention prune). Nullable ADD COL
+            # with a self-referential CHECK is satisfied by existing rows (NULL passes).
+            "ALTER TABLE _audit ADD COLUMN content_sha256 TEXT "
+            "CHECK (content_sha256 IS NULL OR length(content_sha256) = 64)",
+            "ALTER TABLE _audit ADD COLUMN file_sha256 TEXT "
+            "CHECK (file_sha256 IS NULL OR length(file_sha256) = 64)",
+        ),
+    ),
+    Migration(
+        10,
+        "create_retirements",
+        (
+            # Durable retirement intent (tombstone) so a privacy-expired prune SELF-COMPLETES after
+            # a crash (G03 review finding #1). Retention deletes the segment row before unlinking
+            # durable file; a crash in that window used to leave an orphan file that reconciliation
+            # re-registered as a live committed segment, with no intent from which to finish the
+            # deletion — so the expired bytes could outlive their hard privacy deadline until a
+            # SEPARATE retention pass ran. A tombstone written in the SAME transaction as the row
+            # delete records the retiring segment's ``file_sha256`` (digest-scoped so a later
+            # segment that reuses the batch id is never mistaken for the retired file); mandatory
+            # reconciliation recognizes it and finishes the deletion (unlink the exact matching
+            # orphan + clear the tombstone) within one acquisition cycle, not re-adopting it.
+            # It carries no payload — only the batch id, day partition, the file digest, and a
+            # timestamp — and is cleared once the file is durably gone.
+            "CREATE TABLE _retirements ("
+            "batch_id TEXT PRIMARY KEY NOT NULL, "
+            "day TEXT NOT NULL, "
+            "file_sha256 TEXT NOT NULL, "
+            "retired_at TEXT NOT NULL, "
+            "CHECK (length(batch_id) > 0), "
+            "CHECK (length(day) = 10), "
+            "CHECK (length(file_sha256) = 64))",
+        ),
+    ),
+    Migration(
+        11,
+        "create_installation_key",
+        (
+            # Durable installation pseudonym-key identity (ADR 0007 addendum A07, §4.7). A keyed
+            # audit derivative is trustworthy only if produced by THIS installation's own key, and a
+            # `Pseudonymizer` is constructible from any 32 bytes, so loading a file at that path
+            # proves file hygiene, not installation identity. W03's first confirmed compaction
+            # creates or adopts the bound key under the global barrier, then records the NON-SECRET
+            # key ID and epoch here; W06 init reuses that identity. Later audited compaction loads
+            # with these exact expected values and fails closed before spool mutation on a
+            # missing/malformed key or ID/epoch mismatch — so a wrong, restored, rotated, or
+            # cross-installation key can never write unattributable lineage. Singleton (`id = 1`):
+            # one identity per control plane. No secret is
+            # stored — only the public key ID (`mh_pk1_` + 16 hex) and the 1..2^31-1 epoch.
+            "CREATE TABLE _installation_key ("
+            "id INTEGER PRIMARY KEY NOT NULL, "
+            "key_id TEXT NOT NULL, "
+            "epoch INTEGER NOT NULL, "
+            "established_at TEXT NOT NULL, "
+            "CHECK (id = 1), "
+            "CHECK (length(key_id) = 23), "
+            "CHECK (key_id GLOB 'mh_pk1_*'), "
+            "CHECK (epoch BETWEEN 1 AND 2147483647))",
+        ),
+    ),
+    Migration(
+        12,
+        "create_compaction_intents",
+        (
+            # Authoritative compaction/rehome provenance (ADR 0007 addendum A07; G03 review of the
+            # reserved-namespace upgrade). A ``c[0-9a-f]{64}`` id was a valid producer id before
+            # the reservation, so origin alone cannot distinguish a genuine successor from
+            # a legal pre-reservation occupant (a producer-committed row OR a pre-upgrade producer
+            # crash orphan reconciliation registers ``origin=reconciled``). Compaction instead
+            # records an INTENT for each successor BEFORE publishing it, so a reserved id is
+            # successor ONLY if an intent proves it — and a crash-published successor is still
+            # adoptable, never rehomed (which would duplicate its records). The table starts empty
+            # on schema-12 upgrade, so the first exclusive compaction pass discovers and verifies
+            # the complete successor set for every old source, then atomically collapses the source
+            # and every redundant successor to one current target before treating the remaining
+            # reserved rows as legacy occupants. A rehome intent binds its source to a
+            # collision-resistant target so a restart reuses the same allocation.
+            "CREATE TABLE _compaction_intents ("
+            "target_batch_id TEXT PRIMARY KEY NOT NULL, "
+            "source_batch_id TEXT NOT NULL, "
+            "kind TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, "
+            "CHECK (kind IN ('successor', 'rehome')), "
+            "CHECK (length(target_batch_id) > 0), "
+            "CHECK (length(source_batch_id) > 0), "
+            "CHECK (length(created_at) > 0))",
+            "CREATE INDEX _compaction_intents_by_source ON _compaction_intents (source_batch_id)",
+            "CREATE UNIQUE INDEX _compaction_intents_one_kind_per_source "
+            "ON _compaction_intents (source_batch_id, kind)",
+            # Generic durable counters for later control-plane workflows. Rehome allocation does
+            # NOT use an SQLite integer sequence: its collision-resistant 256-bit target selection
+            # retries without a finite probe terminal, so neither caller-chosen occupation nor
+            # SQLite's signed-integer ceiling can strand the namespace upgrade.
+            "CREATE TABLE _sequences ("
+            "name TEXT PRIMARY KEY NOT NULL, "
+            "value INTEGER NOT NULL, "
+            "CHECK (length(name) > 0), "
+            "CHECK (value >= 0))",
         ),
     ),
 )

@@ -297,6 +297,17 @@ def _validate_barrier(database: ControlDatabase, barrier: object) -> None:
         _fail("MH_SPOOL_RETENTION", "the barrier must be the control-plane commit lock")
 
 
+def _clear_retirement(database: ControlDatabase, batch_id: str) -> None:
+    """Delete the retirement tombstone once its file is durably gone. Best-effort: on any failure
+    the tombstone is left for mandatory reconciliation to clear, so the intent is never lost."""
+
+    try:
+        with database.transaction() as connection:
+            connection.execute("DELETE FROM _retirements WHERE batch_id = ?", (batch_id,))
+    except (sqlite3.Error, StateError):
+        return
+
+
 def _prune_segment(
     database: ControlDatabase,
     record: SegmentRecord,
@@ -305,12 +316,19 @@ def _prune_segment(
     *,
     delivered: bool,
 ) -> PrunedSegment | None:
-    """Delete the ledger row + exporter rows + audit row in one transaction, then unlink the file.
+    """Delete the ledger row + exporter rows + audit row + retirement tombstone in one transaction,
+    then unlink the file.
 
-    Row-first: the ledger deletion and its audit commit atomically, and only then is the durable
-    file unlinked. A crash or unlink failure after the commit leaves an orphan file (reconciliation
-    re-registers it, a later retention re-prunes it — convergent), never a row without a file.
-    Returns ``None`` if the transactional deletion itself failed (the segment is left fully intact).
+    Row-first: the ledger deletion, its audit, and a durable RETIREMENT INTENT (a ``_retirements``
+    tombstone scoped to this segment's ``file_sha256``) commit atomically, and only then is the
+    durable file unlinked. A crash or unlink failure after the commit leaves an orphan file, but now
+    the tombstone records the intent to finish removing it, so mandatory reconciliation completes
+    the deletion (unlinks the exact matching orphan and clears the tombstone) within one acquisition
+    cycle rather than re-adopting the segment as live — the expired bytes cannot outlive their hard
+    privacy deadline waiting for a separate retention pass (G03 review finding #1). On the durable
+    ``removed`` outcome the tombstone is cleared here; on any non-removed outcome it stays for
+    reconciliation. Returns ``None`` if the transactional deletion itself failed (the segment is
+    left fully intact).
 
     Any source cursor that references this segment is DETACHED first (batch_id set to NULL) in the
     same transaction, preserving its payload-free position/revision checkpoint so an idle source's
@@ -318,6 +336,14 @@ def _prune_segment(
     foreign key (D05).
     """
 
+    invalid_time = False
+    retired_at = ""
+    try:
+        retired_at = format_timestamp(now)
+    except (OverflowError, TimeError):
+        invalid_time = True
+    if invalid_time:
+        return None  # a bad instant cannot produce a valid tombstone; leave the segment intact
     failed = False
     try:
         with database.transaction() as connection:
@@ -328,6 +354,11 @@ def _prune_segment(
                 "DELETE FROM _segment_exporters WHERE batch_id = ?", (record.batch_id,)
             )
             connection.execute("DELETE FROM _segments WHERE batch_id = ?", (record.batch_id,))
+            connection.execute(
+                "INSERT INTO _retirements (batch_id, day, file_sha256, retired_at) "
+                "VALUES (?, ?, ?, ?)",
+                (record.batch_id, record.day, record.file_sha256, retired_at),
+            )
             record_retention_prune(
                 connection,
                 now=now,
@@ -350,6 +381,11 @@ def _prune_segment(
         file_outcome = (
             FILE_UNCERTAIN if error.kind is SecureFileErrorKind.COMMIT_UNCERTAIN else FILE_ORPHANED
         )
+    if file_outcome == FILE_REMOVED:
+        # The file is durably gone, so the retirement is complete: clear the tombstone. On any
+        # non-removed outcome the tombstone REMAINS and mandatory reconciliation finishes the
+        # deletion, so the intent is never lost.
+        _clear_retirement(database, record.batch_id)
     return PrunedSegment(
         batch_id=record.batch_id,
         record_count=record.record_count,

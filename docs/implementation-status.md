@@ -22,11 +22,15 @@ status and evidence; it does not amend the plan.
 
 ### Current W03/G03 exact-review inventory
 
-This structured block is the authoritative current snapshot for the remediation review chain and
-supersedes older round counts in the historical prose above. D12 is current: PR #78 head
-`800617594f7d755eb077481a1b27092dabad377e` failed with two P1 false-pass paths; PR #79 head
-`644b57dffb92038390f81cd5697c0bfbfb539275` failed with three P1 and two P2. W03/G03 remain
-**In progress and not accepted**.
+This structured block is the authoritative current snapshot for the independent remediation review
+chain and supersedes older round counts in the historical prose above. D12 remains PR #78's latest
+independent review: head `800617594f7d755eb077481a1b27092dabad377e` failed with two P1
+false-pass paths. Its corrected successor `e5fa62ac89c269afa5800250079e1672f5a7a721`
+subsequently merged on direct owner authority as protected-main squash
+`9bb1d02fed272cb6201b71a06be4b1d0c4ea4b90`, with an identical tree, without claiming an
+independent PASS or G03 acceptance. PR #79's latest independent review remains head
+`644b57dffb92038390f81cd5697c0bfbfb539275` with three P1 and two P2; its corrective branch is now
+rebased onto `9bb1d02`. W03/G03 remain **In progress and not accepted**.
 
 <!-- BEGIN CURRENT W03/G03 REVIEW INVENTORY -->
 - REVIEW-ARTIFACT | PR #78 | HEAD `800617594f7d755eb077481a1b27092dabad377e` | COMMENT [5162094078](https://github.com/that1guy15/Milhouse-oss/pull/78#issuecomment-5162094078) | VERDICT **FAIL**
@@ -37,6 +41,13 @@ supersedes older round counts in the historical prose above. D12 is current: PR 
 - REVIEW-ARTIFACT | PR #79 | HEAD `fde0cc6f5fac43da137e9a6eb39aef825623a325` | COMMENT [5159628362](https://github.com/that1guy15/Milhouse-oss/pull/79#issuecomment-5159628362) | VERDICT **FAIL**
 - REVIEW-ARTIFACT | PR #79 | HEAD `644b57dffb92038390f81cd5697c0bfbfb539275` | COMMENT [5160178919](https://github.com/that1guy15/Milhouse-oss/pull/79#issuecomment-5160178919) | VERDICT **FAIL**
 <!-- END CURRENT W03/G03 REVIEW INVENTORY -->
+
+**Authoritative post-PR #78 Git state:** protected `main` is
+`9bb1d02fed272cb6201b71a06be4b1d0c4ea4b90`; its tree
+`410d7dffc69aba875e1ffc4c6794db5f6df6ee04` exactly equals corrected PR #78 head
+`e5fa62ac89c269afa5800250079e1672f5a7a721`. This supersedes the pre-merge `c7390ed` Git-state and
+sequencing prose retained in the large historical snapshot rows above. The merge was owner-directed
+after green exact-head gates and is not an independent PASS or G03 acceptance.
 
 The audited public baseline is the source scaffold. The private baseline is a
 read-only behavior and algorithm donor. Its history, configuration, telemetry,
@@ -253,6 +264,7 @@ reversible migration cannot be designed, or a change would materially expand
 external writes, hosted operation, raw-content handling, or multi-tenancy.
 
 | D12 | 2026-08-02 | **PR #78 exact head `800617594f7d755eb077481a1b27092dabad377e` independently FAILED with 2 P1; accountable owner: engineering delivery** | Affects W03/G03 change-control and evidence integrity. [Comment 5162094078](https://github.com/that1guy15/Milhouse-oss/pull/78#issuecomment-5162094078), 2026-08-03T03:50:28Z, reviewed base `c7390ed023789f9839d6a5a2858fc73b223cfca5`, integrated tree `8212a3d3d41646993b15af8168f45199acb98396`, verdict **FAIL with 2 P1**: rendered HTML-entity/comment-split and Unicode-confusable amendment identifiers still disappeared before the raw-ASCII classifier, and the exact-artifact guard accepted scattered tokens anywhere in a document while the current snapshot remained stale. Correction: classify a conservative rendered view before raw parsing, accept authority only from one canonical raw ASCII declaration, cover entity/comment splits and compatibility forms adversarially, parse exact `(PR, 40-character head, linked comment, verdict)` inventory records structurally, and require the records inside both current-summary sections. **Disposition:** no merge of the reviewed head; correct both P1s on a new SHA, repeat exact-head gates, and keep W03/G03 In progress and not accepted. |
+| D13 | 2026-08-02 | **PR #78's corrected successor merged on direct owner authority; PR #79 rebased for final remediation; accountable owner: engineering delivery** | Corrected PR #78 head `e5fa62ac89c269afa5800250079e1672f5a7a721` closed D12's two P1 false-pass paths, passed 4,707 tests / 1 skipped locally plus all exact-head Required CI checks, and merged as protected-main squash `9bb1d02fed272cb6201b71a06be4b1d0c4ea4b90`; merge tree `410d7dffc69aba875e1ffc4c6794db5f6df6ee04` equals the reviewed corrective head tree. The merge was explicitly owner-directed and does **not** claim a fresh independent PASS, W03/G03 acceptance, or E06 completion. PR #79 is rebased onto that actual protected main; A08 and its implementation close the latest review's complete-successor-set and production-key-lifecycle P1s, while issues #80, #81, and #82 carry non-blocking follow-up work. **Disposition:** run full rebased exact-head gates and a final paginated P0/P1 race guard, then merge only on the owner's direct instruction; G03/W03 remain In progress and not accepted. |
 
 ## Update procedure
 
