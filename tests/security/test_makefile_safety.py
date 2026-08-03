@@ -58,6 +58,7 @@ CRITICAL_COVERAGE_FILES = {
     "scripts/check_dco.py",
     "scripts/check_links.py",
     "scripts/check_private_identifiers.py",
+    "scripts/check_worktree_hygiene.py",
     "scripts/gitleaks.py",
     "scripts/prepare_environment.py",
     "scripts/required_ci.py",

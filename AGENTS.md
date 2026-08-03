@@ -50,6 +50,28 @@ select one dependency-ready work package
 `milhouse-feedback` is a normalized evidence input to assigned application work; it is never
 permission to inspect raw telemetry or feedback sources.
 
+## Worktree hygiene
+
+Run `./scripts/run_make.py worktree-check` before beginning development. The primary checkout is
+always `clean-main`: it remains on `main`, has no uncommitted entries, and exactly matches the local
+`origin/main` tracking ref. Fetch before relying on that comparison. Codex and Claude make changes
+only in explicitly named task worktrees. The normal maximum is the primary plus one active task
+worktree per agent.
+
+- The agent that creates a task worktree owns removing it after its PR merges, closes, or is
+  superseded.
+- A task never ends with unidentified changes. Commit them, preserve them in a named stash with its
+  recovery hash, or report the exact blocker.
+- Use only these state names: `clean-main`, `active`, `recovery-stashed`, and `blocked`.
+- Every runtime handoff states the worktree path, branch, exact head, dirty count, PR, owner, and
+  state. Private machine paths and stash metadata belong in the private handoff, never in committed
+  repository files.
+- Use `python3 -I scripts/check_worktree_hygiene.py --expect LABEL=PATH` to verify an active handoff
+  registration and add `--strict` before closing a task. A dirty secondary worktree is always
+  reported and requires classification.
+- Audit obsolete local branches separately. Delete one only after proving it merged or was
+  superseded and contains no required unique work.
+
 ## Safety and authority boundaries
 
 - Never persist, summarize, attach, or commit raw prompts, responses, transcripts, session histories,
