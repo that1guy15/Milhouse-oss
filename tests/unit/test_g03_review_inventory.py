@@ -23,6 +23,12 @@ class ReviewArtifact:
 _LATEST_REMEDIATION_REVIEWS = (
     ReviewArtifact(
         pr=78,
+        head="09708871d1d3fd90ad3a7ec6294d30f1e72f31a4",
+        comment="5161910990",
+        verdict="FAIL",
+    ),
+    ReviewArtifact(
+        pr=78,
         head="f9e67870a54daa20971065bce74448eddd16d364",
         comment="5160141657",
         verdict="FAIL",
@@ -43,6 +49,12 @@ _LATEST_REMEDIATION_REVIEWS = (
         pr=79,
         head="fde0cc6f5fac43da137e9a6eb39aef825623a325",
         comment="5159628362",
+        verdict="FAIL",
+    ),
+    ReviewArtifact(
+        pr=79,
+        head="644b57dffb92038390f81cd5697c0bfbfb539275",
+        comment="5160178919",
         verdict="FAIL",
     ),
 )
@@ -78,10 +90,35 @@ def test_fixture_rejects_the_stale_two_head_snapshot() -> None:
     )
     missing = _missing(stale)
     assert missing == [
+        "PR #78 09708871d1d3fd90ad3a7ec6294d30f1e72f31a4: "
+        "['09708871d1d3fd90ad3a7ec6294d30f1e72f31a4', "
+        "'issuecomment-5161910990']",
         "PR #78 f9e67870a54daa20971065bce74448eddd16d364: "
         "['f9e67870a54daa20971065bce74448eddd16d364', "
         "'issuecomment-5160141657']",
         "PR #79 fde0cc6f5fac43da137e9a6eb39aef825623a325: "
         "['fde0cc6f5fac43da137e9a6eb39aef825623a325', "
         "'issuecomment-5159628362']",
+        "PR #79 644b57dffb92038390f81cd5697c0bfbfb539275: "
+        "['644b57dffb92038390f81cd5697c0bfbfb539275', "
+        "'issuecomment-5160178919']",
     ]
+
+
+def test_fixture_with_the_previous_four_entries_rejects_the_current_pr79_review() -> None:
+    previous = (
+        "PR #78 f9e67870a54daa20971065bce74448eddd16d364 "
+        "issuecomment-5160141657 FAIL; "
+        "PR #78 aac8fc92085a81d1069145e6b9dd6fb677b7d68b "
+        "issuecomment-5159451366 FAIL; "
+        "PR #79 9c08351962ba2af0521cef41a6e07c7e83df798b "
+        "issuecomment-5157727285 FAIL; "
+        "PR #79 fde0cc6f5fac43da137e9a6eb39aef825623a325 "
+        "issuecomment-5159628362 FAIL"
+    )
+    missing = _missing(previous)
+    assert (
+        "PR #79 644b57dffb92038390f81cd5697c0bfbfb539275: "
+        "['644b57dffb92038390f81cd5697c0bfbfb539275', "
+        "'issuecomment-5160178919']"
+    ) in missing

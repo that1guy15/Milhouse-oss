@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 _REPO = Path(__file__).resolve().parents[2]
 _PLAN = (_REPO / "docs/implementation-plan.md").read_text(encoding="utf-8")
 _ADR_INDEX = (_REPO / "docs/adr/README.md").read_text(encoding="utf-8")
@@ -52,23 +54,18 @@ _MAX_FIELD_VALUE_CHARS = 20_000
 # An amendment ratified by (or amending) an ADR. Every match matters: one amendment may ratify
 # multiple ADRs, and every associated ADR row must name it.
 _ADR_RATIFIED = re.compile(r"ratified by (?:an?\s+)?adr\s+(\d{4})", re.IGNORECASE)
-# A declaration starts either a register paragraph/line or a new sentence. Capturing the raw token
-# lets the checker reject Markdown-styled or otherwise malformed identifiers instead of skipping
-# them. Bare ``Amendment A03`` is retained for the historical register spelling.
+# The register uses one machine-checkable declaration per Markdown paragraph. A declaration is
+# canonical only when its raw paragraph starts with one of these literal phrases and ASCII
+# whitespace before the identifier. Markdown links/emphasis, HTML/comments, blockquotes, list or
+# heading prefixes, Unicode whitespace, and any other wrapper therefore cannot silently normalize
+# into authority: the broader paragraph classifier below treats every A-ID-bearing register
+# paragraph as declaration-shaped and rejects it unless the raw paragraph is canonical.
 _AMENDMENT_DECLARATION = re.compile(
-    r"(?:^|(?<=\.\s))"
-    r"(?P<kind>process amendment|plan amendment|amendment)\s+"
-    r"(?P<token>\S+)",
-    flags=re.IGNORECASE | re.MULTILINE,
+    r"^(?P<kind>process amendment|plan amendment|amendment)[ \t\r\n]+(?P<token>\S+)",
+    flags=re.IGNORECASE,
 )
 _CANONICAL_ID = re.compile(r"A(?P<number>0[1-9]|[1-9][0-9]+),?", re.IGNORECASE)
-# Broader than the canonical declaration parser on purpose: Markdown around the declaration phrase,
-# a list/heading prefix, or styling around the id still produces an amendment-like occurrence, which
-# must be consumed by exactly one canonical declaration or fail closed.
-_AMENDMENT_LIKE = re.compile(
-    r"(?P<kind>(?:process\s+|plan\s+)?amendment)[*_`]*\s+[*_`]*(?P<aid>A[0-9]+)[*_`]*",
-    re.IGNORECASE,
-)
+_AMENDMENT_ID_LIKE = re.compile(r"(?<![A-Za-z0-9])A[0-9]+", re.IGNORECASE)
 _ADR_ROW = re.compile(
     r"^\|\s*\[(?P<adr>[0-9]{4})\]\([^)]+\)\s*\|(?P<decision>.*?)\|\s*$",
     flags=re.MULTILINE,
@@ -91,11 +88,31 @@ def _register(plan_text: str) -> str:
 def _declarations(register: str) -> tuple[list[tuple[str, str, str]], list[str]]:
     """Return canonical ``(id, kind, block)`` declarations and malformed-id violations."""
 
-    matches = list(_AMENDMENT_DECLARATION.finditer(register))
     declarations: list[tuple[str, str, str]] = []
     violations: list[str] = []
-    consumed: set[tuple[int, str]] = set()
-    for index, match in enumerate(matches):
+    # ASCII-only blank-line splitting is deliberate: a Unicode-whitespace separator cannot hide a
+    # second declaration; it leaves both A-IDs in one paragraph and the exact-one check rejects it.
+    paragraphs = re.split(r"(?:\r?\n[ \t]*){2,}", register)
+    for paragraph in paragraphs:
+        ids = _AMENDMENT_ID_LIKE.findall(paragraph)
+        # Any A-ID-bearing register paragraph is declaration-shaped authority and must be canonical.
+        # This remains fail-closed even when HTML entities/tags obscure the word "amendment" itself.
+        if not ids:
+            continue
+        match = _AMENDMENT_DECLARATION.match(paragraph)
+        if match is None:
+            aid = f"A{int(ids[0][1:]):02d}"
+            violations.append(
+                f"{aid} has an amendment/A-ID paragraph that is not one canonical declaration"
+            )
+            continue
+        unique_ids = {identifier.upper() for identifier in ids}
+        if len(unique_ids) != 1:
+            aid = f"A{int(ids[0][1:]):02d}"
+            violations.append(
+                f"{aid} amendment paragraph must contain exactly one unique amendment identifier"
+            )
+            continue
         token = match.group("token")
         canonical = _CANONICAL_ID.fullmatch(token)
         if canonical is None:
@@ -104,16 +121,7 @@ def _declarations(register: str) -> tuple[list[tuple[str, str, str]], list[str]]
             violations.append(f"{subject} has a malformed amendment identifier token {token!r}")
             continue
         aid = f"A{int(canonical.group('number')):02d}"
-        consumed.add((match.start("kind"), aid))
-        start = match.start("kind")
-        end = matches[index + 1].start("kind") if index + 1 < len(matches) else len(register)
-        declarations.append((aid, match.group("kind").lower(), register[start:end]))
-    for match in _AMENDMENT_LIKE.finditer(register):
-        aid = f"A{int(match.group('aid')[1:]):02d}"
-        if (match.start("kind"), aid) not in consumed:
-            violations.append(
-                f"{aid} has an amendment-like occurrence that is not one canonical declaration"
-            )
+        declarations.append((aid, match.group("kind").lower(), paragraph))
     return declarations, violations
 
 
@@ -231,6 +239,13 @@ def test_every_expected_amendment_is_enumerated() -> None:
         assert amendment in blocks, f"{amendment} is not enumerated from the section-1 register"
 
 
+def test_each_real_amendment_maps_to_exactly_one_canonical_paragraph() -> None:
+    declarations, violations = _declarations(_register(_PLAN))
+    assert violations == []
+    ids = [aid for aid, _kind, _block in declarations]
+    assert ids == ["A01", "A02", "A03", "A04", "A05", "A06", "A07"]
+
+
 def test_the_process_allowlist_reads_as_process_or_disposition() -> None:
     # The exempt set must be genuinely non-contract, not a convenient escape hatch.
     blocks = _amendment_blocks(_register(_PLAN))
@@ -329,7 +344,9 @@ def test_a_multi_digit_amendment_id_is_enumerated_and_checked() -> None:
 def test_a_styled_amendment_id_is_rejected_instead_of_skipped() -> None:
     plan = _synth_plan("Plan amendment **A08**, approved by the owner, changes a locked contract.")
     violations = evaluate(plan, _ADR_INDEX)
-    assert any("A08" in v and "identifier" in v for v in violations), violations
+    assert any("A08" in v and ("not one canonical" in v or "malformed" in v) for v in violations), (
+        violations
+    )
 
 
 def test_styled_heading_or_list_declarations_are_rejected_instead_of_hidden() -> None:
@@ -346,10 +363,42 @@ def test_styled_heading_or_list_declarations_are_rejected_instead_of_hidden() ->
         )
 
 
+@pytest.mark.parametrize(
+    "amendment",
+    (
+        "[Plan amendment](https://example.invalid/policy) A08, changes a contract.",
+        "`[Plan amendment](https://example.invalid/policy)` A08, changes a contract.",
+        "<strong>Plan amendment</strong> A08, changes a contract.",
+        "Plan amendment<!-- policy --> A08, changes a contract.",
+        "Plan amend<span>ment</span> A08, changes a contract.",
+        "Plan amend&#x6d;ent A08, changes a contract.",
+        "> Plan amendment A08, changes a contract.",
+        "Plan amendment\u00a0A08, changes a contract.",
+        "***Plan _amendment_*** **A08**, changes a contract.",
+        "> - **[Plan amendment](https://example.invalid/policy)** `A08`, changes a contract.",
+    ),
+)
+def test_markdown_html_and_unicode_wrappers_cannot_hide_a_declaration(amendment: str) -> None:
+    violations = evaluate(_synth_plan(f"{amendment} {_ALL_FIELDS}"), _ADR_INDEX)
+    assert any("A08" in v and "not one canonical declaration" in v for v in violations), (
+        amendment,
+        violations,
+    )
+
+
+def test_a_prose_reference_cannot_create_or_hide_a_declaration() -> None:
+    plan = _synth_plan(
+        "This paragraph changes a contract and points to amendment A08 without declaring it. "
+        f"{_ALL_FIELDS}"
+    )
+    violations = evaluate(plan, _ADR_INDEX)
+    assert any("A08" in v and "not one canonical declaration" in v for v in violations), violations
+
+
 def test_a_reused_process_exemption_is_rejected() -> None:
     plan = _synth_plan(
         "Process amendment A01, approved by the owner, changes no locked contract. "
-        "Reason: process only. Amendment A01, approved by the owner, changes a locked "
+        "Reason: process only.\n\nAmendment A01, approved by the owner, changes a locked "
         "storage contract."
     )
     violations = evaluate(plan, _ADR_INDEX)
@@ -359,7 +408,7 @@ def test_a_reused_process_exemption_is_rejected() -> None:
 def test_out_of_order_or_gapped_amendment_declarations_are_rejected() -> None:
     plan = _synth_plan(
         f"Plan amendment A02, approved by the owner, changes a contract. {_ALL_FIELDS} "
-        f"Plan amendment A04, approved by the owner, changes a contract. {_ALL_FIELDS}"
+        f"\n\nPlan amendment A04, approved by the owner, changes a contract. {_ALL_FIELDS}"
     )
     violations = evaluate(plan, _ADR_INDEX)
     assert any("sequence" in v for v in violations), violations

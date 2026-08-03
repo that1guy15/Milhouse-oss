@@ -47,7 +47,9 @@ Security: the wire carries installation-scoped operational metadata only — nev
 prompts, transcripts, or tool output — and adds no external egress, record, publication, or retention
 authority beyond the existing 14-day log class. Revised tests: ADR 0016's revised validation plus the
 section 4.15 file-surface, rotation, recovery, concurrency, bound, and retention gate assertions
-exercise the contract at G03. Amendment A03, approved by the owner on 2026-07-22 and ratified by
+exercise the contract at G03.
+
+Amendment A03, approved by the owner on 2026-07-22 and ratified by
 ADR 0017, records the exact bounded historical DCO disposition for the D01 PR #21 squash incident
 without weakening future enforcement.
 
@@ -89,7 +91,7 @@ a mixed-line JSONL stream requires every line to be self-describing). Compatibil
 public stored-log format has shipped, so the schema is v1 with no migration and no implicit adoption of
 preexisting files, and A05 changes no already-implemented wire byte. Security: the exact schema keeps
 arbitrary text, exception detail, secrets, and provider content out of every line, stderr, exception,
-and traceback, unchanged from A02. Revised tests: a schema-lock test asserts each declared key,
+and traceback, unchanged from the prior stored-log amendment. Revised tests: a schema-lock test asserts each declared key,
 literal, scalar type, and optionality rule for the minimal and maximal header, event, non-empty
 trailer, and empty trailer, together with the digest-coverage and the `expires_at` normative vector.
 
