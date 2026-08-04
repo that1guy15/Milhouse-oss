@@ -3,6 +3,11 @@
 These mirror the canonical construction in ``test_records.py`` but expose public factories that
 return finalized :class:`RecordEnvelopeV1` objects, so the storage tests exercise the real domain →
 row mapping instead of hand-rolling envelopes.
+
+Every factory accepts ``now`` (default the fixed ``NOW`` so unit-test record identities stay
+deterministic). The live smoke passes a real clock instant so a record's ``expires_at`` is always in
+the future — otherwise the fixed anchor would age past the ``records_current`` retention filter and
+the live round-trip would spuriously fail once real time passes ``NOW + 30d``.
 """
 
 from __future__ import annotations
@@ -42,9 +47,9 @@ def _source() -> SourceDescriptorV1:
     )
 
 
-def _target() -> TargetDescriptorV1:
+def _target(target_id: str = "example-target") -> TargetDescriptorV1:
     return TargetDescriptorV1(
-        id="example-target", name="Example target", kind="web.service", environment="test"
+        id=target_id, name="Example target", kind="web.service", environment="test"
     )
 
 
@@ -54,7 +59,7 @@ def _collector() -> CollectorDescriptorV1:
     )
 
 
-def _verification_spec() -> VerificationSpecV1:
+def _verification_spec(now: datetime) -> VerificationSpecV1:
     return VerificationSpecV1(
         rule_id="example-rule",
         rule_version=1,
@@ -65,18 +70,18 @@ def _verification_spec() -> VerificationSpecV1:
         predicate=ValidationPassedPredicateV1(),
         minimum_observations=1,
         observation_window_seconds=3600,
-        deadline=NOW + timedelta(days=7),
+        deadline=now + timedelta(days=7),
     )
 
 
-def _draft(data: object, **overrides: object) -> RecordDraftV1:
+def _draft(data: object, *, now: datetime, **overrides: object) -> RecordDraftV1:
     values: dict[str, object] = {
         "record_type": data.type,  # type: ignore[attr-defined]
         "name": "source.event",
-        "occurred_at": NOW,
-        "observed_at": NOW + timedelta(seconds=1),
-        "ingested_at": NOW + timedelta(seconds=2),
-        "expires_at": NOW + timedelta(days=30),
+        "occurred_at": now,
+        "observed_at": now + timedelta(seconds=1),
+        "ingested_at": now + timedelta(seconds=2),
+        "expires_at": now + timedelta(days=30),
         "source_event_id": "event-1",
         "source_entity_id": "entity-1",
         "operation_id": "operation-1",
@@ -97,20 +102,20 @@ def _draft(data: object, **overrides: object) -> RecordDraftV1:
     return RecordDraftV1.model_validate(values)
 
 
-def event_record(**overrides: object) -> RecordEnvelopeV1:
+def event_record(*, now: datetime = NOW, **overrides: object) -> RecordEnvelopeV1:
     """A finalized ``event`` record (the common case)."""
 
     payload = EventDataV1(category="availability", status="healthy", message="ok")
-    return finalize_record(_draft(payload, **overrides), installation_id=INSTALLATION_ID)
+    return finalize_record(_draft(payload, now=now, **overrides), installation_id=INSTALLATION_ID)
 
 
-def feedback_item_record() -> RecordEnvelopeV1:
+def feedback_item_record(*, now: datetime = NOW) -> RecordEnvelopeV1:
     """A finalized ``feedback_item`` record (opens a feedback item at revision 0)."""
 
     item = FeedbackItemDataV1(
         item_id="feedback-1",
         fingerprint="a" * 64,
-        created_at=NOW,
+        created_at=now,
         target_id="example-target",
         title="Synthetic feedback",
         summary="A bounded synthetic observation",
@@ -120,13 +125,14 @@ def feedback_item_record() -> RecordEnvelopeV1:
         actionability="needs_approval",
         confidence="high",
         evidence_ids=[EVIDENCE_ID],
-        verification_spec=_verification_spec(),
+        verification_spec=_verification_spec(now),
         trust_level="authenticated",
         privacy_class="internal",
     )
     return finalize_record(
         _draft(
             item,
+            now=now,
             record_type="feedback_item",
             name="feedback.item_created",
             severity="warning",
@@ -135,7 +141,7 @@ def feedback_item_record() -> RecordEnvelopeV1:
     )
 
 
-def feedback_transition_record() -> RecordEnvelopeV1:
+def feedback_transition_record(*, now: datetime = NOW) -> RecordEnvelopeV1:
     """A finalized ``feedback_transition`` record (open → accepted, revision 1)."""
 
     accepted = FeedbackTransitionDataV1(
@@ -146,12 +152,12 @@ def feedback_transition_record() -> RecordEnvelopeV1:
         revision=1,
         expected_revision=0,
         actor=ActorReferenceV1(type="operator", id="operator-1"),
-        timestamp=NOW,
+        timestamp=now,
         rationale="Synthetic approval",
         request_id="request-1",
         owner=ActorReferenceV1(type="agent", id="agent-1"),
     )
     return finalize_record(
-        _draft(accepted, record_type="feedback_transition", name="feedback.accepted"),
+        _draft(accepted, now=now, record_type="feedback_transition", name="feedback.accepted"),
         installation_id=INSTALLATION_ID,
     )

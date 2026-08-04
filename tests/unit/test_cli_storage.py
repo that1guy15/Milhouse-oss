@@ -11,6 +11,7 @@ from click.testing import CliRunner
 
 from milhouse.cli import root
 from milhouse.cli.root import main
+from milhouse.cli.views import TrustedRecordScan
 from milhouse.config.secrets import SecretEnvironment
 from milhouse.storage import FeedbackStateRow, StoredRecordV1
 
@@ -94,7 +95,11 @@ def test_cli_storage_config_error_is_exit_two(tmp_path: Path, _stub: FakeClickHo
 def _spooled_records(monkeypatch: pytest.MonkeyPatch) -> None:
     # Bypass bootstrap + the real spool: the export command is wired to one spooled event record.
     monkeypatch.setattr(root, "_require_installation_id", lambda paths: "mh_installation")
-    monkeypatch.setattr(root.views, "read_trusted_records", lambda paths, iid: (event_record(),))
+    monkeypatch.setattr(
+        root.views,
+        "read_trusted_records",
+        lambda paths, iid: TrustedRecordScan(records=(event_record(),), skipped=()),
+    )
 
 
 def test_cli_storage_export(
@@ -103,7 +108,7 @@ def test_cli_storage_export(
     config = _config(tmp_path)
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
     assert result.exit_code == 0
-    assert "records=1 feedback_items=0 feedback_transitions=0" in result.output
+    assert "records=1 feedback_items=0 feedback_transitions=0 skipped_segments=0" in result.output
     assert [table for _db, table, *_ in _stub.inserts] == ["records"]
 
 
@@ -112,12 +117,33 @@ def test_cli_storage_export_json_and_empty(
 ) -> None:
     # Point the export at an empty spool → zero rows, no inserts recorded.
     monkeypatch.setattr(root, "_require_installation_id", lambda paths: "mh_installation")
-    monkeypatch.setattr(root.views, "read_trusted_records", lambda paths, iid: ())
+    monkeypatch.setattr(
+        root.views, "read_trusted_records", lambda paths, iid: TrustedRecordScan((), ())
+    )
     config = _config(tmp_path)
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "export", "--json"])
     assert result.exit_code == 0
     assert '"records": 0' in result.output
+    assert '"skipped_segments": []' in result.output
     assert _stub.inserts == []
+
+
+def test_cli_storage_export_reports_unreadable_segments_and_exits_nonzero(
+    tmp_path: Path, _stub: FakeClickHouseClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A committed segment that fails the trusted read must be surfaced, not silently dropped.
+    monkeypatch.setattr(root, "_require_installation_id", lambda paths: "mh_installation")
+    monkeypatch.setattr(
+        root.views,
+        "read_trusted_records",
+        lambda paths, iid: TrustedRecordScan(records=(event_record(),), skipped=("batch-bad",)),
+    )
+    config = _config(tmp_path)
+    result = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
+    assert result.exit_code == 1  # incomplete export is fail-loud, not exit 0
+    assert "skipped_segments=1" in result.output
+    assert "export incomplete" in result.output
+    assert [table for _db, table, *_ in _stub.inserts] == ["records"]  # the good record still wrote
 
 
 def test_cli_storage_records(

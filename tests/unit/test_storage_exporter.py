@@ -61,8 +61,14 @@ def test_event_record_maps_to_the_records_columns() -> None:
     assert row["record_id"] == record.record_id
     assert row["record_type"] == "event"
     assert row["target_id"] == "example-target"
+    # Assert each timestamp against its own field so a swap of two adjacent datetimes is caught.
     assert row["occurred_at"] == record.occurred_at
+    assert row["observed_at"] == record.observed_at
+    assert row["ingested_at"] == record.ingested_at
     assert row["expires_at"] == record.expires_at
+    assert (
+        record.occurred_at != record.observed_at != record.ingested_at
+    )  # distinct, so the above bites
     assert row["source_event_id"] == "event-1"
     assert row["dedupe_key"] == record.dedupe_key
     assert row["content_hash"] == record.content_hash

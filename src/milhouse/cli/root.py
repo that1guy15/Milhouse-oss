@@ -509,10 +509,10 @@ def storage_export_command(context: click.Context, as_json: bool) -> None:
     state = context.ensure_object(CliState)
     paths = _resolve_paths(state)
     installation_id = _require_installation_id(paths)
-    records = views.read_trusted_records(paths, installation_id)
+    scan = views.read_trusted_records(paths, installation_id)
     database, client = _storage_client(state)
     try:
-        summary = storage.export_records(client, database, records)
+        summary = storage.export_records(client, database, scan.records)
     except storage.StorageError as error:
         raise StorageCommandError(error) from None
     finally:
@@ -524,15 +524,25 @@ def storage_export_command(context: click.Context, as_json: bool) -> None:
                     "records": summary.records,
                     "feedback_items": summary.feedback_items,
                     "feedback_transitions": summary.feedback_transitions,
+                    "skipped_segments": list(scan.skipped),
                 },
                 sort_keys=True,
             )
         )
-        return
-    click.echo(
-        f"export: records={summary.records} feedback_items={summary.feedback_items} "
-        f"feedback_transitions={summary.feedback_transitions}"
-    )
+    else:
+        click.echo(
+            f"export: records={summary.records} feedback_items={summary.feedback_items} "
+            f"feedback_transitions={summary.feedback_transitions} "
+            f"skipped_segments={len(scan.skipped)}"
+        )
+    if scan.skipped:
+        # A committed segment that fails the trusted read is fail-closed (never exported), but the
+        # export is then INCOMPLETE — surface it loudly and non-zero rather than imply full success.
+        click.echo(
+            f"WARNING: {len(scan.skipped)} committed segment(s) unreadable; export incomplete",
+            err=True,
+        )
+        context.exit(1)
 
 
 @storage_group.command(name="records")
@@ -567,7 +577,7 @@ def storage_records_command(state: CliState, target_id: str | None, as_json: boo
 @click.option("--json", "as_json", is_flag=True, help="Emit the feedback state as stable JSON.")
 @click.pass_obj
 def storage_feedback_command(state: CliState, as_json: bool) -> None:
-    """Query each feedback item's derived current state from the store."""
+    """Query feedback items' transition-derived current state (open-only items show in records)."""
 
     database, client = _storage_client(state)
     try:

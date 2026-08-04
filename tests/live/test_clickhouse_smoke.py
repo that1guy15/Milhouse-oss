@@ -18,6 +18,8 @@ import pytest
 
 from milhouse.config._models import StorageClickHouseConfig
 from milhouse.config.secrets import SecretEnvironment
+from milhouse.core.clock import SystemClock
+from milhouse.domain.records import TargetDescriptorV1
 from milhouse.storage import (
     StorageError,
     build_client,
@@ -125,23 +127,35 @@ def test_live_export_round_trips_records_and_derives_feedback_state() -> None:
         client.command(f"DROP DATABASE IF EXISTS {_SMOKE_DB}")
         migrate(client, _SMOKE_DB, now=datetime.now(UTC), milhouse_version="live-smoke")
 
-        event = event_record()
-        item = feedback_item_record()
-        transition = feedback_transition_record()
-        summary = export_records(client, _SMOKE_DB, [event, item, transition])
-        assert (summary.records, summary.feedback_items, summary.feedback_transitions) == (3, 1, 1)
+        # Build against a real clock instant so expires_at is in the future — otherwise the fixed
+        # factory anchor would age past records_current's retention filter and fail spuriously.
+        now = SystemClock().now()
+        event = event_record(now=now)
+        item = feedback_item_record(now=now)
+        transition = feedback_transition_record(now=now)
+        other = event_record(
+            now=now,
+            target=TargetDescriptorV1(
+                id="other-target", name="Other", kind="web.service", environment="test"
+            ),
+        )
+        summary = export_records(client, _SMOKE_DB, [event, item, transition, other])
+        assert (summary.records, summary.feedback_items, summary.feedback_transitions) == (4, 1, 1)
 
         # Re-export: the deduplicating records table collapses the repeat.
-        export_records(client, _SMOKE_DB, [event, item, transition])
+        export_records(client, _SMOKE_DB, [event, item, transition, other])
 
         records = fetch_current_records(client, _SMOKE_DB)
         appearances = [row for row in records if row.record_id == event.record_id]
         assert len(appearances) == 1  # deduplicated by ReplacingMergeTree FINAL
         assert appearances[0].record_type == "event"
 
-        # The target filter is bound server-side; every record here targets example-target.
+        # The target filter is bound server-side and actually EXCLUDES non-matching targets.
         filtered = fetch_current_records(client, _SMOKE_DB, target_id="example-target")
-        assert filtered and all(row.target_id == "example-target" for row in filtered)
+        filtered_ids = {row.record_id for row in filtered}
+        assert event.record_id in filtered_ids
+        assert other.record_id not in filtered_ids  # other-target is excluded
+        assert all(row.target_id == "example-target" for row in filtered)
 
         feedback = {row.item_id: row for row in fetch_current_feedback(client, _SMOKE_DB)}
         assert feedback["feedback-1"].current_state == "accepted"  # argMax over the locked order

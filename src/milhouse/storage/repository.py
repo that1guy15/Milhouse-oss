@@ -98,7 +98,14 @@ def fetch_current_records(
 
 
 def fetch_current_feedback(client: ClickHouseClient, database: str) -> tuple[FeedbackStateRow, ...]:
-    """Return every feedback item's derived current state, ordered by item id."""
+    """Return the transition-derived current state of each feedback item, ordered by item id.
+
+    ``feedback_current`` derives state from the append-only transition log, so an item that has been
+    created but never transitioned (still ``open`` at revision 0) does not appear here — it is
+    visible as its ``feedback_item`` record via :func:`fetch_current_records`. Folding those
+    untriaged-open items into a single current-state surface is the feedback service's concern
+    (W08); this repository intentionally exposes exactly what the view derives.
+    """
 
     _require_database(database)
     statement = (

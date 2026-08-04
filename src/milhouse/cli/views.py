@@ -157,24 +157,39 @@ def read_events(paths: RuntimePaths, installation_id: str) -> tuple[EventSummary
     return tuple(events)
 
 
-def read_trusted_records(paths: RuntimePaths, installation_id: str) -> tuple[RecordEnvelopeV1, ...]:
-    """Read every committed segment through the trusted reader; return the whole records.
+@dataclass(frozen=True, slots=True)
+class TrustedRecordScan:
+    """The whole records read for export, plus the batch ids that could not be trusted-read.
 
-    Unlike the metadata views above, this returns full :class:`RecordEnvelopeV1` objects for the
-    local persistence path (exporting to the ClickHouse store). An unreadable or disagreeing segment
-    is skipped rather than raising, so one bad file never blocks the rest.
+    ``skipped`` matters because this feeds a *persistence* path (the ClickHouse export): unlike the
+    metadata display views, a silently dropped segment here is undetected data loss, so the caller
+    must surface it rather than report an unqualified success.
+    """
+
+    records: tuple[RecordEnvelopeV1, ...]
+    skipped: tuple[str, ...]
+
+
+def read_trusted_records(paths: RuntimePaths, installation_id: str) -> TrustedRecordScan:
+    """Read every committed segment through the trusted reader; return the whole records + skips.
+
+    An unreadable or disagreeing segment is skipped (fail closed — a possibly-tampered segment is
+    never exported) but its batch id is recorded in ``skipped`` so the export never claims a silent
+    complete success.
     """
 
     records: list[RecordEnvelopeV1] = []
+    skipped: list[str] = []
     for record in _segments(paths):
         try:
             parsed = read_trusted_segment(
                 _segment_path(paths, record), installation_id=installation_id
             )
         except SpoolError:
+            skipped.append(record.batch_id)
             continue
         records.extend(frame.record for frame in parsed.frames)
-    return tuple(records)
+    return TrustedRecordScan(records=tuple(records), skipped=tuple(skipped))
 
 
 def show_segment(paths: RuntimePaths, batch_id: str, installation_id: str) -> SegmentDetail | None:
