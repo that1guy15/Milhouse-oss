@@ -8,6 +8,13 @@ from milhouse.storage.client import (
     build_client,
 )
 from milhouse.storage.errors import StorageError
+from milhouse.storage.exporter import ExportSummary, export_records
+from milhouse.storage.repository import (
+    FeedbackStateRow,
+    StoredRecordV1,
+    fetch_current_feedback,
+    fetch_current_records,
+)
 from milhouse.storage.runner import (
     MigrateResult,
     MigrationState,
@@ -22,12 +29,18 @@ __all__ = [
     "CLICKHOUSE_MIGRATIONS",
     "ClickHouseClient",
     "ConnectedClickHouseClient",
+    "ExportSummary",
+    "FeedbackStateRow",
     "MigrateResult",
     "MigrationState",
     "StorageError",
     "StorageMigration",
     "StoragePlan",
+    "StoredRecordV1",
     "build_client",
+    "export_records",
+    "fetch_current_feedback",
+    "fetch_current_records",
     "migrate",
     "plan",
     "status",

@@ -19,12 +19,12 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from milhouse.core.clock import TimeError, truncate_to_milliseconds
+from milhouse.storage._identifiers import require_identifier
 from milhouse.storage.client import ClickHouseClient
 from milhouse.storage.errors import StorageError
 from milhouse.storage.schema import CLICKHOUSE_MIGRATIONS, StorageMigration
 
 _LEDGER = "_migrations"
-_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}", flags=re.ASCII)
 
 
 def _fail(message: str) -> None:
@@ -76,9 +76,11 @@ class MigrateResult:
 
 
 def _validate_database(database: object) -> str:
-    if type(database) is not str or _IDENTIFIER.fullmatch(database) is None:
-        _fail("a bounded ClickHouse database identifier is required")
-    return database  # type: ignore[return-value]
+    return require_identifier(
+        database,
+        code="MH_STORAGE_MIGRATION",
+        message="a bounded ClickHouse database identifier is required",
+    )
 
 
 def _substitute(sql: str, database: str) -> str:

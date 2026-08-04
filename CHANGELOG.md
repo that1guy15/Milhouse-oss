@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add the W04 G04b storage exporter and query repository: a record→ClickHouse exporter that
+  authorizes each record against the `local_clickhouse` egress surface (fail-closed) and writes rows
+  as native column data (never interpolated into SQL), a query repository over the deduplicating
+  `records_current`/`feedback_current` views with server-side parameter binding, and `milhouse
+  storage export/records/feedback` commands — proving the demo → spool → export → query path. The
+  live export round-trip and feedback-state derivation are an opt-in local smoke; the recovery
+  obligations (idempotent delivery ledger, outage drain, native restore) still sequence with G03, so
+  G04b is not yet accepted.
 - Add the W04 ClickHouse storage foundation (G04a): packaged, checksum-protected SQL migrations
   (0001–0004), a migration runner that refuses an altered applied checksum, a typed authenticated
   `clickhouse-connect` client that opens no socket at construction, `milhouse storage

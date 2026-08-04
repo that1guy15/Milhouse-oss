@@ -498,3 +498,92 @@ def storage_migrate_command(state: CliState, as_json: bool) -> None:
         f"({len(result.already_applied)} already applied); "
         f"schema at version {result.current_version}"
     )
+
+
+@storage_group.command(name="export")
+@click.option("--json", "as_json", is_flag=True, help="Emit the result as stable JSON.")
+@click.pass_context
+def storage_export_command(context: click.Context, as_json: bool) -> None:
+    """Export committed spool records into the ClickHouse store (idempotent for deduped records)."""
+
+    state = context.ensure_object(CliState)
+    paths = _resolve_paths(state)
+    installation_id = _require_installation_id(paths)
+    records = views.read_trusted_records(paths, installation_id)
+    database, client = _storage_client(state)
+    try:
+        summary = storage.export_records(client, database, records)
+    except storage.StorageError as error:
+        raise StorageCommandError(error) from None
+    finally:
+        client.close()
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "records": summary.records,
+                    "feedback_items": summary.feedback_items,
+                    "feedback_transitions": summary.feedback_transitions,
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    click.echo(
+        f"export: records={summary.records} feedback_items={summary.feedback_items} "
+        f"feedback_transitions={summary.feedback_transitions}"
+    )
+
+
+@storage_group.command(name="records")
+@click.option("--target", "target_id", default=None, help="Filter to one target id.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the records as stable JSON.")
+@click.pass_obj
+def storage_records_command(state: CliState, target_id: str | None, as_json: bool) -> None:
+    """Query the current (deduplicated, non-expired) records from the store."""
+
+    database, client = _storage_client(state)
+    try:
+        rows = storage.fetch_current_records(client, database, target_id=target_id)
+    except storage.StorageError as error:
+        raise StorageCommandError(error) from None
+    finally:
+        client.close()
+    if as_json:
+        click.echo(json.dumps([asdict(row) for row in rows], sort_keys=True))
+        return
+    if not rows:
+        click.echo("no current records")
+        return
+    for row in rows:
+        click.echo(
+            f"{row.record_id} {row.record_type}/{row.name} occurred={row.occurred_at} "
+            f"expires={row.expires_at} target={row.target_id} class={row.privacy_class} "
+            f"severity={row.severity}"
+        )
+
+
+@storage_group.command(name="feedback")
+@click.option("--json", "as_json", is_flag=True, help="Emit the feedback state as stable JSON.")
+@click.pass_obj
+def storage_feedback_command(state: CliState, as_json: bool) -> None:
+    """Query each feedback item's derived current state from the store."""
+
+    database, client = _storage_client(state)
+    try:
+        rows = storage.fetch_current_feedback(client, database)
+    except storage.StorageError as error:
+        raise StorageCommandError(error) from None
+    finally:
+        client.close()
+    if as_json:
+        click.echo(json.dumps([asdict(row) for row in rows], sort_keys=True))
+        return
+    if not rows:
+        click.echo("no feedback items")
+        return
+    for row in rows:
+        click.echo(
+            f"{row.item_id} state={row.current_state} revision={row.current_revision} "
+            f"last={row.last_transition_at}"
+        )

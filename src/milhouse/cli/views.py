@@ -2,9 +2,10 @@
 
 ``spool list`` / ``spool show``, ``events``, and ``doctor`` read the durable spool and control
 ledger and report privacy-safe *metadata only* — never the raw record payload — consistent with the
-local-query egress policy (plan section 4.7). Everything here is local and read-only: no network, no
-mutation, no secret resolution. A preparatory W06 vertical on the accepted W02/W03 foundations; it
-does not claim a gate.
+local-query egress policy (plan section 4.7). :func:`read_trusted_records` is the one exception: it
+returns whole trusted records, not for display but for the local persistence path (the G04b
+ClickHouse export, an authorized ``LOCAL_CLICKHOUSE`` surface). Everything here is local and
+read-only over the spool: no network, no mutation, no secret resolution.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from pathlib import Path
 from milhouse.cli import bootstrap
 from milhouse.config import RuntimePaths
 from milhouse.core.clock import format_timestamp
+from milhouse.domain.records import RecordEnvelopeV1
 from milhouse.spooling import ParsedSegment, SpoolError, read_trusted_segment
 from milhouse.spooling.ledger import (
     SegmentRecord,
@@ -153,6 +155,26 @@ def read_events(paths: RuntimePaths, installation_id: str) -> tuple[EventSummary
             continue
         events.extend(_events_of(record, parsed))
     return tuple(events)
+
+
+def read_trusted_records(paths: RuntimePaths, installation_id: str) -> tuple[RecordEnvelopeV1, ...]:
+    """Read every committed segment through the trusted reader; return the whole records.
+
+    Unlike the metadata views above, this returns full :class:`RecordEnvelopeV1` objects for the
+    local persistence path (exporting to the ClickHouse store). An unreadable or disagreeing segment
+    is skipped rather than raising, so one bad file never blocks the rest.
+    """
+
+    records: list[RecordEnvelopeV1] = []
+    for record in _segments(paths):
+        try:
+            parsed = read_trusted_segment(
+                _segment_path(paths, record), installation_id=installation_id
+            )
+        except SpoolError:
+            continue
+        records.extend(frame.record for frame in parsed.frames)
+    return tuple(records)
 
 
 def show_segment(paths: RuntimePaths, batch_id: str, installation_id: str) -> SegmentDetail | None:

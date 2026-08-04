@@ -8,13 +8,16 @@ driver is created lazily on first use — so the runner's logic is fully unit-te
 client, and no credential is ever read until a command actually runs.
 
 Per-record egress enforcement (privacy class against ``EgressSurface.LOCAL_CLICKHOUSE``) lives on
-the exporter write path added in the next W04 increment, not on this connection primitive; the DDL
-this seam carries for migrations contains no record payload.
+the exporter write path (:mod:`milhouse.storage.exporter`), not on this connection primitive; the
+DDL this seam carries for migrations contains no record payload. The write and read primitives here
+never interpolate record content into SQL: :meth:`ClickHouseClient.insert` binds values as native
+column data and :meth:`ClickHouseClient.query` accepts server-side bound parameters, so untrusted
+free-text record fields can never form part of a statement.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlparse
@@ -26,13 +29,33 @@ from milhouse.storage.errors import StorageError
 
 @runtime_checkable
 class ClickHouseClient(Protocol):
-    """The command/query surface the storage runner depends on."""
+    """The command/query/insert surface the runner, exporter, and repository depend on."""
 
     def command(self, statement: str) -> None:
         """Execute one DDL/DML statement, discarding any result."""
 
-    def query(self, statement: str) -> Sequence[Sequence[Any]]:
-        """Execute one SELECT and return its result rows as a sequence of row sequences."""
+    def query(
+        self, statement: str, *, parameters: Mapping[str, Any] | None = None
+    ) -> Sequence[Sequence[Any]]:
+        """Execute one SELECT and return its result rows as a sequence of row sequences.
+
+        ``parameters`` are bound server-side (``{name:Type}`` placeholders), never string-formatted
+        into the statement, so caller-supplied filter values cannot alter the query.
+        """
+
+    def insert(
+        self,
+        database: str,
+        table: str,
+        rows: Sequence[Sequence[Any]],
+        *,
+        column_names: Sequence[str],
+    ) -> None:
+        """Insert column-ordered ``rows`` into ``<database>.<table>``.
+
+        Values are transmitted as native column data, never interpolated into SQL, so untrusted
+        record content (free text, identifiers) can never form part of a statement.
+        """
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -116,11 +139,33 @@ class ConnectedClickHouseClient:
         except Exception as error:
             raise StorageError("MH_STORAGE_CLIENT", "a ClickHouse command failed") from error
 
-    def query(self, statement: str) -> Sequence[Sequence[Any]]:
+    def query(
+        self, statement: str, *, parameters: Mapping[str, Any] | None = None
+    ) -> Sequence[Sequence[Any]]:
         try:
-            return list(self._connected().query(statement).result_rows)
+            return list(self._connected().query(statement, parameters=parameters).result_rows)
         except Exception as error:
             raise StorageError("MH_STORAGE_CLIENT", "a ClickHouse query failed") from error
+
+    def insert(
+        self,
+        database: str,
+        table: str,
+        rows: Sequence[Sequence[Any]],
+        *,
+        column_names: Sequence[str],
+    ) -> None:
+        if not rows:
+            return  # nothing to write; avoid a driver round-trip on an empty batch
+        try:
+            self._connected().insert(
+                table=table,
+                data=[list(row) for row in rows],
+                column_names=list(column_names),
+                database=database,
+            )
+        except Exception as error:
+            raise StorageError("MH_STORAGE_CLIENT", "a ClickHouse insert failed") from error
 
     def close(self) -> None:
         if self._driver is not None:
