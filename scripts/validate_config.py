@@ -30,6 +30,7 @@ EXPECTED_PYTEST_MARKERS = (
     "contract: public and repository contract tests",
     "e2e: installed or end-to-end workflow tests",
     "integration: multi-module integration tests",
+    "live: opt-in tests against a real loopback ClickHouse; self-skip and stay out of Required CI",
     "migration: migration foundation tests",
     "packaging: artifact and package inventory tests",
     "property: Hypothesis property tests",
