@@ -14,4 +14,13 @@ def test_typed_resource_inventory_is_installed() -> None:
 
     assert package_root.joinpath("py.typed").is_file()
     assert package_root.joinpath("resources", "manifest.json").is_file()
-    assert set(manifest.resources) == {"py.typed", "resources/manifest.json"}
+    assert set(manifest.resources) == {
+        "py.typed",
+        "resources/manifest.json",
+        "storage/migrations/0001_core.sql",
+        "storage/migrations/0002_records.sql",
+        "storage/migrations/0003_feedback.sql",
+        "storage/migrations/0004_views.sql",
+    }
+    for migration in ("0001_core", "0002_records", "0003_feedback", "0004_views"):
+        assert package_root.joinpath("storage", "migrations", f"{migration}.sql").is_file()
