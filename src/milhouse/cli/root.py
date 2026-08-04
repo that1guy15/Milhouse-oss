@@ -9,15 +9,17 @@ from pathlib import Path
 import click
 from platformdirs import user_config_path, user_data_path
 
-from milhouse import __version__
+from milhouse import __version__, storage
 from milhouse.cli import bootstrap, demo, views
 from milhouse.config import (
     ConfigError,
     RuntimePaths,
     generate_json_schema_bytes,
     load_config,
+    load_secret_environment,
     resolve_runtime_paths,
 )
+from milhouse.config._models import MilhouseConfig
 from milhouse.core.clock import SystemClock
 
 
@@ -57,20 +59,27 @@ def _platform_data_root() -> Path:
     return user_data_path("milhouse", appauthor=False)
 
 
-def _resolve_paths(state: CliState) -> RuntimePaths:
+def _resolve_config(state: CliState) -> tuple[MilhouseConfig, RuntimePaths]:
     """Load the config and resolve runtime paths, mapping config failure to the exit-2 CLI error."""
 
     try:
         config, config_path = load_config(
             state.config_path, platform_default=_platform_config_file()
         )
-        return resolve_runtime_paths(
+        paths = resolve_runtime_paths(
             config,
             config_path=config_path,
             platform_data_root=_platform_data_root(),
         )
+        return config, paths
     except ConfigError as error:
         raise ConfigCommandError(error) from None
+
+
+def _resolve_paths(state: CliState) -> RuntimePaths:
+    """Resolve runtime paths only (config discarded)."""
+
+    return _resolve_config(state)[1]
 
 
 @click.group(
@@ -364,3 +373,128 @@ def doctor_command(context: click.Context, as_json: bool) -> None:
         click.echo(f"status: {'ok' if report.ok else 'problem'}")
     if not report.ok:
         context.exit(1)
+
+
+class StorageCommandError(click.ClickException):
+    """A stable ClickHouse-storage failure using the CLI contract's exit code 1."""
+
+    exit_code = 1
+
+    def __init__(self, error: storage.StorageError) -> None:
+        self.code = error.code
+        super().__init__(str(error))
+
+
+def _storage_client(state: CliState) -> tuple[str, storage.ConnectedClickHouseClient]:
+    config, paths = _resolve_config(state)
+    clickhouse = config.storage.clickhouse
+    if not clickhouse.enabled:
+        raise StorageCommandError(
+            storage.StorageError("MH_STORAGE_CONFIG", "storage.clickhouse is disabled in config")
+        )
+    try:
+        secrets = load_secret_environment(config, paths)
+    except ConfigError as error:
+        raise ConfigCommandError(error) from None
+    try:
+        client = storage.build_client(clickhouse, secrets)
+    except storage.StorageError as error:
+        raise StorageCommandError(error) from None
+    return clickhouse.database, client
+
+
+def _emit_plan(report: storage.StoragePlan, as_json: bool) -> None:
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "database": report.database,
+                    "current_version": report.current_version,
+                    "migrations": [
+                        {"version": state.version, "name": state.name, "applied": state.applied}
+                        for state in report.states
+                    ],
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    for state in report.states:
+        marker = "applied" if state.applied else "pending"
+        click.echo(f"[{marker}] {state.version:04d}_{state.name}")
+    click.echo(
+        f"database={report.database} current_version={report.current_version} "
+        f"pending={len(report.pending)}"
+    )
+
+
+@main.group(name="storage")
+def storage_group() -> None:
+    """Manage the ClickHouse analytical store (migration status, plan, and apply)."""
+
+
+@storage_group.command(name="status")
+@click.option("--json", "as_json", is_flag=True, help="Emit the status as stable JSON.")
+@click.pass_obj
+def storage_status_command(state: CliState, as_json: bool) -> None:
+    """Report applied vs pending migrations without mutating anything."""
+
+    database, client = _storage_client(state)
+    try:
+        report = storage.status(client, database)
+    except storage.StorageError as error:
+        raise StorageCommandError(error) from None
+    finally:
+        client.close()
+    _emit_plan(report, as_json)
+
+
+@storage_group.command(name="plan")
+@click.option("--json", "as_json", is_flag=True, help="Emit the plan as stable JSON.")
+@click.pass_obj
+def storage_plan_command(state: CliState, as_json: bool) -> None:
+    """Show which migrations a subsequent ``migrate`` would apply, without mutating anything."""
+
+    database, client = _storage_client(state)
+    try:
+        report = storage.plan(client, database)
+    except storage.StorageError as error:
+        raise StorageCommandError(error) from None
+    finally:
+        client.close()
+    _emit_plan(report, as_json)
+
+
+@storage_group.command(name="migrate")
+@click.option("--json", "as_json", is_flag=True, help="Emit the result as stable JSON.")
+@click.pass_obj
+def storage_migrate_command(state: CliState, as_json: bool) -> None:
+    """Apply every pending migration in order; refuse an altered applied checksum."""
+
+    database, client = _storage_client(state)
+    try:
+        result = storage.migrate(
+            client, database, now=SystemClock().now(), milhouse_version=__version__
+        )
+    except storage.StorageError as error:
+        raise StorageCommandError(error) from None
+    finally:
+        client.close()
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "database": result.database,
+                    "applied_now": list(result.applied_now),
+                    "already_applied": list(result.already_applied),
+                    "current_version": result.current_version,
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    click.echo(
+        f"migrate: applied {len(result.applied_now)} migration(s) "
+        f"({len(result.already_applied)} already applied); "
+        f"schema at version {result.current_version}"
+    )

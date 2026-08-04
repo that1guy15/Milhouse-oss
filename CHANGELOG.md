@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add the W04 ClickHouse storage foundation (G04a): packaged, checksum-protected SQL migrations
+  (0001–0004), a migration runner that refuses an altered applied checksum, a typed authenticated
+  `clickhouse-connect` client that opens no socket at construction, `milhouse storage
+  status/plan/migrate` commands, and a hardened loopback-only, digest-pinned reference compose with
+  the built-in default account locked. The offline subset runs in CI; the live G04a criteria are an
+  opt-in local smoke and remain owner/host gate evidence (G04a not yet accepted).
+- Add the first runnable local product surface: `milhouse init`, `health`, `demo`, and the
+  `spool`/`events`/`doctor` inspect commands (spool-only, credential-free), on the accepted W02/W03
+  foundations.
 - Pair each meaningful engineering-journal milestone with an unpublished, beginner-friendly
   learning companion or scoped learning-series plan, and require every completed Discussion-derived
   article to be saved through authenticated Chrome as an unpublished Substack draft while keeping
