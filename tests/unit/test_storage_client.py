@@ -29,12 +29,18 @@ def _secrets(url: str = "http://127.0.0.1:8123") -> SecretEnvironment:
 class _FakeDriver:
     def __init__(self) -> None:
         self.commands: list[str] = []
+        self.inserts: list[dict[str, Any]] = []
 
     def command(self, statement: str) -> None:
         self.commands.append(statement)
 
-    def query(self, statement: str) -> Any:
+    def query(self, statement: str, *, parameters: Any = None) -> Any:
         raise AssertionError("not used")
+
+    def insert(self, *, table: str, data: Any, column_names: Any, database: str) -> None:
+        self.inserts.append(
+            {"table": table, "data": data, "column_names": column_names, "database": database}
+        )
 
     def close(self) -> None:
         pass
@@ -124,7 +130,7 @@ def test_query_returns_rows_reuses_driver_and_closes(monkeypatch: pytest.MonkeyP
             self.result_rows = [[1], [2]]
 
     class _Driver(_FakeDriver):
-        def query(self, statement: str) -> Any:
+        def query(self, statement: str, *, parameters: Any = None) -> Any:
             return _Result()
 
     driver = _Driver()
@@ -145,11 +151,71 @@ def test_query_returns_rows_reuses_driver_and_closes(monkeypatch: pytest.MonkeyP
 
 def test_query_wraps_a_driver_error(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Boom(_FakeDriver):
-        def query(self, statement: str) -> Any:
+        def query(self, statement: str, *, parameters: Any = None) -> Any:
             raise RuntimeError("driver failure")
 
     monkeypatch.setattr("clickhouse_connect.get_client", lambda **kw: _Boom())
     client = build_client(_config(), _secrets())
     with pytest.raises(StorageError) as captured:
         client.query("SELECT 1")
+    assert captured.value.code == "MH_STORAGE_CLIENT"
+
+
+def test_query_forwards_bound_parameters_to_the_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+
+    class _Result:
+        def __init__(self) -> None:
+            self.result_rows = [["ok"]]
+
+    class _Driver(_FakeDriver):
+        def query(self, statement: str, *, parameters: Any = None) -> Any:
+            seen.append(parameters)
+            return _Result()
+
+    monkeypatch.setattr("clickhouse_connect.get_client", lambda **kw: _Driver())
+    client = build_client(_config(), _secrets())
+    rows = client.query("SELECT 1 WHERE x = {x:String}", parameters={"x": "value"})
+    assert list(rows) == [["ok"]]
+    assert seen == [{"x": "value"}]
+
+
+def test_insert_transmits_rows_as_native_column_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    driver = _FakeDriver()
+    monkeypatch.setattr("clickhouse_connect.get_client", lambda **kw: driver)
+    client = build_client(_config(), _secrets())
+
+    client.insert("milhouse", "records", [("a", 1), ("b", 2)], column_names=("name", "n"))
+
+    assert driver.inserts == [
+        {
+            "table": "records",
+            "data": [["a", 1], ["b", 2]],
+            "column_names": ["name", "n"],
+            "database": "milhouse",
+        }
+    ]
+
+
+def test_insert_skips_an_empty_batch_without_opening_a_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "clickhouse_connect.get_client", lambda **kw: calls.append(1) or _FakeDriver()
+    )
+    client = build_client(_config(), _secrets())
+    client.insert("milhouse", "records", [], column_names=("name",))
+    assert calls == []  # an empty batch is a no-op; the driver is never even constructed
+
+
+def test_insert_wraps_a_driver_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Boom(_FakeDriver):
+        def insert(self, *, table: str, data: Any, column_names: Any, database: str) -> None:
+            raise RuntimeError("driver failure")
+
+    monkeypatch.setattr("clickhouse_connect.get_client", lambda **kw: _Boom())
+    client = build_client(_config(), _secrets())
+    with pytest.raises(StorageError) as captured:
+        client.insert("milhouse", "records", [("a",)], column_names=("name",))
     assert captured.value.code == "MH_STORAGE_CLIENT"

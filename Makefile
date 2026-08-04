@@ -116,8 +116,11 @@ test-coverage:
 		--critical 'src/milhouse/spooling/segment.py' \
 		--critical 'src/milhouse/spooling/verify.py' \
 		--critical 'src/milhouse/spooling/writer.py' \
+		--critical 'src/milhouse/storage/_identifiers.py' \
 		--critical 'src/milhouse/storage/client.py' \
 		--critical 'src/milhouse/storage/errors.py' \
+		--critical 'src/milhouse/storage/exporter.py' \
+		--critical 'src/milhouse/storage/repository.py' \
 		--critical 'src/milhouse/storage/runner.py' \
 		--critical 'src/milhouse/storage/schema.py' \
 		--critical 'scripts/check_artifacts.py' \

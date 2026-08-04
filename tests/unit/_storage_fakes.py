@@ -9,7 +9,7 @@ ordering, checksum, and non-mutation logic can be exercised with no network.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 _COUNT_DB = re.compile(r"SELECT count\(\) FROM system\.databases WHERE name = '([^']+)'")
@@ -34,6 +34,8 @@ class FakeClickHouseClient:
         # database -> {version: (name, checksum)}
         self.ledger: dict[str, dict[int, tuple[str, str]]] = {}
         self.commands: list[str] = []
+        # every insert() call: (database, table, rows, column_names)
+        self.inserts: list[tuple[str, str, list[list[Any]], tuple[str, ...]]] = []
 
     def close(self) -> None:
         """Match the CLI's ``client.close()`` on the concrete client (no-op for the fake)."""
@@ -60,7 +62,21 @@ class FakeClickHouseClient:
             db, version, name, checksum = insert.groups()
             self.ledger.setdefault(db, {})[int(version)] = (name, checksum)
 
-    def query(self, statement: str) -> Sequence[Sequence[Any]]:
+    def insert(
+        self,
+        database: str,
+        table: str,
+        rows: Sequence[Sequence[Any]],
+        *,
+        column_names: Sequence[str],
+    ) -> None:
+        if not rows:
+            return  # mirror the real client: an empty batch is a no-op, no call recorded
+        self.inserts.append((database, table, [list(row) for row in rows], tuple(column_names)))
+
+    def query(
+        self, statement: str, *, parameters: Mapping[str, Any] | None = None
+    ) -> Sequence[Sequence[Any]]:
         db_probe = _COUNT_DB.search(statement)
         if db_probe is not None:
             return [[1 if db_probe.group(1) in self.databases else 0]]
