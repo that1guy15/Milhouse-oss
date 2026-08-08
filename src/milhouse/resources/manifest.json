@@ -8,6 +8,7 @@
     "storage/migrations/0001_core.sql",
     "storage/migrations/0002_records.sql",
     "storage/migrations/0003_feedback.sql",
-    "storage/migrations/0004_views.sql"
+    "storage/migrations/0004_views.sql",
+    "storage/migrations/0005_feedback_transition_dedup.sql"
   ]
 }

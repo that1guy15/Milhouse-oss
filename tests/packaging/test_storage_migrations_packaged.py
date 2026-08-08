@@ -6,7 +6,13 @@ import tomllib
 from importlib import resources
 from pathlib import Path
 
-_MIGRATION_FILES = ("0001_core.sql", "0002_records.sql", "0003_feedback.sql", "0004_views.sql")
+_MIGRATION_FILES = (
+    "0001_core.sql",
+    "0002_records.sql",
+    "0003_feedback.sql",
+    "0004_views.sql",
+    "0005_feedback_transition_dedup.sql",
+)
 
 
 def test_migrations_are_readable_via_importlib_resources() -> None:

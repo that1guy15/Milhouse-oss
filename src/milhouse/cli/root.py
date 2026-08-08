@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -21,6 +22,9 @@ from milhouse.config import (
 )
 from milhouse.config._models import MilhouseConfig
 from milhouse.core.clock import SystemClock
+from milhouse.spooling import SpoolError, replay_segments
+from milhouse.spooling.ledger import list_segment_records
+from milhouse.state import GlobalCommitBarrier, open_control_database
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -385,6 +389,21 @@ class StorageCommandError(click.ClickException):
         super().__init__(str(error))
 
 
+class StorageExportError(click.ClickException):
+    """A stable ``storage export`` drain failure using the CLI contract's exit code 1.
+
+    The ledger-gated export spans two fail-closed layers — the spool's replay/delivery machine
+    (``MH_SPOOL_*``) and the ClickHouse egress (``MH_STORAGE_*``) — so this sibling of
+    :class:`StorageCommandError` accepts either coded error and preserves its fixed machine code.
+    """
+
+    exit_code = 1
+
+    def __init__(self, error: SpoolError | storage.StorageError) -> None:
+        self.code = error.code
+        super().__init__(str(error))
+
+
 def _storage_client(state: CliState) -> tuple[str, storage.ConnectedClickHouseClient]:
     config, paths = _resolve_config(state)
     clickhouse = config.storage.clickhouse
@@ -469,13 +488,33 @@ def storage_plan_command(state: CliState, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Emit the result as stable JSON.")
 @click.pass_obj
 def storage_migrate_command(state: CliState, as_json: bool) -> None:
-    """Apply every pending migration in order; refuse an altered applied checksum."""
+    """Apply every pending migration in order under the exclusive commit barrier; refuse a tamper.
 
+    The whole apply runs while THIS installation's control-plane commit lock is held EXCLUSIVELY, so
+    ``storage export`` — which delivers ClickHouse rows under the *shared* side of the same lock —
+    cannot write ClickHouse while a schema change is in flight. A table-rebuild migration (0005's
+    copy → swap → drop of ``feedback_transitions``) must have no concurrent ClickHouse writer, or a
+    row inserted into the old table between the copy and the swap would be dropped. The exclusive
+    acquisition blocks until any in-flight export drains (writer preference), then proceeds. An
+    altered applied checksum is still refused. Requires an initialized control plane (the commit
+    lock lives under its control dir).
+
+    NOTE: this fence holds only because ``storage export`` is the SOLE production ClickHouse writer
+    and it delivers under ``barrier.shared()``. ANY future ClickHouse writer MUST likewise take the
+    shared side of this same commit lock, or it could race a migration and lose data.
+    """
+
+    paths = _resolve_paths(state)
+    _require_installation_id(paths)  # the commit lock lives under an initialized control dir
     database, client = _storage_client(state)
+    barrier = GlobalCommitBarrier(
+        paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
+    )
     try:
-        result = storage.migrate(
-            client, database, now=SystemClock().now(), milhouse_version=__version__
-        )
+        with barrier.exclusive():
+            result = storage.migrate(
+                client, database, now=SystemClock().now(), milhouse_version=__version__
+            )
     except storage.StorageError as error:
         raise StorageCommandError(error) from None
     finally:
@@ -504,44 +543,146 @@ def storage_migrate_command(state: CliState, as_json: bool) -> None:
 @click.option("--json", "as_json", is_flag=True, help="Emit the result as stable JSON.")
 @click.pass_context
 def storage_export_command(context: click.Context, as_json: bool) -> None:
-    """Export committed spool records into the ClickHouse store (idempotent for deduped records)."""
+    """Deliver committed spool segments to ClickHouse through the exactly-once delivery ledger.
+
+    The export drives the spool's G03-certified :func:`~milhouse.spooling.replay.replay_segments`
+    machine — the proven double-replay recovery shape — over the ``clickhouse`` delivery ledger, so
+    a run is a full drain of every committed segment. A not-yet-delivered segment (``pending`` OR a
+    prior run's ``failed``) is trusted-read, forwarded once through
+    :class:`~milhouse.storage.delivery.ClickHouseExporter`, and checkpointed ``delivered`` under one
+    compare-and-set; an already-``delivered`` segment is an idempotent no-op — re-read and
+    re-verified against its ledger row, but never re-inserted (no duplicate ``records`` row, no
+    appended ``feedback_transitions`` row). A re-run therefore recovers a segment whose delivery
+    failed during an outage while leaving delivered segments untouched. A segment that still ends
+    the pass ``failed`` is not in ClickHouse, so the export is incomplete — surfaced loudly on
+    stderr with a non-zero exit rather than reported as a full success. A committed segment with no
+    ``clickhouse`` delivery obligation (its ``required_exporters`` omit clickhouse) is likewise not
+    in ClickHouse: it is reported as ``unhandled`` and the export is incomplete (non-zero exit) too.
+    The reported ``records`` count is CONFIRMED egress only — segments ``delivered`` this pass or
+    ``already_delivered`` before — so a ``failed`` / ``expired`` / ``unhandled`` segment (each
+    surfaced by its own count) never inflates it.
+    """
 
     state = context.ensure_object(CliState)
     paths = _resolve_paths(state)
     installation_id = _require_installation_id(paths)
-    scan = views.read_trusted_records(paths, installation_id)
-    database, client = _storage_client(state)
+    control = open_control_database(bootstrap.database_path(paths))
     try:
-        summary = storage.export_records(client, database, scan.records)
-    except storage.StorageError as error:
-        raise StorageCommandError(error) from None
+        database, client = _storage_client(state)
+        try:
+            barrier = GlobalCommitBarrier(
+                paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
+            )
+            report = replay_segments(
+                control,
+                barrier,
+                spool_root=paths.spool,
+                installation_id=installation_id,
+                exporters={
+                    storage.CLICKHOUSE_EXPORTER_ID: storage.ClickHouseExporter(client, database)
+                },
+                now=SystemClock().now(),
+                # Drain ALL committed segments, not only ``pending``: the delivery ledger's CAS
+                # makes an already-``delivered`` segment an idempotent no-op, and this is the only
+                # scope that ALSO retries a segment left ``failed`` by an earlier ClickHouse outage
+                # — the core G04b recovery property. This is the proven G03 double-replay shape.
+                # Cost: delivered-but-unpruned segments are re-read each run; it is bounded because
+                # retention prunes delivered segments, and a future "not-delivered" (pending OR
+                # failed) ledger filter could avoid the re-read (follow-up optimization).
+                delivery_status=None,
+            )
+            # A committed segment with no ``clickhouse`` delivery attempt (its required_exporters
+            # omit clickhouse, e.g. an empty set or only a different destination) is drained but
+            # never forwarded here — it is not in ClickHouse. Identify those, and scope the reported
+            # record count to CONFIRMED egress only. Read per-segment counts while control is open.
+            clickhouse_attempts = [
+                attempt
+                for attempt in report.delivery_attempts
+                if attempt.exporter_id == storage.CLICKHOUSE_EXPORTER_ID
+            ]
+            handled_batches = {attempt.batch_id for attempt in clickhouse_attempts}
+            unhandled_batches = tuple(
+                batch_id for batch_id in report.segments if batch_id not in handled_batches
+            )
+            # ``records`` counts only segments whose clickhouse delivery is CONFIRMED in the store —
+            # ``delivered`` this pass or ``already_delivered`` on a prior one. A ``failed`` (retry-
+            # eligible, not yet written), ``expired`` (withheld), or ``unhandled`` segment is NOT
+            # confirmed egress and is excluded, so the count never overstates the store. Those
+            # segments are surfaced by their own separate counts and stderr notes.
+            confirmed_batches = {
+                attempt.batch_id
+                for attempt in clickhouse_attempts
+                if attempt.outcome in ("delivered", "already_delivered")
+            }
+            record_counts = {
+                record.batch_id: record.record_count for record in list_segment_records(control)
+            }
+            confirmed_records = sum(
+                record_counts.get(batch_id, 0)
+                for batch_id in report.segments
+                if batch_id in confirmed_batches
+            )
+        except (storage.StorageError, SpoolError) as error:
+            raise StorageExportError(error) from None
+        finally:
+            client.close()
     finally:
-        client.close()
+        control.close()
+
+    outcomes = Counter(attempt.outcome for attempt in report.delivery_attempts)
+    delivered = outcomes["delivered"]
+    already_delivered = outcomes["already_delivered"]
+    failed = outcomes["failed"]
+    expired = outcomes["expired"]
+    unhandled = len(unhandled_batches)
     if as_json:
         click.echo(
             json.dumps(
                 {
-                    "records": summary.records,
-                    "feedback_items": summary.feedback_items,
-                    "feedback_transitions": summary.feedback_transitions,
-                    "skipped_segments": list(scan.skipped),
+                    "already_delivered": already_delivered,
+                    "delivered": delivered,
+                    "expired": expired,
+                    "failed": failed,
+                    "records": confirmed_records,
+                    "segments": len(report.segments),
+                    "unhandled": unhandled,
                 },
                 sort_keys=True,
             )
         )
     else:
         click.echo(
-            f"export: records={summary.records} feedback_items={summary.feedback_items} "
-            f"feedback_transitions={summary.feedback_transitions} "
-            f"skipped_segments={len(scan.skipped)}"
+            f"export: segments={len(report.segments)} records={confirmed_records} "
+            f"delivered={delivered} already_delivered={already_delivered} "
+            f"failed={failed} expired={expired} unhandled={unhandled}"
         )
-    if scan.skipped:
-        # A committed segment that fails the trusted read is fail-closed (never exported), but the
-        # export is then INCOMPLETE — surface it loudly and non-zero rather than imply full success.
+    if expired:
+        # An expired segment is withheld (privacy-correct — records past their hard privacy expiry
+        # must never egress) but is therefore NOT in ClickHouse. That is not an error (only a
+        # ``failed`` or ``unhandled`` segment forces a non-zero exit), but it must be observable.
         click.echo(
-            f"WARNING: {len(scan.skipped)} committed segment(s) unreadable; export incomplete",
+            f"NOTE: {expired} segment(s) withheld — records reached their privacy expiry "
+            "before delivery and were not exported",
             err=True,
         )
+    if unhandled:
+        # A committed segment with no clickhouse delivery obligation is drained but NOT in
+        # ClickHouse, so an export/rebuild over it is INCOMPLETE — surface it and exit non-zero.
+        # This blanket non-zero exit is correct while ``clickhouse`` is the ONLY exporter id: an
+        # unhandled segment is genuinely missing from the store. FOLLOW-UP: once a second real
+        # exporter exists, ``storage export`` should distinguish "no clickhouse obligation"
+        # (informational, exit 0 — that segment was never meant for ClickHouse) from "failed
+        # clickhouse delivery" (exit 1), rather than treating both as incomplete here.
+        click.echo(
+            f"NOTE: {unhandled} committed segment(s) had no clickhouse delivery obligation "
+            "and were not exported; export incomplete",
+            err=True,
+        )
+    if failed:
+        # A segment whose delivery raised is retryable but NOT yet in ClickHouse, so this export is
+        # INCOMPLETE — surface it loudly and non-zero rather than imply a full success.
+        click.echo(f"WARNING: {failed} segment delivery(ies) failed; export incomplete", err=True)
+    if failed or unhandled:
         context.exit(1)
 
 

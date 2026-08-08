@@ -86,8 +86,8 @@ def test_live_fresh_migrate_status_idempotent_and_checksum_enforcement() -> None
         assert plan(client, _SMOKE_DB).current_version == 0  # fresh deployment
 
         result = migrate(client, _SMOKE_DB, now=datetime.now(UTC), milhouse_version="live-smoke")
-        assert result.current_version == 4  # migrated to the full schema
-        assert status(client, _SMOKE_DB).current_version == 4  # status reports it
+        assert result.current_version == 5  # migrated to the full schema
+        assert status(client, _SMOKE_DB).current_version == 5  # status reports it
 
         again = migrate(client, _SMOKE_DB, now=datetime.now(UTC), milhouse_version="live-smoke")
         assert again.applied_now == ()  # idempotent
@@ -160,6 +160,21 @@ def test_live_export_round_trips_records_and_derives_feedback_state() -> None:
         feedback = {row.item_id: row for row in fetch_current_feedback(client, _SMOKE_DB)}
         assert feedback["feedback-1"].current_state == "accepted"  # argMax over the locked order
         assert feedback["feedback-1"].current_revision == 1
+
+        # G04b / E06 owner-host evidence (live only): the re-export above re-inserted the same
+        # transition, so feedback_transitions physically holds two rows for it. Migration 0005
+        # recreated the table as ReplacingMergeTree(item_id, transition_id), so a merge collapses
+        # them to ONE physical row — the terminal proof 0005 de-dups a redelivered transition (the
+        # at-least-once retry / concurrent-drain cost). This can only run against a real ClickHouse
+        # (the offline fake models no merges), and it also proves 0005's EXCHANGE TABLES swap ran on
+        # the deployment's table engine — a fresh migrate above would have failed otherwise.
+        client.command(f"OPTIMIZE TABLE {_SMOKE_DB}.feedback_transitions FINAL")
+        collapsed = client.query(
+            f"SELECT count() FROM {_SMOKE_DB}.feedback_transitions FINAL "
+            "WHERE transition_id = {tid:String}",
+            parameters={"tid": transition.data.transition_id},
+        )
+        assert int(collapsed[0][0]) == 1  # the redelivered transition collapsed to one physical row
     finally:
         client.command(f"DROP DATABASE IF EXISTS {_SMOKE_DB}")
         client.close()

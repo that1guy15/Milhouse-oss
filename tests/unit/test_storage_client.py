@@ -37,9 +37,17 @@ class _FakeDriver:
     def query(self, statement: str, *, parameters: Any = None) -> Any:
         raise AssertionError("not used")
 
-    def insert(self, *, table: str, data: Any, column_names: Any, database: str) -> None:
+    def insert(
+        self, *, table: str, data: Any, column_names: Any, database: str, settings: Any = None
+    ) -> None:
         self.inserts.append(
-            {"table": table, "data": data, "column_names": column_names, "database": database}
+            {
+                "table": table,
+                "data": data,
+                "column_names": column_names,
+                "database": database,
+                "settings": settings,
+            }
         )
 
     def close(self) -> None:
@@ -193,8 +201,22 @@ def test_insert_transmits_rows_as_native_column_data(monkeypatch: pytest.MonkeyP
             "data": [["a", 1], ["b", 2]],
             "column_names": ["name", "n"],
             "database": "milhouse",
+            "settings": {"async_insert": 0, "wait_for_async_insert": 1},
         }
     ]
+
+
+def test_insert_pins_synchronous_insert_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Synchronous, fully-acknowledged inserts (async_insert=0, wait_for_async_insert=1) are pinned
+    # so an acknowledged row is durably visible before the commit barrier releases — the migrate
+    # fence relies on it. Prove the client forwards them, overriding any server async default.
+    driver = _FakeDriver()
+    monkeypatch.setattr("clickhouse_connect.get_client", lambda **kw: driver)
+    client = build_client(_config(), _secrets())
+
+    client.insert("milhouse", "records", [("a", 1)], column_names=("name", "n"))
+
+    assert driver.inserts[0]["settings"] == {"async_insert": 0, "wait_for_async_insert": 1}
 
 
 def test_insert_skips_an_empty_batch_without_opening_a_socket(
@@ -211,7 +233,9 @@ def test_insert_skips_an_empty_batch_without_opening_a_socket(
 
 def test_insert_wraps_a_driver_error(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Boom(_FakeDriver):
-        def insert(self, *, table: str, data: Any, column_names: Any, database: str) -> None:
+        def insert(
+            self, *, table: str, data: Any, column_names: Any, database: str, settings: Any = None
+        ) -> None:
             raise RuntimeError("driver failure")
 
     monkeypatch.setattr("clickhouse_connect.get_client", lambda **kw: _Boom())
