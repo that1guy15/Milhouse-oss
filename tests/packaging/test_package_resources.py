@@ -21,6 +21,13 @@ def test_typed_resource_inventory_is_installed() -> None:
         "storage/migrations/0002_records.sql",
         "storage/migrations/0003_feedback.sql",
         "storage/migrations/0004_views.sql",
+        "storage/migrations/0005_feedback_transition_dedup.sql",
     }
-    for migration in ("0001_core", "0002_records", "0003_feedback", "0004_views"):
+    for migration in (
+        "0001_core",
+        "0002_records",
+        "0003_feedback",
+        "0004_views",
+        "0005_feedback_transition_dedup",
+    ):
         assert package_root.joinpath("storage", "migrations", f"{migration}.sql").is_file()

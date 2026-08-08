@@ -9,11 +9,22 @@ resolve. Rows are transmitted as native column data through :meth:`ClickHouseCli
 interpolated into SQL, so untrusted free-text fields (name, title, rationale) cannot form a
 statement.
 
-Writes are idempotent for the deduplicating ``records`` table (``ReplacingMergeTree`` on
-``ingested_at`` collapses a re-export of the same ``record_id``). ``feedback_transitions`` is an
-append-only ``MergeTree``; re-exporting the same transition writes a duplicate row, which does not
-change the ``feedback_current`` derivation (``argMax`` / ``max`` over the locked total order) but
-does cost storage until the delivery ledger tracks per-segment export state (a later increment).
+Every projection deduplicates a re-export: ``records`` (``ReplacingMergeTree`` on ``ingested_at``)
+collapses a re-inserted ``record_id``, ``feedback_items`` collapses on ``item_id``, and
+``feedback_transitions`` collapses on the deterministic, globally-unique ``transition_id`` —
+migration 0005 recreated it as a ``ReplacingMergeTree`` (``ORDER BY (item_id, transition_id)``),
+closing the one table a plain ``MergeTree`` left non-idempotent. So a re-export changes no logical
+state (``feedback_current`` derives via ``argMax`` / ``max`` over the locked total order) and leaves
+no lasting duplicate row. The production ``storage export`` path drives :func:`export_records`
+through the segment delivery ledger (:class:`~milhouse.storage.delivery.ClickHouseExporter` under
+:func:`~milhouse.spooling.exporter.deliver_segment` /
+:func:`~milhouse.spooling.replay.replay_segments`), whose fenced compare-and-set makes delivery
+*logically* exactly-once: it reports one delivery per segment and skips a segment already
+``delivered`` (re-inserting nothing). It is not a distributed lock, so at-least-once delivery still
+holds — an interrupted retry (a crash after the ClickHouse write but before the ledger checkpoint)
+or two concurrent drains DO write a transient duplicate ``feedback_transitions`` row. That physical
+duplicate is exactly what the 0005 ``ReplacingMergeTree`` collapses on merge, so the logical state
+is unchanged either way.
 """
 
 from __future__ import annotations
