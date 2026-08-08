@@ -21,6 +21,7 @@ _MIGRATION_FILES: tuple[tuple[int, str, str], ...] = (
     (2, "records", "0002_records.sql"),
     (3, "feedback", "0003_feedback.sql"),
     (4, "views", "0004_views.sql"),
+    (5, "feedback_transition_dedup", "0005_feedback_transition_dedup.sql"),
 )
 
 

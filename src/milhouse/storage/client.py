@@ -155,6 +155,15 @@ class ConnectedClickHouseClient:
         *,
         column_names: Sequence[str],
     ) -> None:
+        """Insert ``rows`` synchronously (``async_insert=0``, ``wait_for_async_insert=1``).
+
+        Synchronous, fully-acknowledged inserts are load-bearing for the commit-barrier fence: an
+        acknowledged row must be durably visible before the shared barrier releases, so a concurrent
+        ``storage migrate`` (holding the exclusive side) sees it in its ``INSERT ... SELECT`` copy
+        and never drops it in a table rebuild. A server/profile ``async_insert=1`` default would ACK
+        before visibility and reopen that race, so it is pinned off here regardless of deployment.
+        """
+
         if not rows:
             return  # nothing to write; avoid a driver round-trip on an empty batch
         try:
@@ -163,6 +172,7 @@ class ConnectedClickHouseClient:
                 data=[list(row) for row in rows],
                 column_names=list(column_names),
                 database=database,
+                settings={"async_insert": 0, "wait_for_async_insert": 1},
             )
         except Exception as error:
             raise StorageError("MH_STORAGE_CLIENT", "a ClickHouse insert failed") from error

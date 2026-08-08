@@ -7,6 +7,7 @@ from milhouse.storage.client import (
     ConnectedClickHouseClient,
     build_client,
 )
+from milhouse.storage.delivery import CLICKHOUSE_EXPORTER_ID, ClickHouseExporter
 from milhouse.storage.errors import StorageError
 from milhouse.storage.exporter import ExportSummary, export_records
 from milhouse.storage.repository import (
@@ -26,8 +27,10 @@ from milhouse.storage.runner import (
 from milhouse.storage.schema import CLICKHOUSE_MIGRATIONS, StorageMigration
 
 __all__ = [
+    "CLICKHOUSE_EXPORTER_ID",
     "CLICKHOUSE_MIGRATIONS",
     "ClickHouseClient",
+    "ClickHouseExporter",
     "ConnectedClickHouseClient",
     "ExportSummary",
     "FeedbackStateRow",
