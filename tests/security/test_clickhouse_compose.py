@@ -3,7 +3,9 @@
 Statically verifies the hardening contract without starting a container: loopback-only ports, an
 exact digest pin on the 26.3 line, a dedicated non-empty credential from the environment (no
 committed secret and no unauthenticated `default` account), the mounted users.d default-account
-lock, a health check, and resource guidance.
+lock, a health check, and resource guidance. It also verifies the native-backup provisioning
+(W04 G04b): the read-only config.d backups-disk declaration and the durable backup volume kept
+separate from the data volume.
 """
 
 from __future__ import annotations
@@ -77,3 +79,38 @@ def test_env_example_commits_no_secret() -> None:
         stripped = line.strip()
         if stripped.startswith("MILHOUSE_") and "PASSWORD" in stripped:
             assert stripped.endswith("="), stripped
+
+
+def test_config_d_is_mounted_read_only_and_declares_the_backups_disk() -> None:
+    # Native BACKUP/RESTORE (W04 G04b) needs a `backups` disk that ClickHouse both KNOWS and allows;
+    # config.d/backups.xml must declare it, and be mounted read-only so the container cannot mutate
+    # the provisioning. This adds a capability check WITHOUT relaxing any hardening assertion above.
+    volumes = [str(volume) for volume in _service()["volumes"]]
+    assert any("config.d" in volume and volume.endswith(":ro") for volume in volumes), (
+        "config.d must be mounted read-only"
+    )
+
+    root = ElementTree.fromstring((_OPS / "config.d" / "backups.xml").read_text(encoding="utf-8"))
+    disk = root.find("./storage_configuration/disks/backups")
+    assert disk is not None, "the backups disk must be declared"
+    assert (disk.findtext("./type") or "").strip() == "local"
+    assert (disk.findtext("./path") or "").strip() == "/var/lib/clickhouse/backups/"
+    # Declaring the disk is not enough: it must be allow-listed for backups or BACKUP/RESTORE fails.
+    allowed = [(entry.text or "").strip() for entry in root.findall("./backups/allowed_disk")]
+    assert "backups" in allowed
+
+
+def test_backups_volume_is_durable_and_separate_from_the_data_volume() -> None:
+    # The backup archive must survive a data-volume reset, so it lives on its OWN durable named
+    # volume mounted at the disk path — never inside clickhouse-data and never a host bind mount.
+    service = _service()
+    volumes = [str(volume) for volume in service["volumes"]]
+    assert "clickhouse-backups:/var/lib/clickhouse/backups" in volumes
+    assert "clickhouse-data:/var/lib/clickhouse" in volumes  # still present, unchanged
+
+    compose = yaml.safe_load((_OPS / "docker-compose.yml").read_text(encoding="utf-8"))
+    named_volumes = compose["volumes"]
+    assert (
+        "clickhouse-backups" in named_volumes
+    )  # a top-level named volume, persists across recreate
+    assert "clickhouse-data" in named_volumes

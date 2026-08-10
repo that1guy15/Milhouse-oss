@@ -33,6 +33,32 @@ $ milhouse --config ./config.toml storage status    # read-only: applied vs pend
 $ milhouse --config ./config.toml storage migrate    # apply the packaged migrations
 ```
 
+## Back up and restore (native BACKUP/RESTORE)
+
+This deployment provisions a ClickHouse `backups` disk in `config.d/backups.xml` (declared under
+`storage_configuration` and allow-listed under `<backups>`), backed by the durable
+`clickhouse-backups` named volume mounted at `/var/lib/clickhouse/backups`. It is kept **separate
+from the data volume**, so `docker compose down -v` (which resets `clickhouse-data`) does not delete
+your backups. Without this disk, `storage backup` / `storage restore` fail with `Disk backups does
+not exist`.
+
+```console
+$ milhouse --config ./config.toml storage backup nightly_2026_08_10     # native BACKUP DATABASE
+$ milhouse --config ./config.toml storage restore nightly_2026_08_10     # RESTORE into an EMPTY db
+```
+
+- **Restore targets an empty database.** A native `RESTORE DATABASE` rejects a non-empty target, so
+  `storage restore` refuses (issuing no drop and no restore) if the analytical database already holds
+  a schema. Restore into a clean/fresh state root, or after intentionally dropping the lost database.
+  In-place **overwrite with rollback is deferred to W16** — this command never overwrites live data.
+- **Retention and permissions.** The `backups` volume grows with each archive; rotate and remove old
+  archives on your own schedule (there is no automatic pruning here). The directory is written by the
+  ClickHouse server user inside the container and is loopback-only — never exposed off-host. Treat
+  the backup volume with the same restrictive, owner-only permissions and off-device-encryption
+  guidance as any state backup (plan section 10.3); it can contain analytical record metadata.
+- The composite SQLite control-state + spool + manifest backup (and verified clean-host restore
+  drill) is **W16**; this is only the ClickHouse-side native backup.
+
 ## Opt-in live smoke (G04a evidence)
 
 The offline test suite runs in CI. The **live** G04a checks (anonymous access fails, authenticated

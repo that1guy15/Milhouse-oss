@@ -404,6 +404,23 @@ class StorageExportError(click.ClickException):
         super().__init__(str(error))
 
 
+class StorageRestoreError(click.ClickException):
+    """A stable ``storage restore`` failure using the CLI contract's exit code 1.
+
+    Restore spans two fail-closed layers — the native ClickHouse round-trip/verification
+    (``MH_STORAGE_*``) and the cross-store reconciliation over the spool delivery ledger
+    (``MH_SPOOL_*`` when a durable segment or the ledger cannot be read) — so, like its
+    :class:`StorageExportError` sibling, it accepts either coded error and preserves the machine
+    code. A verification or reconciliation mismatch surfaces as ``MH_STORAGE_RESTORE`` and exit 1.
+    """
+
+    exit_code = 1
+
+    def __init__(self, error: SpoolError | storage.StorageError) -> None:
+        self.code = error.code
+        super().__init__(str(error))
+
+
 def _storage_client(state: CliState) -> tuple[str, storage.ConnectedClickHouseClient]:
     config, paths = _resolve_config(state)
     clickhouse = config.storage.clickhouse
@@ -536,6 +553,154 @@ def storage_migrate_command(state: CliState, as_json: bool) -> None:
         f"migrate: applied {len(result.applied_now)} migration(s) "
         f"({len(result.already_applied)} already applied); "
         f"schema at version {result.current_version}"
+    )
+
+
+@storage_group.command(name="backup")
+@click.argument("destination")
+@click.option("--json", "as_json", is_flag=True, help="Emit the result as stable JSON.")
+@click.pass_obj
+def storage_backup_command(state: CliState, destination: str, as_json: bool) -> None:
+    """Create a native ClickHouse backup of the analytical database under the exclusive commit lock.
+
+    The whole operation runs while THIS installation's control-plane commit barrier is held
+    EXCLUSIVELY (plan section 10.3: retention, migration, restore, and another backup are blocked
+    for its duration), so no ``storage export`` writer can mutate ClickHouse mid-backup — the same
+    fence ``storage migrate`` takes. It records the source snapshot (record-id set + migration
+    state) that a later restore is verified against, then issues a native ``BACKUP DATABASE`` to the
+    configured backup disk. Requires an initialized control plane (the commit lock lives under its
+    control dir). Emits the captured fingerprint; exit non-zero with a coded error on failure.
+
+    OFFLINE/LIVE boundary: this increment wires and unit-tests the barrier fence, the validated
+    statement, and the fingerprint. The REAL native ``BACKUP`` round-trip and its physical fidelity
+    are host-gated (E06) and are not asserted here; the composite SQLite+manifest backup is W16.
+    """
+
+    paths = _resolve_paths(state)
+    _require_installation_id(paths)  # the commit lock lives under an initialized control dir
+    database, client = _storage_client(state)
+    barrier = GlobalCommitBarrier(
+        paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
+    )
+    try:
+        with barrier.exclusive():
+            snapshot = storage.snapshot_state(client, database)
+            client.command(storage.backup_statement(database, destination))
+    except storage.StorageError as error:
+        raise StorageCommandError(error) from None
+    finally:
+        client.close()
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "database": database,
+                    "destination": destination,
+                    "migration_version": snapshot.migration_version,
+                    "record_count": len(snapshot.record_ids),
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    click.echo(
+        f"backup: database={database} destination={destination} "
+        f"schema_version={snapshot.migration_version} records={len(snapshot.record_ids)}"
+    )
+
+
+@storage_group.command(name="restore")
+@click.argument("source")
+@click.option("--json", "as_json", is_flag=True, help="Emit the result as stable JSON.")
+@click.pass_context
+def storage_restore_command(context: click.Context, source: str, as_json: bool) -> None:
+    """Restore a native ClickHouse backup into an EMPTY analytical database, then reconcile.
+
+    A clean disaster-recovery restore under the EXCLUSIVE commit barrier (plan section 10.3), so
+    nothing writes SQLite or ClickHouse during it. A native ``RESTORE DATABASE`` rejects a non-empty
+    target, so the analytical database must be EMPTY or absent — lost to a disaster, or a fresh
+    state root. If it already holds a schema the restore ABORTS with ``MH_STORAGE_RESTORE`` and
+    issues NEITHER a drop NOR a restore — nothing destructive runs. Overwriting an existing database
+    (verify source, restore into staging, validate, then cut over with rollback) is deferred to W16;
+    there is no in-place overwrite here.
+
+    After the native ``RESTORE`` it fails closed unless BOTH hold: (a) the restored ``_migrations``
+    ledger is checksum-consistent and at the current defined schema head (via the read-only
+    :func:`~milhouse.storage.runner.status`, which refuses a tampered ledger) — so a restore that
+    brought no or a stale schema is rejected; and (b) a BOUNDED cross-store reconcile
+    (``reconcile_delivered``) — every spool segment the surviving SQLite ledger marks ``delivered``
+    to ``clickhouse`` has all of its record ids PRESENT in the restored store (a subset check, not
+    full record-id-set equality — that stricter proof needs the W16 backup manifest).
+    Feedback-state parity is deferred to G16. Requires an initialized control plane; any mismatch
+    exits non-zero with the fixed ``MH_STORAGE_RESTORE`` code.
+
+    OFFLINE/LIVE boundary: this proves the barrier fence, the empty-target guard, the statements,
+    the schema-validity + bounded-reconcile wiring, and the exit codes offline against a fake
+    client and a real spool ledger. The REAL native ``BACKUP``/``RESTORE`` round-trip, its
+    physical/merge/TTL fidelity, and version compatibility are host-gated (E06); this increment does
+    not claim G04b passed.
+    """
+
+    state = context.ensure_object(CliState)
+    paths = _resolve_paths(state)
+    installation_id = _require_installation_id(paths)
+    control = open_control_database(bootstrap.database_path(paths))
+    try:
+        database, client = _storage_client(state)
+        try:
+            barrier = GlobalCommitBarrier(
+                paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
+            )
+            with barrier.exclusive():
+                # A native RESTORE DATABASE rejects a non-empty target, and this command never drops
+                # or overwrites live data (that is W16). A present schema (any applied migration)
+                # means the analytical tables exist, so abort before issuing ANY statement.
+                if storage.status(client, database).current_version != 0:
+                    raise storage.StorageError(
+                        "MH_STORAGE_RESTORE",
+                        "the analytical database is not empty; restore into a clean database "
+                        "(overwriting an existing database is deferred to W16)",
+                    )
+                client.command(storage.restore_statement(database, source))
+                # The restore must have brought a checksum-consistent schema at the current defined
+                # head; status() refuses a tampered ledger, and an empty/stale restore fails here.
+                restored_plan = storage.status(client, database)
+                head = max((entry.version for entry in restored_plan.states), default=0)
+                if head == 0 or restored_plan.current_version != head:
+                    raise storage.StorageError(
+                        "MH_STORAGE_RESTORE",
+                        "the restore did not bring the current analytical schema",
+                    )
+                restored = storage.snapshot_state(client, database)
+                storage.reconcile_delivered(
+                    control,
+                    restored,
+                    spool_root=paths.spool,
+                    installation_id=installation_id,
+                )
+        except (storage.StorageError, SpoolError) as error:
+            raise StorageRestoreError(error) from None
+        finally:
+            client.close()
+    finally:
+        control.close()
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "database": database,
+                    "migration_version": restored.migration_version,
+                    "reconciled": True,
+                    "record_count": len(restored.record_ids),
+                    "source": source,
+                },
+                sort_keys=True,
+            )
+        )
+        return
+    click.echo(
+        f"restore: database={database} source={source} reconciled=True "
+        f"schema_version={restored.migration_version} records={len(restored.record_ids)}"
     )
 
 

@@ -575,3 +575,195 @@ def test_cli_storage_feedback_empty(
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "feedback"])
     assert result.exit_code == 0
     assert "no feedback items" in result.output
+
+
+def _migrate_and_export_one_delivered(config: Path) -> None:
+    # demo commits one pending clickhouse segment; migrate advances the fake ledger to head; export
+    # delivers that segment to the fake and marks the SQLite ledger delivered. Leaves the fake with
+    # one records row and a real delivered-to-clickhouse ledger entry for backup/restore to use.
+    _spool_one_pending_segment(config)
+    assert CliRunner().invoke(main, ["--config", str(config), "storage", "migrate"]).exit_code == 0
+    assert CliRunner().invoke(main, ["--config", str(config), "storage", "export"]).exit_code == 0
+
+
+def test_cli_storage_backup_then_dr_restore_into_empty_db(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # The disaster-recovery happy path: back up, LOSE the analytical database, then restore it into
+    # the now-empty target. (This fails against the old before-reference wiring, which snapshotted
+    # the empty pre-restore DB as its baseline and false-failed the restore.)
+    config = _config(tmp_path)
+    _migrate_and_export_one_delivered(config)
+
+    backup = CliRunner().invoke(
+        main, ["--config", str(config), "storage", "backup", "backup_one", "--json"]
+    )
+    assert backup.exit_code == 0
+    assert _json_payload(backup.output) == {
+        "database": "milhouse",
+        "destination": "backup_one",
+        "migration_version": 5,
+        "record_count": 1,
+    }
+    assert any(command.startswith("BACKUP DATABASE milhouse") for command in _stub.commands)
+
+    # Disaster: the analytical database is lost. RESTORE into the empty target succeeds.
+    _stub.command("DROP DATABASE IF EXISTS milhouse")
+    restore = CliRunner().invoke(
+        main, ["--config", str(config), "storage", "restore", "backup_one", "--json"]
+    )
+    assert restore.exit_code == 0
+    assert _json_payload(restore.output) == {
+        "database": "milhouse",
+        "migration_version": 5,
+        "reconciled": True,
+        "record_count": 1,
+        "source": "backup_one",
+    }
+    assert any(command.startswith("RESTORE DATABASE milhouse") for command in _stub.commands)
+
+    _stub.command("DROP DATABASE IF EXISTS milhouse")  # empty again for the text-mode assertion
+    text = CliRunner().invoke(main, ["--config", str(config), "storage", "restore", "backup_one"])
+    assert text.exit_code == 0
+    assert "restore: database=milhouse source=backup_one reconciled=True" in text.output
+
+
+def test_cli_storage_restore_over_non_empty_aborts_without_touching_data(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # A native RESTORE DATABASE rejects a non-empty target, and this command NEVER drops or
+    # overwrites live data (overwrite-with-rollback is W16). A restore over a populated DB must
+    # abort exit 1 with MH_STORAGE_RESTORE and issue NEITHER DROP NOR RESTORE — live data untouched.
+    config = _config(tmp_path)
+    _migrate_and_export_one_delivered(config)
+    assert (
+        CliRunner()
+        .invoke(main, ["--config", str(config), "storage", "backup", "backup_one"])
+        .exit_code
+        == 0
+    )
+
+    result = CliRunner().invoke(main, ["--config", str(config), "storage", "restore", "backup_one"])
+    assert result.exit_code == 1
+    assert "MH_STORAGE_RESTORE" in result.output
+    assert "not empty" in result.output
+    assert "deferred to W16" in result.output
+    assert not any(command.startswith("RESTORE DATABASE") for command in _stub.commands)
+    assert not any(command.startswith("DROP DATABASE") for command in _stub.commands)
+
+
+def test_cli_storage_restore_reconcile_mismatch_is_fail_closed_and_nonzero(
+    tmp_path: Path, _stub: FakeClickHouseClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # If reconciliation finds a delivered record id absent from the restored store, exit non-zero
+    # with MH_STORAGE_RESTORE. The target is emptied first so the restore proceeds to reconcile.
+    config = _config(tmp_path)
+    _migrate_and_export_one_delivered(config)
+    assert (
+        CliRunner()
+        .invoke(main, ["--config", str(config), "storage", "backup", "backup_one"])
+        .exit_code
+        == 0
+    )
+    _stub.command("DROP DATABASE IF EXISTS milhouse")  # empty target → restore proceeds
+
+    def _missing(control: object, restored: object, **kwargs: object) -> None:
+        raise root.storage.StorageError(
+            "MH_STORAGE_RESTORE",
+            "a clickhouse-delivered record id is absent from the restored store",
+        )
+
+    monkeypatch.setattr(root.storage, "reconcile_delivered", _missing)
+    result = CliRunner().invoke(main, ["--config", str(config), "storage", "restore", "backup_one"])
+    assert result.exit_code == 1
+    assert "MH_STORAGE_RESTORE" in result.output
+
+
+def test_cli_storage_restore_that_brings_no_current_schema_fails_closed(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # A restore that does not materialize the current schema (an unknown/empty archive) fails
+    # closed: the post-restore status reports no applied migrations, so the schema-validity check
+    # refuses it.
+    config = _config(tmp_path)
+    _init_paths(config)  # control plane only; the fake analytical DB is empty
+    result = CliRunner().invoke(
+        main, ["--config", str(config), "storage", "restore", "nonexistent"]
+    )
+    assert result.exit_code == 1
+    assert "MH_STORAGE_RESTORE" in result.output
+    assert "current analytical schema" in result.output
+    # The empty target let the native RESTORE run (no --force), but its result was rejected.
+    assert any(command.startswith("RESTORE DATABASE milhouse") for command in _stub.commands)
+
+
+def test_cli_storage_backup_is_fenced_by_the_exclusive_commit_barrier(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # Like storage migrate, storage backup must run its native BACKUP under the EXCLUSIVE commit
+    # barrier (plan 10.3), so it blocks while any shared hold (an in-flight export delivery) is
+    # active and issues no ClickHouse command until it acquires exclusive. The full "no writer
+    # during a REAL backup" proof is host-gated (E06); here we prove the mutual exclusion.
+    config = _config(tmp_path)
+    paths = _init_paths(config)
+    barrier = GlobalCommitBarrier(
+        paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
+    )
+    holding = threading.Event()
+    release = threading.Event()
+    backup_done = threading.Event()
+    captured: dict[str, object] = {}
+
+    def _hold_shared() -> None:
+        with barrier.shared():  # simulate an in-flight export holding the shared delivery side
+            holding.set()
+            release.wait(timeout=15)
+
+    def _run_backup() -> None:
+        captured["result"] = CliRunner().invoke(
+            main, ["--config", str(config), "storage", "backup", "backup_one"]
+        )
+        backup_done.set()
+
+    holder = threading.Thread(target=_hold_shared)
+    holder.start()
+    try:
+        assert holding.wait(timeout=10)
+        backer = threading.Thread(target=_run_backup)
+        backer.start()
+        try:
+            # While the shared hold is active, backup is blocked on exclusive() and runs no command.
+            assert not backup_done.wait(timeout=1.0)
+            assert _stub.commands == []
+            release.set()
+            assert backup_done.wait(timeout=10)
+        finally:
+            backer.join(timeout=10)
+    finally:
+        release.set()
+        holder.join(timeout=10)
+
+    result = captured["result"]
+    assert isinstance(result, Result)
+    assert result.exit_code == 0
+    assert "backup: database=milhouse destination=backup_one" in result.output
+
+
+def test_cli_storage_backup_requires_an_initialized_control_plane(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # backup fences under the control-plane commit barrier; without init it fails on the "not
+    # initialized" path, before any ClickHouse call.
+    config = _config(tmp_path)  # no _init_paths
+    result = CliRunner().invoke(main, ["--config", str(config), "storage", "backup", "backup_one"])
+    assert result.exit_code == 1
+    assert _stub.commands == []
+
+
+def test_cli_storage_restore_requires_an_initialized_control_plane(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    config = _config(tmp_path)  # no _init_paths
+    result = CliRunner().invoke(main, ["--config", str(config), "storage", "restore", "backup_one"])
+    assert result.exit_code == 1
+    assert _stub.commands == []

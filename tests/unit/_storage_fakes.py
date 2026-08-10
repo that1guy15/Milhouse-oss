@@ -1,9 +1,19 @@
-"""A typed in-memory fake ``ClickHouseClient`` for offline storage-runner/CLI tests.
+"""A typed in-memory fake ``ClickHouseClient`` for offline storage-runner/CLI/backup tests.
 
-It recognizes exactly the query/command shapes the runner emits — ``system.databases`` /
+It recognizes exactly the query/command shapes the storage layer emits — ``system.databases`` /
 ``system.tables`` existence probes, the ledger SELECT, ``CREATE DATABASE``/``CREATE TABLE``/
-``CREATE VIEW`` DDL, and the ledger ``INSERT`` — and records the resulting state, so the runner's
-ordering, checksum, and non-mutation logic can be exercised with no network.
+``CREATE VIEW`` DDL, the ledger ``INSERT``, the native ``BACKUP``/``RESTORE``/``DROP DATABASE``
+commands, and the raw ``SELECT record_id FROM <db>.records`` shape — and records the resulting
+state, so the runner's ordering/checksum/non-mutation logic AND the backup verification core can be
+exercised with no network.
+
+Backup fidelity is modelled only at the level of logical STATE — which databases/tables exist, the
+migration ledger rows, and the ``insert()`` calls (hence each ``records`` row's ``record_id``). A
+``BACKUP`` copies that per-database state onto an in-memory "disk" and a ``RESTORE`` REPLACES the
+database slice with a copied one (equivalent to the E06 live drill's ``DROP DATABASE`` +
+``RESTORE``, so a re-restore is faithful). It models NO merges, ``FINAL``, or TTL, so only record-id
+*set* equality and migration state are meaningful against it — never physical row fidelity, which is
+host-gated (E06).
 """
 
 from __future__ import annotations
@@ -17,16 +27,27 @@ _COUNT_TABLE = re.compile(
     r"SELECT count\(\) FROM system\.tables WHERE database = '([^']+)' AND name = '([^']+)'"
 )
 _LEDGER_SELECT = re.compile(r"SELECT version, name, checksum FROM (\w+)\._migrations FINAL")
+# ``\brecords\b`` matches the raw records table but NOT ``records_current`` (``_`` is a word
+# character, so no word boundary falls between ``records`` and ``_current``).
+_RECORD_IDS = re.compile(r"SELECT record_id FROM (\w+)\.records\b")
 _CREATE_DB = re.compile(r"CREATE DATABASE IF NOT EXISTS (\w+)")
 _CREATE_OBJ = re.compile(r"CREATE (?:TABLE|VIEW) IF NOT EXISTS (\w+)\.(\w+)")
 _INSERT = re.compile(
     r"INSERT INTO (\w+)\._migrations \([^)]*\) VALUES "
     r"\((\d+), '([^']*)', '([^']*)', '[^']*', '[^']*'\)"
 )
+_BACKUP = re.compile(r"BACKUP DATABASE (\w+) TO Disk\('\w+', '(\w+)'\)")
+_RESTORE = re.compile(r"RESTORE DATABASE (\w+) FROM Disk\('\w+', '(\w+)'\)")
+_DROP_DB = re.compile(r"DROP DATABASE (?:IF EXISTS )?(\w+)")
+
+# One database's captured state on the in-memory backup "disk".
+_DatabaseSnapshot = dict[str, Any]
+
+Insert = tuple[str, str, list[list[Any]], tuple[str, ...]]
 
 
 class FakeClickHouseClient:
-    """Records databases, tables, and ledger rows from the runner's statements."""
+    """Records databases, tables, ledger rows, and inserts from the storage layer's statements."""
 
     def __init__(self) -> None:
         self.databases: set[str] = set()
@@ -35,7 +56,9 @@ class FakeClickHouseClient:
         self.ledger: dict[str, dict[int, tuple[str, str]]] = {}
         self.commands: list[str] = []
         # every insert() call: (database, table, rows, column_names)
-        self.inserts: list[tuple[str, str, list[list[Any]], tuple[str, ...]]] = []
+        self.inserts: list[Insert] = []
+        # in-memory backup "disk": archive name -> captured per-database state
+        self.backups: dict[str, _DatabaseSnapshot] = {}
 
     def close(self) -> None:
         """Match the CLI's ``client.close()`` on the concrete client (no-op for the fake)."""
@@ -46,6 +69,32 @@ class FakeClickHouseClient:
         self.databases.add(database)
         self.tables.add((database, "_migrations"))
         self.ledger.setdefault(database, {})[version] = (name, checksum)
+
+    def _snapshot_database(self, database: str) -> _DatabaseSnapshot:
+        return {
+            "exists": database in self.databases,
+            "tables": {table for table in self.tables if table[0] == database},
+            "ledger": dict(self.ledger.get(database, {})),
+            "inserts": [row for row in self.inserts if row[0] == database],
+        }
+
+    def _drop_database(self, database: str) -> None:
+        self.databases.discard(database)
+        self.tables = {table for table in self.tables if table[0] != database}
+        self.ledger.pop(database, None)
+        self.inserts = [row for row in self.inserts if row[0] != database]
+
+    def _apply_snapshot(self, database: str, snapshot: _DatabaseSnapshot | None) -> None:
+        # RESTORE replaces the database slice with the backed-up one (drop, then re-materialize).
+        self._drop_database(database)
+        if snapshot is None:
+            return  # restoring an unknown archive materializes nothing (empty slice)
+        if snapshot["exists"]:
+            self.databases.add(database)
+        self.tables |= set(snapshot["tables"])
+        if snapshot["ledger"]:
+            self.ledger[database] = dict(snapshot["ledger"])
+        self.inserts.extend(snapshot["inserts"])
 
     def command(self, statement: str) -> None:
         self.commands.append(statement)
@@ -61,6 +110,18 @@ class FakeClickHouseClient:
         if insert is not None:
             db, version, name, checksum = insert.groups()
             self.ledger.setdefault(db, {})[int(version)] = (name, checksum)
+            return
+        backup = _BACKUP.search(statement)
+        if backup is not None:
+            self.backups[backup.group(2)] = self._snapshot_database(backup.group(1))
+            return
+        restore = _RESTORE.search(statement)
+        if restore is not None:
+            self._apply_snapshot(restore.group(1), self.backups.get(restore.group(2)))
+            return
+        drop = _DROP_DB.search(statement)
+        if drop is not None:
+            self._drop_database(drop.group(1))
 
     def insert(
         self,
@@ -88,4 +149,19 @@ class FakeClickHouseClient:
         if ledger is not None:
             rows = self.ledger.get(ledger.group(1), {})
             return [[version, name, checksum] for version, (name, checksum) in sorted(rows.items())]
+        record_ids = _RECORD_IDS.search(statement)
+        if record_ids is not None:
+            return [[value] for value in self._record_ids(record_ids.group(1))]
         raise AssertionError(f"unexpected query: {statement}")
+
+    def _record_ids(self, database: str) -> list[str]:
+        # Rebuild the raw ``records`` record-id column from the recorded ``records`` inserts (every
+        # physical row, no dedup/FINAL/TTL) — the offline stand-in for ``SELECT record_id FROM
+        # <db>.records``.
+        ids: list[str] = []
+        for db, table, rows, columns in self.inserts:
+            if db != database or table != "records" or "record_id" not in columns:
+                continue
+            index = list(columns).index("record_id")
+            ids.extend(str(row[index]) for row in rows)
+        return ids
