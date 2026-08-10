@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -39,12 +39,15 @@ from milhouse.storage import (
     StorageError,
     backup_statement,
     build_client,
+    claim,
     export_records,
     fetch_current_feedback,
     fetch_current_records,
     migrate,
     plan,
+    read_owner,
     reconcile_delivered,
+    require_owner,
     restore_statement,
     snapshot_state,
     status,
@@ -107,8 +110,8 @@ def test_live_fresh_migrate_status_idempotent_and_checksum_enforcement() -> None
         assert plan(client, _SMOKE_DB).current_version == 0  # fresh deployment
 
         result = migrate(client, _SMOKE_DB, now=datetime.now(UTC), milhouse_version="live-smoke")
-        assert result.current_version == 5  # migrated to the full schema
-        assert status(client, _SMOKE_DB).current_version == 5  # status reports it
+        assert result.current_version == 6  # migrated to the full schema
+        assert status(client, _SMOKE_DB).current_version == 6  # status reports it
 
         again = migrate(client, _SMOKE_DB, now=datetime.now(UTC), milhouse_version="live-smoke")
         assert again.applied_now == ()  # idempotent
@@ -263,7 +266,7 @@ def test_live_native_backup_restore_round_trips_and_reconciles(tmp_path: Path) -
         )
 
         source = snapshot_state(client, _SMOKE_DB)
-        assert source.migration_version == 5
+        assert source.migration_version == 6
         assert record.record_id in source.record_ids
 
         # Drive the real DR restore SEQUENCE the ``storage restore`` command performs (backup → DROP
@@ -289,4 +292,51 @@ def test_live_native_backup_restore_round_trips_and_reconciles(tmp_path: Path) -
         client.command(f"DROP DATABASE IF EXISTS {_SMOKE_DB}")
         if control is not None:
             control.close()
+        client.close()
+
+
+@_requires_live
+def test_live_installation_ownership_claims_and_rejects_a_cross_installation() -> None:
+    # The installation-ownership guard against a REAL ClickHouse: a fresh migrate provisions the
+    # ``_installation`` table, a claim stamps the owner, the same installation verifies, and a
+    # DIFFERENT installation is refused fail-closed for both a require-check and a claim — unless it
+    # deliberately reclaims, which supersedes the prior owner (ReplacingMergeTree(claimed_at)).
+    client = build_client(_config(), _secrets())
+    id_a = "mh_in1_" + "a" * 32
+    id_b = "mh_in1_" + "b" * 32
+    try:
+        client.command(f"DROP DATABASE IF EXISTS {_SMOKE_DB}")
+        now = datetime.now(UTC)
+        migrate(client, _SMOKE_DB, now=now, milhouse_version="live-smoke")
+        assert read_owner(client, _SMOKE_DB) is None  # migrated but unclaimed
+
+        claim(client, _SMOKE_DB, installation_id=id_a, now=now, milhouse_version="live-smoke")
+        assert read_owner(client, _SMOKE_DB) == id_a
+        require_owner(client, _SMOKE_DB, installation_id=id_a)  # the owner is admitted (no raise)
+        # A same-id re-claim is an idempotent no-op.
+        claim(client, _SMOKE_DB, installation_id=id_a, now=now, milhouse_version="live-smoke")
+        assert read_owner(client, _SMOKE_DB) == id_a
+
+        # A different installation is refused fail-closed on both the read barrier and a claim.
+        with pytest.raises(StorageError) as required:
+            require_owner(client, _SMOKE_DB, installation_id=id_b)
+        assert required.value.code == "MH_STORAGE_OWNERSHIP"
+        with pytest.raises(StorageError) as claimed:
+            claim(client, _SMOKE_DB, installation_id=id_b, now=now, milhouse_version="live-smoke")
+        assert claimed.value.code == "MH_STORAGE_OWNERSHIP"
+        assert read_owner(client, _SMOKE_DB) == id_a  # unchanged by the refused claim
+
+        # A deliberate --reclaim supersedes the prior owner; a strictly later claimed_at wins.
+        claim(
+            client,
+            _SMOKE_DB,
+            installation_id=id_b,
+            now=now + timedelta(seconds=1),
+            milhouse_version="live-smoke",
+            reclaim=True,
+        )
+        assert read_owner(client, _SMOKE_DB) == id_b
+        require_owner(client, _SMOKE_DB, installation_id=id_b)
+    finally:
+        client.command(f"DROP DATABASE IF EXISTS {_SMOKE_DB}")
         client.close()

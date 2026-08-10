@@ -10,10 +10,11 @@ class StorageError(MilhouseValueError):
 
     Codes: ``MH_STORAGE_MIGRATION`` (migration ledger/checksum/ordering), ``MH_STORAGE_CLIENT``
     (client construction or a driver fault), ``MH_STORAGE_CONFIG`` (missing/invalid storage config
-    or credentials), ``MH_STORAGE_BACKUP`` (native-backup snapshot or statement building), and
+    or credentials), ``MH_STORAGE_BACKUP`` (native-backup snapshot or statement building),
     ``MH_STORAGE_RESTORE`` (a restore-round-trip verification, cross-store reconciliation, or
-    restore statement building). The message never carries a secret, a credential, a raw driver
-    payload, or a machine-local path.
+    restore statement building), and ``MH_STORAGE_OWNERSHIP`` (a ClickHouse destination is owned by
+    another installation, or is unclaimed, when a single-owner claim or write was required). The
+    message never carries a secret, a credential, a raw driver payload, or a machine-local path.
     """
 
     def __init__(self, code: str, message: str) -> None:

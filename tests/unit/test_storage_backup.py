@@ -63,7 +63,7 @@ from milhouse.storage import (
 
 _DB = "milhouse"
 _GENERATION = "a" * 64
-_FULL_SCHEMA = frozenset({1, 2, 3, 4, 5})
+_FULL_SCHEMA = frozenset({1, 2, 3, 4, 5, 6})
 
 
 # --- backup/restore round-trip over the fake (state-level fidelity) ---
@@ -76,7 +76,7 @@ def test_backup_restore_round_trip_matches_record_ids_and_migration_state() -> N
     export_records(fake, _DB, records)
 
     source = snapshot_state(fake, _DB)
-    assert source.migration_version == 5
+    assert source.migration_version == 6
     assert source.applied_versions == _FULL_SCHEMA
     assert source.record_ids == frozenset(record.record_id for record in records)
 
@@ -108,7 +108,7 @@ def test_snapshot_state_reads_raw_records_not_the_current_view() -> None:
 def test_verify_restored_returns_none_on_exact_match() -> None:
     snapshot = BackupSnapshot(
         database=_DB,
-        migration_version=5,
+        migration_version=6,
         applied_versions=_FULL_SCHEMA,
         record_ids=frozenset({"mh_r_a", "mh_r_b"}),
     )
@@ -116,8 +116,8 @@ def test_verify_restored_returns_none_on_exact_match() -> None:
 
 
 def test_verify_restored_fails_closed_on_a_record_id_mismatch() -> None:
-    source = BackupSnapshot(_DB, 5, _FULL_SCHEMA, frozenset({"mh_r_a", "mh_r_b"}))
-    restored = BackupSnapshot(_DB, 5, _FULL_SCHEMA, frozenset({"mh_r_a"}))  # lost mh_r_b
+    source = BackupSnapshot(_DB, 6, _FULL_SCHEMA, frozenset({"mh_r_a", "mh_r_b"}))
+    restored = BackupSnapshot(_DB, 6, _FULL_SCHEMA, frozenset({"mh_r_a"}))  # lost mh_r_b
     with pytest.raises(StorageError) as captured:
         verify_restored(source, restored)
     assert captured.value.code == "MH_STORAGE_RESTORE"
@@ -125,9 +125,9 @@ def test_verify_restored_fails_closed_on_a_record_id_mismatch() -> None:
 
 def test_verify_restored_fails_closed_on_a_migration_state_mismatch() -> None:
     ids = frozenset({"mh_r_a"})
-    source = BackupSnapshot(_DB, 5, _FULL_SCHEMA, ids)
+    source = BackupSnapshot(_DB, 6, _FULL_SCHEMA, ids)
     # Same record ids, but a lower/incomplete migration head must still fail closed.
-    behind = BackupSnapshot(_DB, 4, frozenset({1, 2, 3, 4}), ids)
+    behind = BackupSnapshot(_DB, 5, frozenset({1, 2, 3, 4, 5}), ids)
     with pytest.raises(StorageError) as captured:
         verify_restored(source, behind)
     assert captured.value.code == "MH_STORAGE_RESTORE"

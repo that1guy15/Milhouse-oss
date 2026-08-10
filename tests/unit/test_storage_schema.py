@@ -15,11 +15,15 @@ _GOLDEN: dict[int, tuple[str, str]] = {
         "feedback_transition_dedup",
         "158761bee4c675ac39eaec9cc6146423c6fb91aa5bd9794a41f946d581ff9e08",
     ),
+    6: (
+        "installation_ownership",
+        "959adb37cfe942aeda7547fb82da736eddde1c18fd4d108d358510bd2ed26b1b",
+    ),
 }
 
 
 def test_migrations_are_contiguous_named_and_nonempty() -> None:
-    assert tuple(m.version for m in CLICKHOUSE_MIGRATIONS) == (1, 2, 3, 4, 5)
+    assert tuple(m.version for m in CLICKHOUSE_MIGRATIONS) == (1, 2, 3, 4, 5, 6)
     for migration in CLICKHOUSE_MIGRATIONS:
         assert migration.name
         assert migration.sql.strip()
@@ -58,3 +62,16 @@ def test_records_current_view_enforces_retention_at_query_time() -> None:
     assert "records_current" in views.sql
     # Retention is enforced at query time independent of merge-time TTL deletion.
     assert "expires_at > now64" in views.sql
+
+
+def test_installation_ownership_migration_is_a_single_owner_replacing_table() -> None:
+    ownership = next(m for m in CLICKHOUSE_MIGRATIONS if m.name == "installation_ownership")
+    assert "_installation" in ownership.sql
+    # One logical owner row keyed on a fixed id; ReplacingMergeTree(claimed_at) keeps the newest
+    # claim so a --reclaim supersedes rather than forking a second owner.
+    assert "ReplacingMergeTree(claimed_at)" in ownership.sql
+    assert "ORDER BY id" in ownership.sql
+    # Idempotent DDL (retry-safe) and no destructive statement.
+    assert "CREATE TABLE IF NOT EXISTS" in ownership.sql
+    assert "DROP TABLE" not in ownership.sql.upper()
+    assert "DROP DATABASE" not in ownership.sql.upper()
