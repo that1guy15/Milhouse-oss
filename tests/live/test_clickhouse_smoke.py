@@ -20,21 +20,42 @@ from milhouse.config._models import StorageClickHouseConfig
 from milhouse.config.secrets import SecretEnvironment
 from milhouse.core.clock import SystemClock
 from milhouse.domain.records import TargetDescriptorV1
+from milhouse.spooling import (
+    DurableSpool,
+    SegmentHeaderV1,
+    SpoolFrameV1,
+    replay_segments,
+    spool_content_sha256,
+    spool_frame_line,
+)
+from milhouse.state import (
+    GlobalCommitBarrier,
+    initialize_control_state,
+    open_control_database,
+)
 from milhouse.storage import (
+    CLICKHOUSE_EXPORTER_ID,
+    ClickHouseExporter,
     StorageError,
+    backup_statement,
     build_client,
     export_records,
     fetch_current_feedback,
     fetch_current_records,
     migrate,
     plan,
+    reconcile_delivered,
+    restore_statement,
+    snapshot_state,
     status,
+    verify_restored,
 )
 
 # Reuse the exact, CI-validated record builders from the unit suite so this standalone smoke never
 # drifts from the domain contract (its own construction would not be checked by Required CI).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unit"))
 from _record_factories import (
+    INSTALLATION_ID,
     event_record,
     feedback_item_record,
     feedback_transition_record,
@@ -177,4 +198,95 @@ def test_live_export_round_trips_records_and_derives_feedback_state() -> None:
         assert int(collapsed[0][0]) == 1  # the redelivered transition collapsed to one physical row
     finally:
         client.command(f"DROP DATABASE IF EXISTS {_SMOKE_DB}")
+        client.close()
+
+
+@_requires_live
+def test_live_native_backup_restore_round_trips_and_reconciles(tmp_path: Path) -> None:
+    # G04b / E06 owner-host evidence (live only): the physical native BACKUP/RESTORE round-trip the
+    # offline suite cannot prove (FakeClickHouseClient models no BACKUP engine, merges, or TTL). A
+    # real BACKUP DATABASE → DROP DATABASE → RESTORE DATABASE must reproduce the record-id set and
+    # migration state (verify_restored), and the restored store must contain every record id the
+    # SQLite delivery ledger marks delivered to clickhouse (reconcile_delivered — the cross-store
+    # "matches exporter checkpoints" reading; feedback-state parity is deferred to G16). Requires a
+    # ClickHouse deployment with a configured backup disk named ``backups``
+    # (``<backups><allowed_disk>backups</allowed_disk></backups>``); it self-skips out of Required
+    # CI like every other case here.
+    client = build_client(_config(), _secrets())
+    control = None
+    try:
+        client.command(f"DROP DATABASE IF EXISTS {_SMOKE_DB}")
+        now = SystemClock().now()
+        migrate(client, _SMOKE_DB, now=now, milhouse_version="live-smoke")
+
+        # A real control plane + durable spool under tmp_path so a real delivery advances the SQLite
+        # ledger, giving reconcile_delivered an authoritative delivered-to-clickhouse set to check.
+        state_root = tmp_path / "state"
+        control_dir = state_root / "control"
+        control_dir.mkdir(mode=0o700, parents=True)
+        os.chmod(control_dir, 0o700)
+        spool_root = state_root / "spool"
+        spool_root.mkdir(mode=0o700)
+        os.chmod(spool_root, 0o700)
+        control = open_control_database(control_dir / "milhouse.sqlite3")
+        barrier = GlobalCommitBarrier(control_dir / "commit.lock")
+        initialize_control_state(control, barrier=barrier, applied_at=now)
+        store = DurableSpool(
+            database=control,
+            barrier=barrier,
+            spool_root=spool_root,
+            installation_id=INSTALLATION_ID,
+        )
+
+        record = event_record(now=now)
+        frames = [SpoolFrameV1(batch_id="batch-live", sequence=1, record=record)]
+        header = SegmentHeaderV1(
+            batch_id="batch-live",
+            config_generation="a" * 64,
+            scope="target",
+            target_id="example-target",
+            privacy_class="internal",
+            retention_days=30,
+            required_exporters=(CLICKHOUSE_EXPORTER_ID,),
+            record_count=1,
+            content_sha256=spool_content_sha256([spool_frame_line(frames[0])]),
+        )
+        store.commit_segment(header, frames, committed_at=now)
+        replay_segments(
+            control,
+            barrier,
+            spool_root=spool_root,
+            installation_id=INSTALLATION_ID,
+            exporters={CLICKHOUSE_EXPORTER_ID: ClickHouseExporter(client, _SMOKE_DB)},
+            now=now,
+            delivery_status="pending",
+        )
+
+        source = snapshot_state(client, _SMOKE_DB)
+        assert source.migration_version == 5
+        assert record.record_id in source.record_ids
+
+        # Drive the real DR restore SEQUENCE the ``storage restore`` command performs (backup → DROP
+        # DATABASE → RESTORE into the emptied target → post-restore validity gate → reconcile) via
+        # the same functions the CLI uses, plus the strict physical round-trip only possible here
+        # (``source`` captured BEFORE the backup/drop).
+        client.command(backup_statement(_SMOKE_DB, "live_backup"))
+        client.command(f"DROP DATABASE IF EXISTS {_SMOKE_DB}")  # disaster: empty the target
+        client.command(restore_statement(_SMOKE_DB, "live_backup"))
+
+        # (a) the restore brought a checksum-consistent schema at the current defined head — the
+        # CLI's post-restore validity gate, exercised against the real restored ledger.
+        restored_plan = status(client, _SMOKE_DB)
+        assert restored_plan.current_version == max(entry.version for entry in restored_plan.states)
+        restored = snapshot_state(client, _SMOKE_DB)
+        # (b) the physical native round-trip reproduced the exact record-id set + migration state.
+        verify_restored(source, restored)
+        # (c) every clickhouse-delivered record id survived the round-trip (cross-store reconcile).
+        reconcile_delivered(
+            control, restored, spool_root=spool_root, installation_id=INSTALLATION_ID
+        )
+    finally:
+        client.command(f"DROP DATABASE IF EXISTS {_SMOKE_DB}")
+        if control is not None:
+            control.close()
         client.close()

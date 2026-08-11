@@ -11,6 +11,12 @@
 #     `default` account, so there is no remotely usable or unauthenticated default user;
 #   * a health check and resource guidance are provided.
 #
+# Native backup:
+#   * config.d/backups.xml declares the `backups` disk and allow-lists it so `storage backup` /
+#     `storage restore` work; it is a local dir on the durable `clickhouse-backups` named volume,
+#     kept SEPARATE from the data volume (a `down -v` of data does not delete backups). See
+#     README.md for retention and permissions.
+#
 # Copy .env.example to .env, set the credentials, then: `docker compose --env-file .env up -d`.
 services:
   clickhouse:
@@ -27,7 +33,11 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "0"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      # Native BACKUP/RESTORE target: a durable volume SEPARATE from the data volume, at the path
+      # config.d/backups.xml declares for the allow-listed `backups` disk.
+      - clickhouse-backups:/var/lib/clickhouse/backups
       - ./users.d:/etc/clickhouse-server/users.d:ro
+      - ./config.d:/etc/clickhouse-server/config.d:ro
     ulimits:
       nofile:
         soft: 262144
@@ -54,3 +64,5 @@ services:
 
 volumes:
   clickhouse-data:
+  # Durable native-backup store, separate from clickhouse-data so a data reset never deletes backups.
+  clickhouse-backups:

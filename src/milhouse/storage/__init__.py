@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+from milhouse.storage.backup import (
+    BackupSnapshot,
+    backup_statement,
+    fetch_record_ids,
+    reconcile_delivered,
+    restore_statement,
+    snapshot_state,
+    verify_restored,
+)
 from milhouse.storage.client import (
     ClickHouseClient,
     ConnectedClickHouseClient,
@@ -29,6 +38,7 @@ from milhouse.storage.schema import CLICKHOUSE_MIGRATIONS, StorageMigration
 __all__ = [
     "CLICKHOUSE_EXPORTER_ID",
     "CLICKHOUSE_MIGRATIONS",
+    "BackupSnapshot",
     "ClickHouseClient",
     "ClickHouseExporter",
     "ConnectedClickHouseClient",
@@ -40,11 +50,17 @@ __all__ = [
     "StorageMigration",
     "StoragePlan",
     "StoredRecordV1",
+    "backup_statement",
     "build_client",
     "export_records",
     "fetch_current_feedback",
     "fetch_current_records",
+    "fetch_record_ids",
     "migrate",
     "plan",
+    "reconcile_delivered",
+    "restore_statement",
+    "snapshot_state",
     "status",
+    "verify_restored",
 ]

@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- Native BACKUP/RESTORE support for the loopback reference deployment (W04 G04b, plan
+         sections 4.5 / 10.3). ClickHouse rejects `BACKUP DATABASE ... TO Disk('backups', ...)`
+         unless a disk named `backups` exists AND is allow-listed for backups, so declare both here.
+         The disk is a local directory mounted from a durable named volume (see docker-compose.yml),
+         kept SEPARATE from the data volume so a data-volume reset does not delete backups. Rotate
+         and secure `/var/lib/clickhouse/backups` per ops/clickhouse/README.md; it is loopback-only
+         and never exposed off-host. -->
+    <storage_configuration>
+        <disks>
+            <backups>
+                <type>local</type>
+                <path>/var/lib/clickhouse/backups/</path>
+            </backups>
+        </disks>
+    </storage_configuration>
+    <backups>
+        <allowed_disk>backups</allowed_disk>
+    </backups>
+</clickhouse>
