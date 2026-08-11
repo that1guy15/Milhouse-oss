@@ -12,6 +12,7 @@ _MIGRATION_FILES = (
     "0003_feedback.sql",
     "0004_views.sql",
     "0005_feedback_transition_dedup.sql",
+    "0006_installation_ownership.sql",
 )
 
 

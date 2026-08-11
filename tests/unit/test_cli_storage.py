@@ -31,18 +31,34 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _EXAMPLE_CONFIG = (_REPO_ROOT / "config" / "example.toml").read_text(encoding="utf-8")
 
 
-def _config(tmp_path: Path, *, enabled: bool = True) -> Path:
+def _config(
+    tmp_path: Path, *, enabled: bool = True, subdir: str = "cfg", home: str = "../data"
+) -> Path:
     # Drop the secret env-file reference (the client/secrets are stubbed in these tests).
     text = _EXAMPLE_CONFIG.replace('env_files = ["../.env"]', "env_files = []")
     if not enabled:
         text = text.replace(
             "[storage.clickhouse]\nenabled = true", "[storage.clickhouse]\nenabled = false"
         )
-    config_dir = tmp_path / "cfg"
+    if home != "../data":
+        text = text.replace('home = "../data"', f'home = "{home}"')
+    config_dir = tmp_path / subdir
     config_dir.mkdir()
     config_file = config_dir / "config.toml"
     config_file.write_text(text, encoding="utf-8")
     return config_file
+
+
+def _second_config(tmp_path: Path) -> Path:
+    # A SECOND installation (its own state root ``tmp_path/data2``) sharing the same monkeypatched
+    # fake ClickHouse — the shape the guard must distinguish: one destination, two installs.
+    return _config(tmp_path, subdir="cfg2", home="../data2")
+
+
+def _run_migrate(config: Path) -> Result:
+    # Claim/verify ownership of the (fake) ClickHouse by applying the migrations — the realistic
+    # precondition for export/backup/restore now that those refuse an unclaimed/foreign destination.
+    return CliRunner().invoke(main, ["--config", str(config), "storage", "migrate"])
 
 
 def _paths(config: Path) -> RuntimePaths:
@@ -116,16 +132,17 @@ def test_cli_storage_status_then_migrate(tmp_path: Path, _stub: FakeClickHouseCl
 
     status = runner.invoke(main, ["--config", str(config), "storage", "status"])
     assert status.exit_code == 0
-    assert "pending=5" in status.output
+    assert "pending=6" in status.output
     assert _stub.databases == set()  # status did not mutate
 
     migrated = runner.invoke(main, ["--config", str(config), "storage", "migrate"])
     assert migrated.exit_code == 0
-    assert "version 5" in migrated.output
+    assert "version 6" in migrated.output
+    assert "ownership claimed" in migrated.output  # a first migrate stamps this install as owner
 
     after = runner.invoke(main, ["--config", str(config), "storage", "status", "--json"])
     assert after.exit_code == 0
-    assert '"current_version": 5' in after.output
+    assert '"current_version": 6' in after.output
 
 
 def test_cli_storage_plan_is_read_only(tmp_path: Path, _stub: FakeClickHouseClient) -> None:
@@ -141,8 +158,9 @@ def test_cli_storage_migrate_json(tmp_path: Path, _stub: FakeClickHouseClient) -
     _init_paths(config)  # migrate fences under the commit barrier (needs init)
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "migrate", "--json"])
     assert result.exit_code == 0
-    assert '"applied_now": [1, 2, 3, 4, 5]' in result.output
-    assert '"current_version": 5' in result.output
+    assert '"applied_now": [1, 2, 3, 4, 5, 6]' in result.output
+    assert '"current_version": 6' in result.output
+    assert '"ownership": "claimed"' in result.output
 
 
 def test_cli_storage_migrate_requires_an_initialized_control_plane(
@@ -207,7 +225,7 @@ def test_cli_storage_migrate_is_fenced_by_the_exclusive_commit_barrier(
     result = captured["result"]
     assert isinstance(result, Result)
     assert result.exit_code == 0
-    assert "version 5" in result.output  # it did migrate, once unblocked
+    assert "version 6" in result.output  # it did migrate, once unblocked
 
 
 def test_cli_storage_disabled_is_an_error(tmp_path: Path, _stub: FakeClickHouseClient) -> None:
@@ -252,6 +270,7 @@ def test_cli_storage_export_delivers_committed_segments(
 ) -> None:
     config = _config(tmp_path)
     _spool_one_pending_segment(config)
+    assert _run_migrate(config).exit_code == 0  # claim ownership before exporting
 
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
 
@@ -268,6 +287,7 @@ def test_cli_storage_export_over_an_empty_ledger_is_zero(
     # An initialized install with no committed segments drains nothing and writes nothing.
     config = _config(tmp_path)
     assert CliRunner().invoke(main, ["--config", str(config), "init"]).exit_code == 0
+    assert _run_migrate(config).exit_code == 0  # claim ownership before exporting
 
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "export", "--json"])
 
@@ -284,6 +304,7 @@ def test_cli_storage_export_is_idempotent_already_delivered_no_reinsert(
 ) -> None:
     config = _config(tmp_path)
     _spool_one_pending_segment(config)
+    assert _run_migrate(config).exit_code == 0  # claim ownership before exporting
     assert CliRunner().invoke(main, ["--config", str(config), "storage", "export"]).exit_code == 0
     inserts_after_first = len(_stub.inserts)
 
@@ -310,6 +331,9 @@ def test_cli_storage_export_failed_delivery_is_fail_loud_and_nonzero(
     monkeypatch.setattr(root.storage, "build_client", lambda config, secrets: raising)
     config = _config(tmp_path)
     _spool_one_pending_segment(config)
+    # Migrate claims ownership over the raising client (its DDL/ledger/claim run via command(), not
+    # broken by the raising subclass — only insert() raises), so export reaches delivery.
+    assert _run_migrate(config).exit_code == 0
 
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
 
@@ -333,14 +357,19 @@ def test_cli_storage_export_recovers_a_failed_segment_on_the_next_run(
     # Outage: the insert raises → the segment is left retryable "failed", export exits non-zero.
     raising = _RaisingClient()
     monkeypatch.setattr(root.storage, "build_client", lambda config, secrets: raising)
+    assert (
+        _run_migrate(config).exit_code == 0
+    )  # claim ownership (command-based, survives the outage)
     outage = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
     assert outage.exit_code == 1
     assert "failed=1" in outage.output
     assert raising.inserts == []
 
-    # Recovery: a healthy client on the next run redelivers the previously-failed segment once.
+    # Recovery: a healthy client on the next run redelivers the previously-failed segment once. It
+    # models the SAME recovered ClickHouse, so it too is migrated + claimed by this installation.
     healthy = FakeClickHouseClient()
     monkeypatch.setattr(root.storage, "build_client", lambda config, secrets: healthy)
+    assert _run_migrate(config).exit_code == 0
     recovered = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
     assert recovered.exit_code == 0
     assert (
@@ -358,6 +387,7 @@ def test_cli_storage_export_notes_expired_withheld_segments(
     # must be observable: an informational stderr NOTE, so the withholding is never silent.
     config = _config(tmp_path)
     _spool_one_pending_segment(config)  # records expire ~30 days after real now
+    assert _run_migrate(config).exit_code == 0  # claim ownership before exporting
     # Export far past the records' expiry so the hard-expiry gate withholds the segment.
     future = datetime.now(UTC) + timedelta(days=60)
     monkeypatch.setattr(root, "SystemClock", lambda: _FixedClock(future))
@@ -379,6 +409,7 @@ def test_cli_storage_export_reports_a_segment_with_an_empty_exporter_set_as_unha
     # attempts.
     config = _config(tmp_path)
     _commit_segment(_init_paths(config), "batch-no-obligation", ())
+    assert _run_migrate(config).exit_code == 0  # claim ownership before exporting
 
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
 
@@ -397,6 +428,7 @@ def test_cli_storage_export_reports_a_segment_with_only_another_exporter_as_unha
     # pinned so the drain is deterministic (the attempt is ``no_exporter``, never ``expired``).
     config = _config(tmp_path)
     _commit_segment(_init_paths(config), "batch-webhook-only", ("webhook",))
+    assert _run_migrate(config).exit_code == 0  # claim ownership before exporting
     monkeypatch.setattr(root, "SystemClock", lambda: _FixedClock(NOW))
 
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
@@ -419,6 +451,7 @@ def test_cli_storage_export_mixed_delivered_and_unhandled_scopes_records_and_exi
     paths = _init_paths(config)
     _commit_segment(paths, "batch-clickhouse", ("clickhouse",))
     _commit_segment(paths, "batch-no-obligation", ())
+    assert _run_migrate(config).exit_code == 0  # claim ownership before exporting
     monkeypatch.setattr(root, "SystemClock", lambda: _FixedClock(NOW))
 
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
@@ -449,6 +482,7 @@ def test_cli_storage_export_records_count_is_confirmed_egress_only(
     # (a) The insert raises before any row lands → the segment is failed and CONFIRMED records is 0.
     raising = _RaisingClient()
     monkeypatch.setattr(root.storage, "build_client", lambda config, secrets: raising)
+    assert _run_migrate(config).exit_code == 0  # claim ownership before exporting
     text_a = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
     assert text_a.exit_code == 1
     assert (
@@ -469,9 +503,11 @@ def test_cli_storage_export_records_count_is_confirmed_egress_only(
     assert raising.inserts == []
 
     # (b) A healthy retry delivers the SAME segment → its records now appear in the confirmed count
-    # exactly once (as delivered now, then already_delivered on the idempotent re-run).
+    # exactly once (delivered now, then already_delivered on the idempotent re-run). The recovered
+    # ClickHouse is migrated + claimed by this installation before the retry.
     healthy = FakeClickHouseClient()
     monkeypatch.setattr(root.storage, "build_client", lambda config, secrets: healthy)
+    assert _run_migrate(config).exit_code == 0
     text_b = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
     assert text_b.exit_code == 0
     assert (
@@ -602,7 +638,7 @@ def test_cli_storage_backup_then_dr_restore_into_empty_db(
     assert _json_payload(backup.output) == {
         "database": "milhouse",
         "destination": "backup_one",
-        "migration_version": 5,
+        "migration_version": 6,
         "record_count": 1,
     }
     assert any(command.startswith("BACKUP DATABASE milhouse") for command in _stub.commands)
@@ -615,7 +651,7 @@ def test_cli_storage_backup_then_dr_restore_into_empty_db(
     assert restore.exit_code == 0
     assert _json_payload(restore.output) == {
         "database": "milhouse",
-        "migration_version": 5,
+        "migration_version": 6,
         "reconciled": True,
         "record_count": 1,
         "source": "backup_one",
@@ -706,6 +742,8 @@ def test_cli_storage_backup_is_fenced_by_the_exclusive_commit_barrier(
     # during a REAL backup" proof is host-gated (E06); here we prove the mutual exclusion.
     config = _config(tmp_path)
     paths = _init_paths(config)
+    assert _run_migrate(config).exit_code == 0  # claim ownership so the backup passes require_owner
+    _stub.commands.clear()  # observe only the commands the fenced backup itself issues
     barrier = GlobalCommitBarrier(
         paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
     )
@@ -767,3 +805,153 @@ def test_cli_storage_restore_requires_an_initialized_control_plane(
     result = CliRunner().invoke(main, ["--config", str(config), "storage", "restore", "backup_one"])
     assert result.exit_code == 1
     assert _stub.commands == []
+
+
+# --- installation-ownership guard (one ClickHouse per installation, fail-closed) ---
+
+
+def test_cli_storage_migrate_claims_then_verifies_ownership(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # A first migrate stamps THIS installation as the destination's owner; a re-run by the same
+    # installation verifies (a no-op re-stamp). The owner recorded is the local installation id.
+    config = _config(tmp_path)
+    paths = _init_paths(config)
+    installation_id = bootstrap.read_installation_id(paths)
+
+    first = CliRunner().invoke(main, ["--config", str(config), "storage", "migrate", "--json"])
+    assert first.exit_code == 0
+    assert _json_payload(first.output)["ownership"] == "claimed"
+    assert _stub.owners["milhouse"] == installation_id
+
+    second = CliRunner().invoke(main, ["--config", str(config), "storage", "migrate", "--json"])
+    assert second.exit_code == 0
+    assert _json_payload(second.output)["ownership"] == "verified"
+    assert _stub.owners["milhouse"] == installation_id  # unchanged
+
+
+def test_cli_storage_migrate_by_a_different_installation_is_fail_closed(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # Installation A claims the shared (fake) ClickHouse. A SECOND installation B — its own state
+    # root, the same destination — is refused fail-closed, and only takes ownership with --reclaim.
+    config_a = _config(tmp_path)
+    _init_paths(config_a)
+    assert (
+        CliRunner().invoke(main, ["--config", str(config_a), "storage", "migrate"]).exit_code == 0
+    )
+    owner_a = _stub.owners["milhouse"]
+
+    config_b = _second_config(tmp_path)
+    paths_b = _init_paths(config_b)
+    id_b = bootstrap.read_installation_id(paths_b)
+    assert id_b != owner_a  # two distinct installations against one destination
+
+    refused = CliRunner().invoke(main, ["--config", str(config_b), "storage", "migrate"])
+    assert refused.exit_code == 1
+    assert "MH_STORAGE_OWNERSHIP" in refused.output
+    assert _stub.owners["milhouse"] == owner_a  # a refused claim never changed the owner
+
+    reclaimed = CliRunner().invoke(
+        main, ["--config", str(config_b), "storage", "migrate", "--reclaim", "--json"]
+    )
+    assert reclaimed.exit_code == 0
+    assert _json_payload(reclaimed.output)["ownership"] == "reclaimed"
+    assert _stub.owners["milhouse"] == id_b  # --reclaim superseded the prior owner
+
+
+def test_cli_storage_export_by_a_different_installation_is_fail_closed(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # A second installation must not deliver to a destination another installation owns.
+    config_a = _config(tmp_path)
+    _init_paths(config_a)
+    assert (
+        CliRunner().invoke(main, ["--config", str(config_a), "storage", "migrate"]).exit_code == 0
+    )
+
+    config_b = _second_config(tmp_path)
+    _init_paths(config_b)
+    result = CliRunner().invoke(main, ["--config", str(config_b), "storage", "export"])
+    assert result.exit_code == 1
+    assert "MH_STORAGE_OWNERSHIP" in result.output
+    assert _stub.inserts == []  # B wrote nothing to A's ClickHouse
+
+
+def test_cli_storage_backup_by_a_different_installation_is_fail_closed(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    config_a = _config(tmp_path)
+    _init_paths(config_a)
+    assert (
+        CliRunner().invoke(main, ["--config", str(config_a), "storage", "migrate"]).exit_code == 0
+    )
+
+    config_b = _second_config(tmp_path)
+    _init_paths(config_b)
+    result = CliRunner().invoke(main, ["--config", str(config_b), "storage", "backup", "backup_b"])
+    assert result.exit_code == 1
+    assert "MH_STORAGE_OWNERSHIP" in result.output
+    assert not any(command.startswith("BACKUP DATABASE") for command in _stub.commands)
+
+
+def test_cli_storage_restore_of_a_foreign_backup_is_fail_closed(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # Installation A migrates and backs up; the backup carries A's ``_installation`` owner row. B
+    # restores A's backup into an empty target — the restored owner is A ≠ B, so it fails closed
+    # with the restore-specific code and the MANUAL-DROP recovery, NOT the "--reclaim" guidance
+    # (which would make B adopt A's backup — the comingling this guard prevents).
+    config_a = _config(tmp_path)
+    _init_paths(config_a)
+    assert (
+        CliRunner().invoke(main, ["--config", str(config_a), "storage", "migrate"]).exit_code == 0
+    )
+    assert (
+        CliRunner()
+        .invoke(main, ["--config", str(config_a), "storage", "backup", "backup_a"])
+        .exit_code
+        == 0
+    )
+
+    config_b = _second_config(tmp_path)
+    _init_paths(config_b)
+    _stub.command("DROP DATABASE IF EXISTS milhouse")  # empty target so the native RESTORE proceeds
+    result = CliRunner().invoke(main, ["--config", str(config_b), "storage", "restore", "backup_a"])
+    assert result.exit_code == 1
+    assert (
+        "MH_STORAGE_RESTORE" in result.output
+    )  # restore-specific, not the ownership --reclaim path
+    assert "DROP this database" in result.output  # names the manual recovery for the wedged target
+    assert (
+        "--reclaim" not in result.output
+    )  # reclaiming would ADOPT the foreign backup (comingling)
+    # The restore materialized A's slice (incl. A's owner row) into B's empty target before failing
+    # closed; B did NOT adopt it, and the documented recovery is a manual DROP DATABASE (W16
+    # automates the rollback). The owner row still names A — exactly the populated state to drop.
+    assert _stub.owners["milhouse"] == bootstrap.read_installation_id(_paths(config_a))  # still A's
+
+
+def test_cli_storage_export_on_an_unclaimed_destination_fails_closed(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    # An initialized install pointed at a never-migrated (unclaimed) ClickHouse is refused with the
+    # "run migrate first" guidance, rather than writing an unowned destination.
+    config = _config(tmp_path)
+    _init_paths(config)  # control plane only; the fake ClickHouse is never migrated/claimed
+    result = CliRunner().invoke(main, ["--config", str(config), "storage", "export"])
+    assert result.exit_code == 1
+    assert "MH_STORAGE_OWNERSHIP" in result.output
+    assert "migrate" in result.output  # "the ClickHouse destination is unclaimed; run ... migrate"
+    assert _stub.inserts == []
+
+
+def test_cli_storage_backup_on_an_unclaimed_destination_fails_closed(
+    tmp_path: Path, _stub: FakeClickHouseClient
+) -> None:
+    config = _config(tmp_path)
+    _init_paths(config)
+    result = CliRunner().invoke(main, ["--config", str(config), "storage", "backup", "backup_one"])
+    assert result.exit_code == 1
+    assert "MH_STORAGE_OWNERSHIP" in result.output
+    assert not any(command.startswith("BACKUP DATABASE") for command in _stub.commands)

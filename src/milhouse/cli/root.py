@@ -502,9 +502,14 @@ def storage_plan_command(state: CliState, as_json: bool) -> None:
 
 
 @storage_group.command(name="migrate")
+@click.option(
+    "--reclaim",
+    is_flag=True,
+    help="Take ownership of a destination currently claimed by another installation.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit the result as stable JSON.")
 @click.pass_obj
-def storage_migrate_command(state: CliState, as_json: bool) -> None:
+def storage_migrate_command(state: CliState, reclaim: bool, as_json: bool) -> None:
     """Apply every pending migration in order under the exclusive commit barrier; refuse a tamper.
 
     The whole apply runs while THIS installation's control-plane commit lock is held EXCLUSIVELY, so
@@ -516,13 +521,25 @@ def storage_migrate_command(state: CliState, as_json: bool) -> None:
     altered applied checksum is still refused. Requires an initialized control plane (the commit
     lock lives under its control dir).
 
+    After the migrations apply (so the ``_installation`` control table exists), this CLAIMS the
+    destination for THIS installation: "one ClickHouse per installation" is the supported model, and
+    the claim makes the local commit barrier a correct single-writer exclusion. A first migrate
+    stamps the local installation as owner; a re-run by the same installation verifies (a no-op). A
+    destination already owned by a DIFFERENT installation is refused fail-closed (exit 1) UNLESS
+    ``--reclaim`` is given — a deliberate re-point (moving this install to a new ClickHouse host),
+    which supersedes the prior owner. On UPGRADE of a pre-existing destination migrated before this
+    guard existed (no ``_installation`` row yet), the first install to migrate claims it — ownership
+    is attributed to whoever migrates first, not retroactively to the original writer; in the
+    supported one-per-destination model that is the sole rightful install, and a destination already
+    (incorrectly) shared is taken back by the rightful owner with ``--reclaim``.
+
     NOTE: this fence holds only because ``storage export`` is the SOLE production ClickHouse writer
     and it delivers under ``barrier.shared()``. ANY future ClickHouse writer MUST likewise take the
     shared side of this same commit lock, or it could race a migration and lose data.
     """
 
     paths = _resolve_paths(state)
-    _require_installation_id(paths)  # the commit lock lives under an initialized control dir
+    installation_id = _require_installation_id(paths)  # the commit lock lives under a control dir
     database, client = _storage_client(state)
     barrier = GlobalCommitBarrier(
         paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
@@ -532,10 +549,27 @@ def storage_migrate_command(state: CliState, as_json: bool) -> None:
             result = storage.migrate(
                 client, database, now=SystemClock().now(), milhouse_version=__version__
             )
+            # The migrations above provisioned ``_installation``; read the prior owner (to report
+            # claimed vs verified vs reclaimed), then stamp/verify this installation's ownership.
+            prior_owner = storage.read_owner(client, database)
+            storage.claim(
+                client,
+                database,
+                installation_id=installation_id,
+                now=SystemClock().now(),
+                milhouse_version=__version__,
+                reclaim=reclaim,
+            )
     except storage.StorageError as error:
         raise StorageCommandError(error) from None
     finally:
         client.close()
+    if prior_owner is None:
+        ownership = "claimed"
+    elif prior_owner == installation_id:
+        ownership = "verified"
+    else:
+        ownership = "reclaimed"
     if as_json:
         click.echo(
             json.dumps(
@@ -544,6 +578,7 @@ def storage_migrate_command(state: CliState, as_json: bool) -> None:
                     "applied_now": list(result.applied_now),
                     "already_applied": list(result.already_applied),
                     "current_version": result.current_version,
+                    "ownership": ownership,
                 },
                 sort_keys=True,
             )
@@ -552,7 +587,7 @@ def storage_migrate_command(state: CliState, as_json: bool) -> None:
     click.echo(
         f"migrate: applied {len(result.applied_now)} migration(s) "
         f"({len(result.already_applied)} already applied); "
-        f"schema at version {result.current_version}"
+        f"schema at version {result.current_version}; ownership {ownership}"
     )
 
 
@@ -577,13 +612,17 @@ def storage_backup_command(state: CliState, destination: str, as_json: bool) -> 
     """
 
     paths = _resolve_paths(state)
-    _require_installation_id(paths)  # the commit lock lives under an initialized control dir
+    installation_id = _require_installation_id(paths)  # the commit lock lives under a control dir
     database, client = _storage_client(state)
     barrier = GlobalCommitBarrier(
         paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
     )
     try:
         with barrier.exclusive():
+            # Refuse to back up a destination this installation does not own (fail closed): the
+            # supported model is one ClickHouse per installation, and a foreign or unclaimed
+            # destination is not this installation's data to snapshot.
+            storage.require_owner(client, database, installation_id=installation_id)
             snapshot = storage.snapshot_state(client, database)
             client.command(storage.backup_statement(database, destination))
     except storage.StorageError as error:
@@ -631,8 +670,11 @@ def storage_restore_command(context: click.Context, source: str, as_json: bool) 
     (``reconcile_delivered``) — every spool segment the surviving SQLite ledger marks ``delivered``
     to ``clickhouse`` has all of its record ids PRESENT in the restored store (a subset check, not
     full record-id-set equality — that stricter proof needs the W16 backup manifest).
-    Feedback-state parity is deferred to G16. Requires an initialized control plane; any mismatch
-    exits non-zero with the fixed ``MH_STORAGE_RESTORE`` code.
+    Feedback-state parity is deferred to G16. It ALSO fails closed if the restored ``_installation``
+    owner row names a DIFFERENT installation (a cross-installation restore is unsupported): the
+    foreign data has already materialized into the (proven-empty) target and the clean precondition
+    is recovered by a manual ``DROP DATABASE`` (automatic rollback is W16). Requires an initialized
+    control plane; any mismatch exits non-zero with the fixed ``MH_STORAGE_RESTORE``.
 
     OFFLINE/LIVE boundary: this proves the barrier fence, the empty-target guard, the statements,
     the schema-validity + bounded-reconcile wiring, and the exit codes offline against a fake
@@ -670,6 +712,25 @@ def storage_restore_command(context: click.Context, source: str, as_json: bool) 
                     raise storage.StorageError(
                         "MH_STORAGE_RESTORE",
                         "the restore did not bring the current analytical schema",
+                    )
+                # The restored database carries the backup's ``_installation`` owner row (migration
+                # 0006 is at the current head gated just above, so the row is present). A restore of
+                # THIS installation's own backup verifies and proceeds; a restore of ANOTHER
+                # installation's backup is refused fail-closed. This deliberately does NOT route
+                # through ``require_owner``: that error's "--reclaim on migrate" guidance is WRONG
+                # for a restore -- reclaiming would ADOPT the foreign backup, the very comingling
+                # this guard prevents. The foreign slice has already materialized into the target
+                # proven empty above, and in-place overwrite/rollback is W16, so the clean
+                # precondition is recovered by a manual DROP DATABASE (named in the error and
+                # ops/clickhouse/README.md), never by an automatic drop here.
+                restored_owner = storage.read_owner(client, database)
+                if restored_owner != installation_id:
+                    raise storage.StorageError(
+                        "MH_STORAGE_RESTORE",
+                        "the restored backup was taken by a different installation; a "
+                        "cross-installation restore is not supported -- DROP this database to "
+                        "restore the empty precondition, then restore a backup taken by this "
+                        "installation",
                     )
                 restored = storage.snapshot_state(client, database)
                 storage.reconcile_delivered(
@@ -735,6 +796,18 @@ def storage_export_command(context: click.Context, as_json: bool) -> None:
     try:
         database, client = _storage_client(state)
         try:
+            # Refuse to deliver to a destination this installation does not own (fail closed): the
+            # supported model is one ClickHouse per installation, so a second install pointed at a
+            # claimed destination — or an unclaimed one — must not write it. This read barrier makes
+            # the local commit barrier a correct single-writer exclusion.
+            #
+            # Placed BEFORE the shared commit barrier (which replay_segments takes internally) on
+            # purpose: the only actor sharing this per-state-root barrier is THIS install, whose id
+            # is our own, so it cannot reclaim the destination away from itself; a DIFFERENT install
+            # has its own barrier and is fenced by this op-time check regardless of ordering. So
+            # — unlike backup/restore, which check inside their exclusive scope because they hold it
+            # the whole operation — the placement here is a correctness no-op vs the barrier.
+            storage.require_owner(client, database, installation_id=installation_id)
             barrier = GlobalCommitBarrier(
                 paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
             )

@@ -19,6 +19,7 @@ from milhouse.storage.client import (
 from milhouse.storage.delivery import CLICKHOUSE_EXPORTER_ID, ClickHouseExporter
 from milhouse.storage.errors import StorageError
 from milhouse.storage.exporter import ExportSummary, export_records
+from milhouse.storage.ownership import claim, read_owner, require_owner
 from milhouse.storage.repository import (
     FeedbackStateRow,
     StoredRecordV1,
@@ -52,13 +53,16 @@ __all__ = [
     "StoredRecordV1",
     "backup_statement",
     "build_client",
+    "claim",
     "export_records",
     "fetch_current_feedback",
     "fetch_current_records",
     "fetch_record_ids",
     "migrate",
     "plan",
+    "read_owner",
     "reconcile_delivered",
+    "require_owner",
     "restore_statement",
     "snapshot_state",
     "status",

@@ -23,7 +23,7 @@ def test_fresh_plan_lists_all_pending_and_does_not_mutate() -> None:
 
     report = plan(client, _DB)
 
-    assert [state.version for state in report.pending] == [1, 2, 3, 4, 5]
+    assert [state.version for state in report.pending] == [1, 2, 3, 4, 5, 6]
     assert report.applied == ()
     assert report.current_version == 0
     # Non-mutation: plan never created the database, the ledger, or any table.
@@ -35,7 +35,7 @@ def test_fresh_plan_lists_all_pending_and_does_not_mutate() -> None:
 def test_status_is_read_only_like_plan() -> None:
     client = FakeClickHouseClient()
     report = status(client, _DB)
-    assert len(report.pending) == 5
+    assert len(report.pending) == 6
     assert client.commands == []
 
 
@@ -44,13 +44,14 @@ def test_migrate_applies_all_in_order_with_ledger_rows() -> None:
 
     result = _migrate(client)
 
-    assert result.applied_now == (1, 2, 3, 4, 5)
+    assert result.applied_now == (1, 2, 3, 4, 5, 6)
     assert result.already_applied == ()
-    assert result.current_version == 5
+    assert result.current_version == 6
     assert (_DB, "records") in client.tables
     assert (_DB, "records_current") in client.tables
+    assert (_DB, "_installation") in client.tables
     ledger = client.ledger[_DB]
-    assert set(ledger) == {1, 2, 3, 4, 5}
+    assert set(ledger) == {1, 2, 3, 4, 5, 6}
     for migration in CLICKHOUSE_MIGRATIONS:
         assert ledger[migration.version] == (migration.name, migration.checksum)
 
@@ -62,8 +63,8 @@ def test_migrate_is_idempotent() -> None:
     result = _migrate(client)
 
     assert result.applied_now == ()
-    assert result.already_applied == (1, 2, 3, 4, 5)
-    assert plan(client, _DB).current_version == 5
+    assert result.already_applied == (1, 2, 3, 4, 5, 6)
+    assert plan(client, _DB).current_version == 6
 
 
 def test_migrate_refuses_a_tampered_applied_checksum() -> None:
@@ -104,7 +105,7 @@ def test_ledger_version_beyond_definitions_is_rejected() -> None:
     client = FakeClickHouseClient()
     for migration in CLICKHOUSE_MIGRATIONS:
         client.seed_ledger(_DB, migration.version, migration.name, migration.checksum)
-    client.seed_ledger(_DB, 6, "phantom", "0" * 64)  # a recorded version with no definition
+    client.seed_ledger(_DB, 7, "phantom", "0" * 64)  # a recorded version with no definition
 
     with pytest.raises(StorageError) as captured:
         plan(client, _DB)

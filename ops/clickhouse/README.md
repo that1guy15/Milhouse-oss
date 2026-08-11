@@ -33,6 +33,36 @@ $ milhouse --config ./config.toml storage status    # read-only: applied vs pend
 $ milhouse --config ./config.toml storage migrate    # apply the packaged migrations
 ```
 
+## One ClickHouse per installation (enforced)
+
+Milhouse's single-writer correctness rests on a machine-local commit barrier that fences exactly one
+installation's writers. That barrier cannot see a **second** installation — a different state root,
+clone, or host — pointed at the **same** ClickHouse, so two installations sharing one destination
+would silently comingle and corrupt each other's data. The supported model is therefore **one
+ClickHouse per installation**, and it is **enforced fail-closed**:
+
+- `storage migrate` **claims** the destination for the local installation (a single-owner
+  `_installation` row). A first migrate stamps ownership; a re-run by the same installation verifies.
+- `storage export`, `storage backup`, and `storage restore` **refuse to run** unless the destination
+  is owned by the local installation. A second installation pointed at a claimed destination — or a
+  restore of another installation's backup, whose restored owner row names that other installation —
+  fails closed with `MH_STORAGE_OWNERSHIP` (exit 1) rather than writing or comingling data.
+- An **unclaimed** destination (never migrated) likewise refuses export/backup: run `storage migrate`
+  first.
+- On **upgrade of a pre-existing destination** (one migrated before this guard existed, so it has no
+  `_installation` row yet), the **first** installation to `storage migrate` claims it — ownership is
+  attributed to whoever migrates first, not retroactively to the original writer. In the supported
+  one-per-destination model that is the sole rightful install; a destination that was already
+  (incorrectly) shared is taken back by the rightful owner with `--reclaim`.
+
+To **deliberately re-point** an installation at a new ClickHouse host (or take over a destination that
+was claimed by an installation you are decommissioning), migrate with `--reclaim`, which supersedes
+the prior owner:
+
+```console
+$ milhouse --config ./config.toml storage migrate --reclaim    # take ownership of this destination
+```
+
 ## Back up and restore (native BACKUP/RESTORE)
 
 This deployment provisions a ClickHouse `backups` disk in `config.d/backups.xml` (declared under
@@ -51,6 +81,12 @@ $ milhouse --config ./config.toml storage restore nightly_2026_08_10     # RESTO
   `storage restore` refuses (issuing no drop and no restore) if the analytical database already holds
   a schema. Restore into a clean/fresh state root, or after intentionally dropping the lost database.
   In-place **overwrite with rollback is deferred to W16** — this command never overwrites live data.
+- **A foreign or failed restore leaves the destination populated.** If the restored backup was taken
+  by a *different* installation (its `_installation` owner row names another install), `storage
+  restore` fails closed (`MH_STORAGE_RESTORE`, exit 1) **after** the native `RESTORE` has already
+  materialized that data into the (empty) target. Recovering the clean precondition is a **manual
+  `DROP DATABASE`** — automatic rollback of a failed/foreign restore is deferred to W16. (Restoring
+  your OWN backup verifies its owner row and proceeds.)
 - **Retention and permissions.** The `backups` volume grows with each archive; rotate and remove old
   archives on your own schedule (there is no automatic pruning here). The directory is written by the
   ClickHouse server user inside the container and is loopback-only — never exposed off-host. Treat
