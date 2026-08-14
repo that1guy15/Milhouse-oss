@@ -9,12 +9,13 @@ never touching the spool — so the pipeline owns every durable side effect.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from _record_factories import INSTALLATION_ID, NOW
+from _record_factories import EVIDENCE_ID, INSTALLATION_ID, NOW
 
 from milhouse.config._models import (
     RetentionConfig,
@@ -22,8 +23,10 @@ from milhouse.config._models import (
     TargetConfig,
 )
 from milhouse.domain.records import (
+    AlertDataV1,
     CollectorDescriptorV1,
     EventDataV1,
+    IncidentDataV1,
     RecordDraftV1,
     SourceDescriptorV1,
 )
@@ -90,10 +93,10 @@ def retention_config() -> RetentionConfig:
     )
 
 
-def _event_draft(context: CollectorContext, *, message: str, sequence: int) -> RecordDraftV1:
-    """Build one target-scoped event draft carrying a redactable free-text ``message``."""
+def _canary_source() -> SourceDescriptorV1:
+    """The shared collector-produced source descriptor every fake draft carries."""
 
-    source = SourceDescriptorV1.model_validate(
+    return SourceDescriptorV1.model_validate(
         {
             "id": "canary-source",
             "type": "source.event",
@@ -103,46 +106,112 @@ def _event_draft(context: CollectorContext, *, message: str, sequence: int) -> R
             "observation": {"kind": "source.revision", "parts": {"revision": 1}},
         }
     )
+
+
+def _draft_envelope(
+    context: CollectorContext,
+    *,
+    sequence: int,
+    record_type: str,
+    severity: str,
+    data: object,
+) -> RecordDraftV1:
+    """Wrap one collector-produced ``data`` payload in a target-scoped draft envelope.
+
+    ``sequence`` keeps each record's derived identity distinct so records never collide across a
+    multi-collector run. The stamped ``redaction_version`` is intentionally stale; the pipeline
+    restamps it with the policy it actually applied.
+    """
+
     return RecordDraftV1.model_validate(
         {
-            "record_type": "event",
+            "record_type": record_type,
             "name": "site.canary",
             "occurred_at": context.now,
             "observed_at": context.now + timedelta(seconds=1),
             "ingested_at": context.now + timedelta(seconds=2),
             "expires_at": context.now + timedelta(days=30),
-            # Distinct per collector so records never collide across a multi-collector run.
-            "source_event_id": f"{context.collector.id}-ev-{sequence}",
+            "source_event_id": f"{context.collector.id}-{record_type}-{sequence}",
             "operation_id": f"{context.collector.id}-op",
             "collector_run_id": f"{context.collector.id}-run",
             "scope": "target",
-            "source": source,
+            "source": _canary_source(),
             "collector": context.collector,
             "target": context.target,
-            "severity": "info",
+            "severity": severity,
             "trust_level": "authenticated",
             "privacy_class": "internal",
-            # An intentionally stale version; the pipeline restamps it with the applied policy.
             "redaction_version": "r1-e1",
-            "data": EventDataV1(category="availability", status="healthy", message=message),
+            "data": data,
         }
+    )
+
+
+def _event_draft(context: CollectorContext, *, message: str, sequence: int) -> RecordDraftV1:
+    """Build one target-scoped event draft carrying a redactable free-text ``message``."""
+
+    data = EventDataV1(category="availability", status="healthy", message=message)
+    return _draft_envelope(
+        context, sequence=sequence, record_type="event", severity="info", data=data
+    )
+
+
+def _alert_draft(context: CollectorContext, *, message: str, sequence: int) -> RecordDraftV1:
+    """Build one alert draft whose free-text ``summary`` carries redactable content."""
+
+    alert = AlertDataV1(
+        alert_key=f"{context.collector.id}-alert-{sequence}",
+        rule_id="availability-rule",
+        rule_version=1,
+        transition_id=f"{context.collector.id}-alert-transition-{sequence}",
+        revision=1,
+        previous_state="inactive",
+        state="firing",
+        triggering_observation=_canary_source().observation,
+        severity="error",
+        summary=message,
+        evidence_ids=[EVIDENCE_ID],
+    )
+    return _draft_envelope(
+        context, sequence=sequence, record_type="alert", severity="error", data=alert
+    )
+
+
+def _incident_draft(context: CollectorContext, *, message: str, sequence: int) -> RecordDraftV1:
+    """Build one incident draft; no redaction policy governs it, so the pipeline fails closed."""
+
+    incident = IncidentDataV1(
+        incident_key=f"{context.collector.id}-incident-{sequence}",
+        transition_id=f"{context.collector.id}-incident-transition-{sequence}",
+        revision=1,
+        previous_state=None,
+        transition="opened",
+        state="open",
+        triggering_observation=_canary_source().observation,
+        severity="error",
+        summary=message,
+        evidence_ids=[EVIDENCE_ID],
+    )
+    return _draft_envelope(
+        context, sequence=sequence, record_type="incident", severity="error", data=incident
     )
 
 
 @dataclass
 class FakeCollector:
-    """A fake first-party collector: returns event drafts, never writes to the spool."""
+    """A fake first-party collector: returns drafts of a chosen type, never writes to the spool."""
 
     descriptor: CollectorDescriptorV1
     messages: tuple[str, ...]
     status: str = "ok"
     raises: bool = False
+    draft_builder: Callable[..., RecordDraftV1] = field(default=_event_draft)
 
     def collect(self, context: CollectorContext) -> CollectorResult:
         if self.raises:
             raise RuntimeError("collector boom with a secret " + KNOWN_SECRET)
         drafts = tuple(
-            _event_draft(context, message=message, sequence=index)
+            self.draft_builder(context, message=message, sequence=index)
             for index, message in enumerate(self.messages, start=1)
         )
         return CollectorResult(
@@ -152,14 +221,26 @@ class FakeCollector:
         )
 
 
-def fake_factory(messages: tuple[str, ...], *, status: str = "ok", raises: bool = False) -> Any:
+def fake_factory(
+    messages: tuple[str, ...],
+    *,
+    status: str = "ok",
+    raises: bool = False,
+    draft_builder: Callable[..., RecordDraftV1] = _event_draft,
+) -> Any:
     """A first-party factory that binds ``config.id`` into the collector's descriptor."""
 
     def factory(config: Any) -> FakeCollector:
         descriptor = CollectorDescriptorV1(
             id=config.id, type="site.canary", implementation_version="1.0.0"
         )
-        return FakeCollector(descriptor=descriptor, messages=messages, status=status, raises=raises)
+        return FakeCollector(
+            descriptor=descriptor,
+            messages=messages,
+            status=status,
+            raises=raises,
+            draft_builder=draft_builder,
+        )
 
     return factory
 

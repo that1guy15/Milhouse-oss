@@ -203,22 +203,34 @@ def _load_plugin_object(entry: PluginAllowlistEntry) -> object:
 def _bind_plugin_collector(loaded: object) -> Collector:
     """Accept a bound plugin object that is, or constructs, a valid collector; else fail closed."""
 
+    # A class is routed to construction BEFORE the instance branch: a class whose body defines
+    # class-level ``descriptor`` and ``collect`` satisfies the runtime_checkable ``Collector``
+    # protocol un-instantiated, so an ``isinstance(..., Collector)`` check first would return the
+    # class object itself rather than a usable instance. Only a constructed instance is ever bound.
+    if isinstance(loaded, type):
+        return _construct_plugin_collector(loaded)
     if isinstance(loaded, Collector):
         return loaded
     if callable(loaded):
-        try:
-            constructed = loaded()
-        except Exception:
-            raise RegistryError(
-                "MH_RUNTIME_PLUGIN_LOAD", "the plugin collector could not be constructed"
-            ) from None
-        return _require_collector(
-            constructed,
-            "MH_RUNTIME_PLUGIN_INVALID",
-            "the plugin did not produce a valid collector",
-        )
+        return _construct_plugin_collector(loaded)
     raise RegistryError(
         "MH_RUNTIME_PLUGIN_INVALID", "the plugin entry point is not a collector or factory"
+    )
+
+
+def _construct_plugin_collector(factory: Callable[..., object]) -> Collector:
+    """Construct a collector from a plugin class or factory, failing closed on any error."""
+
+    try:
+        constructed = factory()
+    except Exception:
+        raise RegistryError(
+            "MH_RUNTIME_PLUGIN_LOAD", "the plugin collector could not be constructed"
+        ) from None
+    return _require_collector(
+        constructed,
+        "MH_RUNTIME_PLUGIN_INVALID",
+        "the plugin did not produce a valid collector",
     )
 
 

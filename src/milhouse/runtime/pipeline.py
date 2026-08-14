@@ -6,10 +6,13 @@ configured collector it resolves the bound collector through the registry, hands
 :class:`~milhouse.runtime.result.CollectorResult` of drafts. It then, per plan section 4.8 and the
 G05 gate ordering:
 
-1. **redacts** every draft's free text through the shared :class:`LayeredRedactor` — strictly BEFORE
-   identity assignment, so redactable content can never reach the spool. Redaction stamps the record
-   with the redaction policy that actually processed it, because the pipeline (not the collector) is
-   the redaction authority before the first durable write;
+1. **redacts** every draft's enumerated free-text leaves through the shared :class:`LayeredRedactor`
+   — strictly BEFORE identity assignment — as a defense-in-depth pass. The collector remains the
+   PRIMARY redaction authority: a :class:`~milhouse.domain.records.RecordDraftV1` is redacted by
+   contract, including structured fields such as ``dimensions``/``attributes`` (DimensionsV1 scalar
+   values), which this pass does NOT rewrite. This pass re-scans only the enumerated FreeTextV1
+   free-text leaves and stamps the record with the redaction policy that actually processed them,
+   because the pipeline runs the last redaction pass before the first durable write;
 2. **validates and finalizes** each redacted draft into a canonical
    :class:`~milhouse.domain.records.RecordEnvelopeV1`;
 3. **spools** the collector's records as one self-describing segment through
@@ -51,6 +54,7 @@ from milhouse.privacy.redact import LayeredRedactor
 from milhouse.runtime.context import CollectorContext
 from milhouse.runtime.errors import PipelineError
 from milhouse.runtime.registry import CollectorRegistry
+from milhouse.runtime.result import CollectorResult
 from milhouse.spooling import (
     DurableSpool,
     Exporter,
@@ -66,17 +70,20 @@ from milhouse.storage import CLICKHOUSE_EXPORTER_ID
 
 RuntimeMode = Literal["full", "spool_only"]
 
-# The exact free-text leaves each record data payload can carry. Redaction runs over these before
-# identity is assigned, so no unredacted free text can reach a durable segment. This is the
-# pipeline's defense-in-depth pass over the collector's own redaction (RecordDraftV1 is redacted by
-# contract). It covers the record types collectors emit today (canary -> event); as collectors that
-# produce metric/run/span land in later increments, EXTEND this map so the net stays complete for
-# every record type _RETENTION_FIELDS admits.
+# The exact FreeTextV1 free-text leaves each collector-producible record payload can carry. This is
+# the pipeline's defense-in-depth pass over the collector's own redaction (a RecordDraftV1 is
+# redacted by contract, structured fields included); it re-scans only these enumerated leaves and
+# does NOT rewrite structured dimensions/attributes. The keys cover EXACTLY the collector-producible
+# record types -- kept symmetric with _RETENTION_FIELDS -- so metric/run/span appear with an empty
+# leaf tuple; a record type absent from this map fails closed at redaction (see _redact_draft)
+# rather than reaching the spool un-scanned.
 _FREE_TEXT_FIELDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
         "event": ("message",),
+        "metric": (),
+        "run": (),
+        "span": (),
         "alert": ("summary",),
-        "incident": ("summary",),
         "feedback_item": ("title", "summary", "recommendation"),
         "feedback_transition": ("rationale",),
     }
@@ -253,6 +260,17 @@ class RuntimePipeline:
             "MH_RUNTIME_PIPELINE_EXPORTERS",
             "each configured exporter must satisfy the exporter protocol",
         )
+        # deliver_segment resolves an exporter by the map KEY and requires it to self-identify
+        # (exporter.exporter_id == key). A mismatched key would return no_exporter and silently
+        # strand committed records, so require the key to equal the exporter's own id here.
+        _require(
+            all(
+                getattr(exporter, "exporter_id", None) == key
+                for key, exporter in exporter_map.items()
+            ),
+            "MH_RUNTIME_PIPELINE_EXPORTERS",
+            "each exporter must be keyed by its own exporter_id",
+        )
         # Mode binds the delivery obligation a committed segment records: spool_only carries none;
         # full records exactly the configured exporter ids and drives them after every commit.
         if mode == "spool_only":
@@ -358,6 +376,12 @@ class RuntimePipeline:
             redactor=self._redactor,
         )
         result = collector.collect(context)
+        if not isinstance(result, CollectorResult):
+            # Fail closed on a duck-typed result: only a real CollectorResult has passed the
+            # status/draft-count/diagnostics validation. Caught by the per-collector isolation.
+            raise PipelineError(
+                "MH_RUNTIME_PIPELINE_RESULT", "the collector returned an invalid result"
+            )
         item.status = result.status
         item.drafts_produced = len(result.drafts)
         if not result.drafts:
@@ -459,11 +483,15 @@ class RuntimePipeline:
             item = committed_at_delivery.get(attempt.batch_id)
             if item is None:
                 continue
-            # Two independent guards (not if/elif) so both arcs of each are exercised; an outcome
-            # that is neither delivered nor failed (e.g. a withheld segment) records neither.
+            # Attribute EVERY terminal outcome of this run's clickhouse attempts so a committed
+            # record is never indistinguishable from "still pending": delivered/already_delivered
+            # count as delivered, while every other outcome (failed/no_exporter/expired/segment_gone
+            # -- a withheld, unmatched, or vanished segment) counts as failed. Full multi-exporter
+            # aggregation across more than one required exporter is deferred; attribution stays
+            # scoped to CLICKHOUSE_EXPORTER_ID.
             if attempt.outcome in ("delivered", "already_delivered"):
                 item.records_delivered = item.records_committed
-            if attempt.outcome == "failed":
+            else:
                 item.records_failed = item.records_committed
         return None
 
@@ -492,23 +520,31 @@ def _target_descriptor(
 
 
 def _redact_draft(draft: RecordDraftV1, *, redactor: LayeredRedactor) -> RecordDraftV1:
-    """Redact a draft's free-text leaves and stamp the applied redaction policy version.
+    """Re-scan a draft's enumerated free-text leaves and stamp the applied redaction policy version.
 
-    This runs strictly BEFORE :func:`finalize_record`, so a draft carrying redactable content is
-    always redacted before it can reach the spool. Redaction is defense in depth: even a collector
-    that neglected to redact cannot smuggle raw free text past this gate.
+    This runs strictly BEFORE :func:`finalize_record`, as a defense-in-depth pass over the
+    collector's own redaction (the collector remains the primary redaction authority, responsible
+    for structured fields this pass does not rewrite). A record type no redaction policy governs
+    fails closed, mirroring :meth:`RuntimePipeline._retention_days`, rather than reaching the spool
+    un-scanned.
     """
 
     values = draft.model_dump(mode="python", exclude_none=True)
     data = values.get("data")
     if type(data) is dict:  # pragma: no branch - a validated draft always dumps a dict payload
-        data_type = data.get("type")
-        for field_name in _FREE_TEXT_FIELDS.get(str(data_type), ()):
+        fields = _FREE_TEXT_FIELDS.get(str(data.get("type")))
+        if fields is None:
+            # Fail closed on an unmapped record type: never guess a redaction policy, and never let
+            # an un-scanned payload reach the durable spool.
+            raise PipelineError(
+                "MH_RUNTIME_PIPELINE_REDACTION", "no redaction policy governs the record type"
+            )
+        for field_name in fields:
             text = data.get(field_name)
             if type(text) is str:
                 data[field_name] = redactor.redact(text).value
-    # The pipeline is the redaction authority before the first durable write: record the policy that
-    # actually processed the content, not whatever version the collector claimed.
+    # This pass ran the last redaction before the first durable write: record the policy that
+    # actually processed the free-text leaves, not whatever version the collector claimed.
     values["redaction_version"] = redactor.version
     return RecordDraftV1.model_validate(values)
 
@@ -517,8 +553,10 @@ def _batch_id(collector_id: str, records: tuple[RecordEnvelopeV1, ...], *, now: 
     """Derive a deterministic, unique batch id from the collector, run instant, and record ids.
 
     Deterministic (no wall-clock or random call in library code): identical inputs produce an
-    identical id, so a re-run of the exact same collection is idempotent at the segment file and
-    ledger, while any change in the run instant or the derived record ids yields a distinct segment.
+    identical id, while any change in the run instant or the derived record ids yields a distinct
+    segment. A same-instant re-run is NOT a silent no-op: the writer refuses to overwrite the
+    existing segment name (``MH_SPOOL_EXISTS``), surfaced as a per-collector error, so the durable
+    data is never duplicated even though the re-run does not silently succeed.
     """
 
     stamp = format_timestamp(now)

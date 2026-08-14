@@ -6,7 +6,7 @@ non-sensitive data. Every rejection is a fixed ``PipelineError`` code.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from _record_factories import INSTALLATION_ID, NOW, event_record
@@ -51,9 +51,14 @@ def test_a_naive_run_instant_fails_closed() -> None:
 
 
 def test_a_non_utc_run_instant_is_normalized_to_utc() -> None:
-    # An aware, in-range instant is accepted and normalized to canonical UTC.
-    context = _context(now=datetime(2026, 7, 21, 15, 0, tzinfo=UTC))
+    # A genuinely offset-aware instant (+05:00) is accepted and CONVERTED to canonical UTC: the same
+    # instant, but the wall-clock hour actually changes (20:00+05:00 -> 15:00Z) and tzinfo is UTC.
+    aware = datetime(2026, 7, 21, 20, 0, tzinfo=timezone(timedelta(hours=5)))
+    context = _context(now=aware)
+    assert context.now == aware  # the same absolute instant is preserved ...
+    assert context.now == datetime(2026, 7, 21, 15, 0, tzinfo=UTC)  # ... normalized to UTC
     assert context.now.tzinfo == UTC
+    assert context.now.hour == 15  # the offset conversion changed the wall-clock hour
 
 
 def test_a_malformed_installation_id_fails_closed() -> None:

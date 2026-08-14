@@ -216,6 +216,12 @@ def test_bind_plugin_collector_accepts_instance_factory_and_rejects_the_rest() -
     stub = _StubCollector()
     assert registry_module._bind_plugin_collector(stub) is stub
 
+    # A class satisfies the runtime_checkable Collector protocol un-instantiated (class-level
+    # descriptor + collect), so it must be CONSTRUCTED, never returned as the type object itself.
+    constructed_from_class = registry_module._bind_plugin_collector(_StubCollector)
+    assert isinstance(constructed_from_class, _StubCollector)
+    assert constructed_from_class is not _StubCollector
+
     def _factory() -> _StubCollector:
         return stub
 
