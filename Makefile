@@ -129,6 +129,9 @@ test-coverage:
 		--critical 'src/milhouse/runtime/pipeline.py' \
 		--critical 'src/milhouse/runtime/registry.py' \
 		--critical 'src/milhouse/runtime/result.py' \
+		--critical 'src/milhouse/http/client.py' \
+		--critical 'src/milhouse/http/errors.py' \
+		--critical 'src/milhouse/collectors/site_canary.py' \
 		--critical 'scripts/check_artifacts.py' \
 		--critical 'scripts/check_coverage.py' \
 		--critical 'scripts/check_dco.py' \
