@@ -123,6 +123,12 @@ test-coverage:
 		--critical 'src/milhouse/storage/repository.py' \
 		--critical 'src/milhouse/storage/runner.py' \
 		--critical 'src/milhouse/storage/schema.py' \
+		--critical 'src/milhouse/runtime/__init__.py' \
+		--critical 'src/milhouse/runtime/context.py' \
+		--critical 'src/milhouse/runtime/errors.py' \
+		--critical 'src/milhouse/runtime/pipeline.py' \
+		--critical 'src/milhouse/runtime/registry.py' \
+		--critical 'src/milhouse/runtime/result.py' \
 		--critical 'scripts/check_artifacts.py' \
 		--critical 'scripts/check_coverage.py' \
 		--critical 'scripts/check_dco.py' \
