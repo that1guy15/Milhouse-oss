@@ -26,11 +26,15 @@ from _runtime_harness import (
 
 from milhouse.config._models import PluginAllowlistEntry
 from milhouse.core.clock import FixedClock
-from milhouse.domain.records import CollectorDescriptorV1, RecordDraftV1
+from milhouse.domain.records import CollectorDescriptorV1, EventDataV1, RecordDraftV1
 from milhouse.runtime import CollectorRegistry, CollectorResult
 from milhouse.runtime import registry as registry_module
 from milhouse.runtime.errors import PipelineError, RegistryError
-from milhouse.runtime.pipeline import _redact_draft, _target_descriptor
+from milhouse.runtime.pipeline import (
+    _availability_sample,
+    _redact_draft,
+    _target_descriptor,
+)
 
 _CLOCK = FixedClock(instant=NOW)
 _GROUP = "milhouse.collectors"
@@ -278,6 +282,31 @@ def test_target_descriptor_absent_and_undeclared() -> None:
     with pytest.raises(PipelineError) as caught:
         _target_descriptor(SimpleNamespace(target="missing"), {})
     assert caught.value.code == "MH_RUNTIME_PIPELINE_TARGET"
+
+
+def _availability_record(
+    status: str, *, category: str = "availability", record_type: str = "event"
+):
+    # ``_availability_sample`` reads only these attributes, so a stand-in exercises every branch.
+    return SimpleNamespace(
+        record_type=record_type,
+        data=EventDataV1(category=category, status=status),
+        record_id=f"rid-{status}-{category}",
+    )
+
+
+def test_availability_sample_maps_health_and_ignores_everything_else() -> None:
+    healthy = _availability_record("healthy")
+    degraded = _availability_record("degraded")
+    assert _availability_sample((healthy,)) == ("success", healthy.record_id)
+    assert _availability_sample((degraded,)) == ("failure", degraded.record_id)
+    # An availability event with an unexpected status maps to no sample (only healthy/degraded map).
+    assert _availability_sample((_availability_record("unknown"),)) is None
+    # A non-availability event and a non-event record both contribute no sample.
+    assert _availability_sample((_availability_record("healthy", category="latency"),)) is None
+    assert _availability_sample((_availability_record("healthy", record_type="metric"),)) is None
+    # No records at all yields no sample.
+    assert _availability_sample(()) is None
 
 
 def test_redact_draft_skips_absent_free_text_but_still_stamps_the_policy() -> None:

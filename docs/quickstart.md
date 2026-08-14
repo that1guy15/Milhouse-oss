@@ -30,10 +30,10 @@ barrier, and generates a durable non-secret installation identity.
 
 ```console
 $ milhouse --config ./config.toml init
-initialized: directories=state_root, control, spool, reports, logs, backups; schema 10; installation id created
+initialized: directories=state_root, control, spool, reports, logs, backups; schema 11; installation id created
 
 $ milhouse --config ./config.toml init
-already initialized (schema 10)
+already initialized (schema 11)
 ```
 
 ## 3. Check health
@@ -49,7 +49,7 @@ $ milhouse --config ./config.toml health
 [ok] directory:reports: present
 [ok] directory:logs: present
 [ok] directory:backups: present
-[ok] control_database: schema 10
+[ok] control_database: schema 11
 [ok] installation_identity: established
 status: healthy
 

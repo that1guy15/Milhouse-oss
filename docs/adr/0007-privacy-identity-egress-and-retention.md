@@ -121,7 +121,12 @@ Contract after this addendum:
 - W03 no longer implements or gates the mixed-expiry rewrite. The `_installation_key` (migration 11)
   and `_compaction_intents`/`_sequences` (migration 12) tables and the reserved `c[0-9a-f]{64}`
   successor namespace are withdrawn; the control schema returns to version 10. The retention
-  retirement tombstone (migration 10) is retained.
+  retirement tombstone (migration 10) is retained. Because these migration numbers are withdrawn (not
+  reserved) and control migrations are strictly contiguous, the next control migration to land takes
+  slot 11: **W05 alerting claims migration 11 for the `_alert_rule_state` table** (schema 11). When
+  the deferred installation-key and compaction tables are re-scoped in (W06/later) they take the next
+  free contiguous migration numbers at that time — the "migration 11 = `_installation_key`" / "12"
+  references elsewhere in this ADR and the plan describe the pre-A09 plan and are superseded here.
 - Retention prunes only fully-expired segments, behind the durable retirement tombstone, and leaves
   a mixed-expiry segment classified and in place — never deleted, never egressed. Export withholds a
   mixed-expiry or fully-expired segment (fail-closed), so no expired record is ever forwarded and no

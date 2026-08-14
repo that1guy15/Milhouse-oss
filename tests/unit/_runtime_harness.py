@@ -260,6 +260,7 @@ def make_pipeline(
     spool_root: Path,
     clock: Any,
     exporters: Any = None,
+    alert_rules: Any = (),
 ) -> RuntimePipeline:
     return RuntimePipeline(
         mode=mode,  # type: ignore[arg-type]
@@ -273,6 +274,7 @@ def make_pipeline(
         clock=clock,
         retention=retention_config(),
         exporters={} if exporters is None else exporters,
+        alert_rules=alert_rules,
     )
 
 

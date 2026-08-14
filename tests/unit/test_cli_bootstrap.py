@@ -50,7 +50,7 @@ def test_initialize_creates_the_full_layout_schema_and_identity(tmp_path: Path) 
         "logs",
         "backups",
     }
-    assert report.schema_version == bootstrap.EXPECTED_SCHEMA_VERSION == 10
+    assert report.schema_version == bootstrap.EXPECTED_SCHEMA_VERSION == 11
     assert report.installation_id_created is True
     assert report.already_initialized is False
     for _label, directory in bootstrap._managed_directories(paths):
@@ -192,7 +192,7 @@ def test_cli_init_json_is_stable(tmp_path: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["--config", str(config_file), "init", "--json"])
     assert result.exit_code == 0
-    assert '"schema_version": 10' in result.output
+    assert '"schema_version": 11' in result.output
     assert '"installation_id_created": true' in result.output
 
 

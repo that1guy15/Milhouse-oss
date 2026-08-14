@@ -41,16 +41,28 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
 
-from milhouse.config._models import CollectorConfig, RetentionConfig, TargetConfig
+from milhouse.config._models import (
+    CanaryStateAlertRule,
+    CollectorConfig,
+    RetentionConfig,
+    TargetConfig,
+)
 from milhouse.core.clock import WallClock, format_timestamp
 from milhouse.core.errors import normalize_error
 from milhouse.domain.records import (
+    EventDataV1,
     RecordDraftV1,
     RecordEnvelopeV1,
     TargetDescriptorV1,
     finalize_record,
 )
 from milhouse.privacy.redact import LayeredRedactor
+from milhouse.runtime.alerting import (
+    CANARY_STATE_RULE_VERSION,
+    AlertOutcome,
+    AlertRuleSpec,
+    evaluate_canary_state_rule,
+)
 from milhouse.runtime.context import CollectorContext
 from milhouse.runtime.errors import PipelineError
 from milhouse.runtime.registry import CollectorRegistry
@@ -65,8 +77,19 @@ from milhouse.spooling import (
     spool_frame_line,
 )
 from milhouse.spooling.reader import INSTALLATION_ID_PATTERN
-from milhouse.state import ControlDatabase, GlobalCommitBarrier
+from milhouse.state import (
+    ControlDatabase,
+    GlobalCommitBarrier,
+    advance_alert_state,
+    read_alert_state,
+)
 from milhouse.storage import CLICKHOUSE_EXPORTER_ID
+
+#: One availability sample the alert stage consumes: the mapped outcome and the triggering record id
+#: (``None`` when a collector failed with no availability record to cite -- the site_canary no
+#: longer does this, since its probe failure now emits a degraded event, but a generic collector
+#: that returns failed-with-no-drafts still can).
+_AvailabilitySample = tuple[AlertOutcome, str | None]
 
 RuntimeMode = Literal["full", "spool_only"]
 
@@ -128,6 +151,11 @@ class PipelineRunSummary:
     mode: RuntimeMode
     export_error_code: str | None
     collectors: tuple[CollectorRunSummary, ...]
+    #: Alert transitions this run emitted, counted by kind. ``alerts_error_code`` is the first fixed
+    #: code an isolated alert-rule evaluation failed with, or ``None``. All privacy-safe.
+    alerts_fired: int = 0
+    alerts_resolved: int = 0
+    alerts_error_code: str | None = None
 
     @property
     def records_committed(self) -> int:
@@ -177,6 +205,7 @@ class RuntimePipeline:
     """A configured, mode-aware runtime pipeline over one control plane and durable spool."""
 
     __slots__ = (
+        "_alert_rules",
         "_barrier",
         "_clock",
         "_config_generation",
@@ -205,6 +234,7 @@ class RuntimePipeline:
         clock: WallClock,
         retention: RetentionConfig,
         exporters: Mapping[str, Exporter] = MappingProxyType({}),
+        alert_rules: Sequence[CanaryStateAlertRule] = (),
     ) -> None:
         _require(
             mode in ("full", "spool_only"),
@@ -285,6 +315,12 @@ class RuntimePipeline:
                 "MH_RUNTIME_PIPELINE_EXPORTERS",
                 "full mode requires at least one exporter",
             )
+        alert_rule_tuple = tuple(alert_rules)
+        _require(
+            all(isinstance(rule, CanaryStateAlertRule) for rule in alert_rule_tuple),
+            "MH_RUNTIME_PIPELINE_ALERT_RULES",
+            "each alert rule must be a canary_state alert rule",
+        )
         self._mode = mode
         self._config_generation = config_generation
         self._registry = registry
@@ -297,6 +333,7 @@ class RuntimePipeline:
         self._retention = retention
         self._exporters: Mapping[str, Exporter] = MappingProxyType(exporter_map)
         self._required_exporters = tuple(sorted(exporter_map))
+        self._alert_rules: tuple[CanaryStateAlertRule, ...] = alert_rule_tuple
 
     def run(
         self,
@@ -321,17 +358,37 @@ class RuntimePipeline:
             installation_id=self._installation_id,
         )
         work: list[_CollectorWork] = []
+        # collector id -> the availability sample its run produced (canary rules alert on this).
+        availability: dict[str, _AvailabilitySample] = {}
         for config in collectors:
             item = _CollectorWork(collector_id=str(getattr(config, "id", "")))
             work.append(item)
             try:
-                self._run_collector(config, item, spool=spool, target_by_id=target_by_id, now=now)
+                self._run_collector(
+                    config,
+                    item,
+                    spool=spool,
+                    target_by_id=target_by_id,
+                    availability=availability,
+                    now=now,
+                )
             except Exception as error:
                 # Per-collector isolation: never abort the run; capture only the fixed code.
                 item.status = "error"
                 item.error_code = normalize_error(error).code
                 item.records_committed = 0
                 item.batch_id = None
+
+        # Alert stage: AFTER the whole collector loop (so every availability record is committed and
+        # citable as evidence) and BEFORE the export tail (so full mode drains any alert segment
+        # this run emits). Each rule is isolated; a failure never aborts the run or the other rules.
+        alerts_fired, alerts_resolved, alerts_error_code = self._drive_alerts(
+            collectors=collectors,
+            spool=spool,
+            target_by_id=target_by_id,
+            availability=availability,
+            now=now,
+        )
 
         # Full mode ALWAYS drives the delivery tail, even on a run that committed nothing this pass:
         # the tail drains the whole ledger (delivery_status=None), so a backlog a prior warehouse
@@ -348,6 +405,9 @@ class RuntimePipeline:
             mode=self._mode,
             export_error_code=export_error_code,
             collectors=tuple(item.freeze() for item in work),
+            alerts_fired=alerts_fired,
+            alerts_resolved=alerts_resolved,
+            alerts_error_code=alerts_error_code,
         )
 
     def _run_collector(
@@ -357,6 +417,7 @@ class RuntimePipeline:
         *,
         spool: DurableSpool,
         target_by_id: Mapping[str, TargetConfig],
+        availability: dict[str, _AvailabilitySample],
         now: datetime,
     ) -> None:
         collector = self._registry.resolve(config)
@@ -384,13 +445,141 @@ class RuntimePipeline:
             )
         item.status = result.status
         item.drafts_produced = len(result.drafts)
+        if result.status == "failed":
+            # A collector that failed with no drafts is a failure sample with no privacy-safe
+            # record to cite as evidence. The site_canary no longer reaches this path (its probe
+            # failure now emits a degraded event); it remains for a generic failed-with-no-drafts
+            # collector, whose transition then defers to the first evidence-bearing failure.
+            availability[str(config.id)] = ("failure", None)
         if not result.drafts:
             return
         records = tuple(self._finalize(draft) for draft in result.drafts)
-        header, frames = self._build_segment(config, records, now=context.now)
+        header, frames = self._build_segment(str(config.id), records, now=context.now)
         committed = spool.commit_segment(header, frames, committed_at=context.now)
         item.records_committed = committed.record_count
         item.batch_id = committed.batch_id
+        # Capture the committed availability record as the alert sample; its record id is the
+        # evidence a firing/resolution transition cites.
+        sample = _availability_sample(records)
+        if sample is not None:
+            availability[str(config.id)] = sample
+
+    def _drive_alerts(
+        self,
+        *,
+        collectors: Sequence[CollectorConfig],
+        spool: DurableSpool,
+        target_by_id: Mapping[str, TargetConfig],
+        availability: Mapping[str, _AvailabilitySample],
+        now: datetime,
+    ) -> tuple[int, int, str | None]:
+        """Evaluate every configured alert rule against this run's samples; return the alert counts.
+
+        Each rule is isolated exactly like a collector: a single rule raising is captured as a fixed
+        code and never aborts the run or the other rules. A rule whose collector did not run this
+        pass (no sample) is a silent no-op.
+        """
+
+        fired_total = 0
+        resolved_total = 0
+        error_code: str | None = None
+        if not self._alert_rules:
+            return fired_total, resolved_total, error_code
+        collector_by_id = {str(config.id): config for config in collectors}
+        for rule in self._alert_rules:
+            try:
+                fired, resolved = self._evaluate_rule(
+                    rule,
+                    collector_by_id=collector_by_id,
+                    spool=spool,
+                    target_by_id=target_by_id,
+                    availability=availability,
+                    now=now,
+                )
+                fired_total += fired
+                resolved_total += resolved
+            except Exception as error:
+                if error_code is None:
+                    error_code = normalize_error(error).code
+        return fired_total, resolved_total, error_code
+
+    def _evaluate_rule(
+        self,
+        rule: CanaryStateAlertRule,
+        *,
+        collector_by_id: Mapping[str, CollectorConfig],
+        spool: DurableSpool,
+        target_by_id: Mapping[str, TargetConfig],
+        availability: Mapping[str, _AvailabilitySample],
+        now: datetime,
+    ) -> tuple[int, int]:
+        """Run one rule's engine, commit any transition, then CAS-advance the durable rule state."""
+
+        sample = availability.get(str(rule.collector))
+        collector_config = collector_by_id.get(str(rule.collector))
+        if sample is None or collector_config is None:
+            # The referenced collector produced no sample this run (idle, errored, or unconfigured).
+            return 0, 0
+        target = _target_descriptor(collector_config, target_by_id)
+        _require(
+            target is not None,
+            "MH_RUNTIME_PIPELINE_ALERT",
+            "a canary alert rule requires a target-scoped collector",
+        )
+        assert target is not None  # narrowed by the guard above
+        outcome, triggering_record_id = sample
+        spec = AlertRuleSpec(
+            rule_id=str(rule.id),
+            rule_version=CANARY_STATE_RULE_VERSION,
+            collector=str(rule.collector),
+            consecutive_failures=rule.consecutive_failures,
+            consecutive_successes=rule.consecutive_successes,
+            cooldown_seconds=rule.cooldown_seconds,
+        )
+        current = read_alert_state(self._control, spec.rule_id, spec.rule_version)
+        evaluation = evaluate_canary_state_rule(
+            spec,
+            outcome=outcome,
+            triggering_record_id=triggering_record_id,
+            target=target,
+            now=now,
+            current=current,
+        )
+        fired = 0
+        resolved = 0
+        if evaluation.draft is not None:
+            record = self._finalize(evaluation.draft)
+            header, frames = self._build_segment(spec.rule_id, (record,), now=now)
+            # Commit the durable alert segment FIRST, then CAS-advance the per-rule state below --
+            # the same commit-before-frontier ordering the source cursors and derivation checkpoints
+            # use, so the frontier never runs ahead of a committed record. This is
+            # commit-before-frontier AT-LEAST-ONCE, not full idempotency: a crash (or an
+            # ``advance_alert_state`` failure) between this commit and the state advance leaves the
+            # per-rule state un-advanced, so the next cycle re-evaluates the still-failing target
+            # and can re-emit a firing -- a DUPLICATE firing record for one outage, sharing the
+            # ``alert_key`` and possibly the same ``revision`` (only the instant-derived transition
+            # id and record id differ). That is the accepted "never miss a fire, may duplicate one"
+            # tradeoff, not exactly-once. A commit failure is isolated per rule.
+            spool.commit_segment(header, frames, committed_at=now)
+            if evaluation.transition == "firing":
+                fired = 1
+            else:
+                resolved = 1
+        update = evaluation.update
+        advance_alert_state(
+            self._control,
+            spec.rule_id,
+            spec.rule_version,
+            consecutive_fail_count=update.consecutive_fail_count,
+            consecutive_success_count=update.consecutive_success_count,
+            current_state=update.current_state,
+            cooldown_until=update.cooldown_until,
+            last_sample_at=update.last_sample_at,
+            last_transition_id=update.last_transition_id,
+            now=now,
+            expected_revision=update.expected_revision,
+        )
+        return fired, resolved
 
     def _finalize(self, draft: RecordDraftV1) -> RecordEnvelopeV1:
         """Redact a draft's free text, then assign its deterministic canonical identity."""
@@ -400,7 +589,7 @@ class RuntimePipeline:
 
     def _build_segment(
         self,
-        config: CollectorConfig,
+        source_id: str,
         records: tuple[RecordEnvelopeV1, ...],
         *,
         now: datetime,
@@ -412,14 +601,14 @@ class RuntimePipeline:
         _require(
             len(scopes) == 1 and len(privacy_classes) == 1 and len(target_ids) == 1,
             "MH_RUNTIME_PIPELINE_SEGMENT",
-            "a collector's records must share one scope, target, and privacy class",
+            "a segment's records must share one scope, target, and privacy class",
         )
         _require(
             len(record_types) == 1,
             "MH_RUNTIME_PIPELINE_SEGMENT",
-            "a collector's records must share one record type",
+            "a segment's records must share one record type",
         )
-        batch_id = _batch_id(str(config.id), records, now=now)
+        batch_id = _batch_id(source_id, records, now=now)
         frames = tuple(
             SpoolFrameV1(batch_id=batch_id, sequence=index, record=record)
             for index, record in enumerate(records, start=1)
@@ -496,6 +685,28 @@ class RuntimePipeline:
         return None
 
 
+def _availability_sample(records: tuple[RecordEnvelopeV1, ...]) -> _AvailabilitySample | None:
+    """Map a collector's committed availability event to an alert sample and its evidence id.
+
+    A ``healthy`` availability event is a success sample; a ``degraded`` one is a failure sample.
+    The committed record's id is the evidence a resulting transition cites. A collector that
+    produced no availability event contributes no sample.
+    """
+
+    for record in records:
+        data = record.data
+        if (
+            record.record_type == "event"
+            and isinstance(data, EventDataV1)
+            and data.category == "availability"
+        ):
+            if data.status == "healthy":
+                return ("success", record.record_id)
+            if data.status == "degraded":
+                return ("failure", record.record_id)
+    return None
+
+
 def _target_descriptor(
     config: CollectorConfig, target_by_id: Mapping[str, TargetConfig]
 ) -> TargetDescriptorV1 | None:
@@ -549,20 +760,23 @@ def _redact_draft(draft: RecordDraftV1, *, redactor: LayeredRedactor) -> RecordD
     return RecordDraftV1.model_validate(values)
 
 
-def _batch_id(collector_id: str, records: tuple[RecordEnvelopeV1, ...], *, now: datetime) -> str:
-    """Derive a deterministic, unique batch id from the collector, run instant, and record ids.
+def _batch_id(source_id: str, records: tuple[RecordEnvelopeV1, ...], *, now: datetime) -> str:
+    """Derive a deterministic, unique batch id for any committed segment from its source id, run
+    instant, and record ids.
 
     Deterministic (no wall-clock or random call in library code): identical inputs produce an
     identical id, while any change in the run instant or the derived record ids yields a distinct
-    segment. A same-instant re-run is NOT a silent no-op: the writer refuses to overwrite the
-    existing segment name (``MH_SPOOL_EXISTS``), surfaced as a per-collector error, so the durable
-    data is never duplicated even though the re-run does not silently succeed.
+    segment. ``source_id`` is whatever produced the segment -- a collector id for an availability
+    segment, a rule id for an alert segment -- so this stays record-source-agnostic. A same-instant
+    re-run is NOT a silent no-op: the writer refuses to overwrite the existing segment name
+    (``MH_SPOOL_EXISTS``), surfaced to the caller as a fixed code, so the durable data is never
+    duplicated even though the re-run does not silently succeed.
     """
 
     stamp = format_timestamp(now)
     material = "\n".join((stamp, *(record.record_id for record in records))).encode("utf-8")
     suffix = hashlib.sha256(material).hexdigest()[:_BATCH_SUFFIX_LENGTH]
-    return f"{collector_id}-{suffix}"
+    return f"{source_id}-{suffix}"
 
 
 __all__ = [

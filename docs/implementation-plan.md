@@ -239,7 +239,12 @@ feature nothing calls and re-opens the same successor-identity design that gener
 Compatibility and migration: no wire byte, record envelope, privacy class, retention day, or egress
 rule changes; because no installation has been released, withdrawing migrations 11 and 12 is a no-op
 against real state and the control schema resolves to version 10, and a future package reintroduces
-the rewrite behind its own accepted amendment and forward migration. Security impact: every privacy
+the rewrite behind its own accepted amendment and forward migration. Because control migrations are
+strictly contiguous and 11/12 are now withdrawn (not reserved), **W05 alerting claims the next free
+slot, migration 11, for the `_alert_rule_state` table** (schema 11); the deferred installation-key
+and compaction tables therefore take the next free contiguous migration numbers when they are
+re-scoped in, and the "migration 11 = `_installation_key`" / "migration 12" references earlier in
+this plan describe the pre-A09 design and are superseded by this. Security impact: every privacy
 invariant is preserved and moved toward fail-closed — expired and mixed-expiry data is withheld from
 egress and never pruned early, the keyed-pseudonym lineage requirement moves to the package that
 owns the key lifecycle instead of being established inside compaction, and no attacker-reachable

@@ -236,6 +236,42 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
             "CHECK (length(file_sha256) = 64))",
         ),
     ),
+    Migration(
+        11,
+        "create_alert_rule_state",
+        (
+            # Per-rule/version canary alert-engine state (plan section 4.6, W05 alerting). The
+            # canary_state engine derives alert transitions from committed availability records and
+            # advances THIS row via a compare-and-set against the exact prior ``revision`` — the
+            # same projection-CAS protocol the derivation checkpoints and feedback transitions use
+            # — so a replayed, restarted, or concurrent pass cannot fork current alert state or
+            # double-emit a firing transition. The (rule_id, rule_version) key keeps a rule-logic
+            # revision from inheriting a prior version's consecutive-sample counters, cooldown, or
+            # state. The row carries only the consecutive fail/success counters, the system-derived
+            # inactive|firing|resolved state, the cooldown/last-sample instants, the last transition
+            # id, and the monotonic revision — never a raw payload, URL, or probe body. The nullable
+            # cooldown_until/last_sample_at/last_transition_id are NULL until a sample or transition
+            # sets them.
+            "CREATE TABLE _alert_rule_state ("
+            "rule_id TEXT NOT NULL, "
+            "rule_version INTEGER NOT NULL, "
+            "consecutive_fail_count INTEGER NOT NULL, "
+            "consecutive_success_count INTEGER NOT NULL, "
+            "current_state TEXT NOT NULL, "
+            "cooldown_until TEXT, "
+            "last_sample_at TEXT, "
+            "last_transition_id TEXT, "
+            "revision INTEGER NOT NULL, "
+            "updated_at TEXT NOT NULL, "
+            "PRIMARY KEY (rule_id, rule_version), "
+            "CHECK (length(rule_id) > 0), "
+            "CHECK (rule_version >= 1), "
+            "CHECK (consecutive_fail_count >= 0), "
+            "CHECK (consecutive_success_count >= 0), "
+            "CHECK (current_state IN ('inactive', 'firing', 'resolved')), "
+            "CHECK (revision >= 1))",
+        ),
+    ),
 )
 
 

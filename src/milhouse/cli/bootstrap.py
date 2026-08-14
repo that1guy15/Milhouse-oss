@@ -38,8 +38,9 @@ CONTROL_DIRNAME = "control"
 DATABASE_NAME = "milhouse.sqlite3"
 BARRIER_NAME = "commit.lock"
 INSTALLATION_ID_NAME = "installation.id"
-#: The current applied control-schema version (see ``state/schema.py``; A09 returned it to 10).
-EXPECTED_SCHEMA_VERSION = 10
+#: The current applied control-schema version (see ``state/schema.py``; W05 appended migration 11,
+#: the canary alert-rule state table).
+EXPECTED_SCHEMA_VERSION = 11
 
 _DIR_MODE = 0o700
 _ID_FILE_MODE = 0o600

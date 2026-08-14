@@ -113,23 +113,32 @@ def test_the_collector_probes_the_configured_url_once_with_tls_and_no_redirect()
     assert request.headers["host"] == "example.test"
 
 
-# --- fail-closed on a client / SSRF / timeout failure ------------------------------------------
+# --- a probe failure is a degraded, alertable event (no url / error-detail leak) ---------------
 
 
-def test_a_client_failure_yields_a_failed_result_with_no_drafts_and_no_leaked_url() -> None:
+def test_a_client_failure_yields_a_degraded_probe_failure_event_with_no_leaked_detail() -> None:
     # The host resolves to a private address, so the SSRF guard trips inside the client.
     collector, _ = _collector(
         lambda request: stream_response(200), resolver=fixed_resolver("10.0.0.5")
     )
     result = collector.collect(_context(collector))
-    assert result.status == "failed"
-    assert result.drafts == ()
-    assert dict(result.diagnostics) == {"probes": 1, "probe_failures": 1}
-    # No configured URL or host leaks through the failed result.
-    assert "example.test" not in repr(result)
+    # A fully-failing probe stays alertable: one degraded availability event carrying only a
+    # privacy-safe probe_failed count -- never a false-healthy sample, never a dropped record.
+    assert result.status == "ok"
+    assert dict(result.diagnostics) == {"probes": 1, "probe_failures": 1, "degraded": 1}
+    (draft,) = result.drafts
+    assert isinstance(draft.data, EventDataV1)
+    assert draft.data.category == "availability"
+    assert draft.data.status == "degraded"
+    assert dict(draft.data.attributes) == {"probe_failed": 1}
+    assert "http_status" not in draft.data.attributes
+    # The record identity shape is unchanged from a responding probe (scheduled instant + route).
+    assert set(draft.source.observation.parts) == {"scheduled_at", "route"}
+    # Neither the resolved private address nor any error detail leaks into the result or its draft.
+    assert "10.0.0.5" not in repr(result)
 
 
-def test_a_transport_timeout_yields_a_failed_result() -> None:
+def test_a_transport_timeout_yields_a_degraded_probe_failure_event() -> None:
     def timing_out(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("slow")
 
@@ -139,8 +148,12 @@ def test_a_transport_timeout_yields_a_failed_result() -> None:
     client = BoundedHttpClient(resolver=fixed_resolver(_PUBLIC), transport=transport)
     collector = build_collector(_config(), client=client)
     result = collector.collect(_context(collector))
-    assert result.status == "failed"
-    assert result.drafts == ()
+    assert result.status == "ok"
+    (draft,) = result.drafts
+    assert draft.data.status == "degraded"
+    assert dict(draft.data.attributes) == {"probe_failed": 1}
+    # The transport error detail never leaks into the result.
+    assert "slow" not in repr(result)
 
 
 # --- deterministic, idempotent record identity -------------------------------------------------

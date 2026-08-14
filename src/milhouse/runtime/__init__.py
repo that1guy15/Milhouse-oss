@@ -9,6 +9,14 @@ package wires nothing into the CLI — command wiring is W06.
 
 from __future__ import annotations
 
+from milhouse.runtime.alerting import (
+    CANARY_STATE_RULE_VERSION,
+    AlertEvaluation,
+    AlertOutcome,
+    AlertRuleSpec,
+    AlertStateUpdate,
+    evaluate_canary_state_rule,
+)
 from milhouse.runtime.context import CollectorContext
 from milhouse.runtime.errors import PipelineError, RegistryError
 from milhouse.runtime.pipeline import (
@@ -21,6 +29,11 @@ from milhouse.runtime.registry import Collector, CollectorFactory, CollectorRegi
 from milhouse.runtime.result import CollectorResult, CollectorStatus
 
 __all__ = [
+    "CANARY_STATE_RULE_VERSION",
+    "AlertEvaluation",
+    "AlertOutcome",
+    "AlertRuleSpec",
+    "AlertStateUpdate",
     "Collector",
     "CollectorContext",
     "CollectorFactory",
@@ -33,4 +46,5 @@ __all__ = [
     "RegistryError",
     "RuntimeMode",
     "RuntimePipeline",
+    "evaluate_canary_state_rule",
 ]
