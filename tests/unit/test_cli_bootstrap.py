@@ -38,6 +38,18 @@ def _paths(tmp_path: Path) -> RuntimePaths:
     )
 
 
+def _init_with_key(tmp_path: Path) -> RuntimePaths:
+    """Initialize an install WITH the pseudonym key (a full config-aware init)."""
+
+    config_file = _config_file(tmp_path)
+    config, config_path = load_config(config_file, platform_default=config_file)
+    paths = resolve_runtime_paths(
+        config, config_path=config_path, platform_data_root=tmp_path / "platform"
+    )
+    bootstrap.initialize(paths, now=_NOW, config=config)
+    return paths
+
+
 def test_initialize_creates_the_full_layout_schema_and_identity(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     report = bootstrap.initialize(paths, now=_NOW)
@@ -125,8 +137,8 @@ def test_initialize_fails_closed_when_a_directory_cannot_be_created(tmp_path: Pa
 
 
 def test_health_is_healthy_after_init(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
-    bootstrap.initialize(paths, now=_NOW)
+    # A full config-aware init provisions the pseudonym key, so the install is fully healthy.
+    paths = _init_with_key(tmp_path)
 
     report = bootstrap.health(paths, now=_NOW)
 
@@ -136,7 +148,30 @@ def test_health_is_healthy_after_init(tmp_path: Path) -> None:
         "control_database",
         "installation_identity",
         "directory:spool",
+        "pseudonym_key",
     }
+
+
+def test_health_flags_a_missing_pseudonym_key(tmp_path: Path) -> None:
+    config_file = _config_file(tmp_path)
+    config, config_path = load_config(config_file, platform_default=config_file)
+    paths = resolve_runtime_paths(
+        config, config_path=config_path, platform_data_root=tmp_path / "platform"
+    )
+    # Keyless init: directories + schema + identity, but NO pseudonym key (collect run needs it).
+    bootstrap.initialize(paths, now=_NOW)
+
+    report = bootstrap.health(paths, now=_NOW)
+
+    key_check = next(check for check in report.checks if check.name == "pseudonym_key")
+    assert key_check.ok is False
+    assert report.healthy is False  # a keyless install is not usable
+
+    # A full init (with config) provisions the key; the install becomes healthy again.
+    bootstrap.initialize(paths, now=_NOW, config=config)
+    healed = bootstrap.health(paths, now=_NOW)
+    assert next(check for check in healed.checks if check.name == "pseudonym_key").ok is True
+    assert healed.healthy is True
 
 
 def test_health_is_unhealthy_before_init(tmp_path: Path) -> None:

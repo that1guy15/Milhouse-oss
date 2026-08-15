@@ -12,6 +12,7 @@ from platformdirs import user_config_path, user_data_path
 
 from milhouse import __version__, storage
 from milhouse.cli import bootstrap, demo, views
+from milhouse.collectors.site_canary import register_site_canary
 from milhouse.config import (
     ConfigError,
     RuntimePaths,
@@ -21,10 +22,21 @@ from milhouse.config import (
     resolve_runtime_paths,
 )
 from milhouse.config._models import MilhouseConfig
+from milhouse.config.loader import validated_config_digest
 from milhouse.core.clock import SystemClock
+from milhouse.core.errors import MilhouseError
+from milhouse.privacy.keys import load_pseudonym_key
+from milhouse.privacy.pseudonym import PrivacyError
+from milhouse.privacy.redact import LayeredRedactor
+from milhouse.runtime import CollectorRegistry, PipelineError, PipelineRunSummary, RuntimePipeline
 from milhouse.spooling import SpoolError, replay_segments
 from milhouse.spooling.ledger import list_segment_records
-from milhouse.state import GlobalCommitBarrier, open_control_database
+from milhouse.state import (
+    ControlDatabase,
+    GlobalCommitBarrier,
+    StateError,
+    open_control_database,
+)
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -147,11 +159,16 @@ class BootstrapCommandError(click.ClickException):
 @click.option("--json", "as_json", is_flag=True, help="Emit the result as stable JSON.")
 @click.pass_obj
 def init_command(state: CliState, as_json: bool) -> None:
-    """Initialize the state root, control database, and installation identity (idempotent)."""
+    """Initialize the state root, control database, installation identity, and pseudonym key.
 
-    paths = _resolve_paths(state)
+    Fully idempotent: a re-run creates only what is missing and NEVER rotates the pseudonym key the
+    runtime redactor requires. Reports only whether each artifact was created — never any key
+    material. Exit 0 on success, 1 on a bootstrap failure, 2 on an invalid configuration.
+    """
+
+    config, paths = _resolve_config(state)
     try:
-        report = bootstrap.initialize(paths, now=SystemClock().now())
+        report = bootstrap.initialize(paths, now=SystemClock().now(), config=config)
     except bootstrap.BootstrapError as error:
         raise BootstrapCommandError(error) from None
     if as_json:
@@ -161,6 +178,7 @@ def init_command(state: CliState, as_json: bool) -> None:
                     "created_directories": list(report.created_directories),
                     "schema_version": report.schema_version,
                     "installation_id_created": report.installation_id_created,
+                    "pseudonym_key_created": report.pseudonym_key_created,
                     "already_initialized": report.already_initialized,
                 },
                 sort_keys=True,
@@ -172,9 +190,10 @@ def init_command(state: CliState, as_json: bool) -> None:
         return
     created = ", ".join(report.created_directories) or "none"
     identity = "created" if report.installation_id_created else "present"
+    key = "created" if report.pseudonym_key_created else "present"
     click.echo(
         f"initialized: directories={created}; schema {report.schema_version}; "
-        f"installation id {identity}"
+        f"installation id {identity}; pseudonym key {key}"
     )
 
 
@@ -249,6 +268,276 @@ def _require_installation_id(paths: RuntimePaths) -> str:
             bootstrap.BootstrapError("MH_NOT_INITIALIZED", "run milhouse init first")
         )
     return installation_id
+
+
+class CollectCommandError(click.ClickException):
+    """A stable ``collect`` failure using the CLI contract's exit code 1.
+
+    Carries the fixed machine code of an underlying coded failure — a privacy, spool, state, or
+    pipeline error (all :class:`~milhouse.core.errors.MilhouseError` subclasses with a ``.code``).
+    Those errors expose only bounded, fixed strings — never key material, a secret, a path, a URL,
+    or a payload — so rendering the code and message here leaks nothing.
+    """
+
+    exit_code = 1
+
+    def __init__(self, error: MilhouseError) -> None:
+        self.code = error.code
+        super().__init__(str(error))
+
+
+def _new_collect_registry() -> CollectorRegistry:
+    """Build the production first-party collector registry (real HTTP-backed site_canary).
+
+    A module-level seam so a network-free test can substitute a registry holding a fake collector;
+    production ``collect`` always calls it with the real registry.
+    """
+
+    registry = CollectorRegistry()
+    register_site_canary(registry)
+    return registry
+
+
+def _build_collect_pipeline(
+    config: MilhouseConfig,
+    paths: RuntimePaths,
+    installation_id: str,
+    control: ControlDatabase,
+    *,
+    registry: CollectorRegistry | None = None,
+) -> RuntimePipeline:
+    """Assemble a spool-only :class:`RuntimePipeline` from validated config and control plane.
+
+    Extracted as the testable seam the ``collect`` command builds through: production passes
+    ``registry=None`` (the real registry, whose site_canary factory builds a live HTTP client) while
+    a test injects a registry holding a network-free fake collector. The pipeline hard-requires a
+    :class:`LayeredRedactor`, so this loads the keyed pseudonym key ``init`` provisions and FAILS
+    CLOSED with ``run milhouse init first`` when it is absent (a corrupt or foreign key surfaces its
+    own fixed code instead). The redactor is built with no extra known secrets; the collectors are
+    the primary redaction authority. ``config_generation`` is the deterministic 64-hex digest of
+    the fully validated config, which the pipeline re-checks. Exporters are empty (spool_only):
+    committed segments are NOT delivered to ClickHouse in this release.
+    """
+
+    if registry is None:
+        registry = _new_collect_registry()
+    try:
+        pseudonymizer = load_pseudonym_key(config, paths)
+    except PrivacyError as error:
+        if error.code == "MH_PRIVACY_KEY_NOT_FOUND":
+            raise BootstrapCommandError(
+                bootstrap.BootstrapError("MH_NOT_INITIALIZED", "run milhouse init first")
+            ) from None
+        raise CollectCommandError(error) from None
+    redactor = LayeredRedactor(pseudonymizer, known_secrets=())
+    barrier = GlobalCommitBarrier(
+        paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
+    )
+    return RuntimePipeline(
+        mode="spool_only",
+        config_generation=validated_config_digest(config),
+        registry=registry,
+        redactor=redactor,
+        control=control,
+        barrier=barrier,
+        spool_root=paths.spool,
+        installation_id=installation_id,
+        clock=SystemClock(),
+        retention=config.retention,
+        exporters={},
+        alert_rules=config.alert_rules,
+        notifications=config.notifications,
+    )
+
+
+def _collect_run_payload(summary: PipelineRunSummary) -> dict[str, object]:
+    """Project a run summary into the privacy-safe JSON payload (counts, codes, config ids)."""
+
+    return {
+        "mode": summary.mode,
+        "alerts_fired": summary.alerts_fired,
+        "alerts_resolved": summary.alerts_resolved,
+        "alerts_error_code": summary.alerts_error_code,
+        "intents_emitted": summary.intents_emitted,
+        "intents_error_code": summary.intents_error_code,
+        "export_error_code": summary.export_error_code,
+        "records_committed": summary.records_committed,
+        "records_delivered": summary.records_delivered,
+        "records_failed": summary.records_failed,
+        "collectors": [
+            {
+                "collector_id": collector.collector_id,
+                "status": collector.status,
+                "error_code": collector.error_code,
+                "drafts_produced": collector.drafts_produced,
+                "records_committed": collector.records_committed,
+                "records_delivered": collector.records_delivered,
+                "records_failed": collector.records_failed,
+                "batch_id": collector.batch_id,
+            }
+            for collector in summary.collectors
+        ],
+    }
+
+
+def _collect_run_failed(summary: PipelineRunSummary) -> bool:
+    """The exit-1 predicate: any stage error code, a failed record, or a failed/error collector."""
+
+    return (
+        summary.export_error_code is not None
+        or summary.alerts_error_code is not None
+        or summary.intents_error_code is not None
+        or summary.records_failed > 0
+        or any(collector.status in ("failed", "error") for collector in summary.collectors)
+    )
+
+
+@main.group(name="collect")
+def collect_group() -> None:
+    """Run configured collectors once into the local spool (spool-only), or list them."""
+
+
+@collect_group.command(name="run")
+@click.argument("collector_id", required=False)
+@click.option(
+    "--target",
+    "target_id",
+    default=None,
+    metavar="TARGET_ID",
+    help="Run only the collectors bound to this declared target id.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the run summary as stable JSON.")
+@click.pass_context
+def collect_run_command(
+    context: click.Context,
+    collector_id: str | None,
+    target_id: str | None,
+    as_json: bool,
+) -> None:
+    """Collect, redact, and spool every configured collector once (spool-only).
+
+    Builds the W05 runtime pipeline in spool_only mode and runs it a single time: each collector's
+    drafts are redacted, finalized, and committed to the local spool, and the configured canary
+    alert rules and notification-intent records are evaluated inside that run. Nothing is exported
+    to ClickHouse in this release — full-mode export from ``collect`` is a later increment, so a
+    config with ``runtime.mode = "full"`` is REJECTED (exit 2) rather than silently run spool-only.
+    Requires an initialized install (run ``milhouse init`` first): the pipeline's redactor needs the
+    keyed pseudonym key that ``init`` provisions.
+
+    An optional ``COLLECTOR_ID`` runs only that configured collector; ``--target`` runs only the
+    collectors bound to that declared target. An unknown collector or target id is a configuration
+    error. The emitted summary carries ONLY privacy-safe counts, fixed codes, and config-declared
+    ids — never a secret, PII, path, payload, URL, or target host.
+
+    Exit codes: 0 clean; 1 if any stage error code is set OR any records failed OR any collector
+    ended ``failed``/``error`` OR the run aborts with a coded spool/state/pipeline failure; 2 for an
+    invalid configuration — an unknown collector or target id, OR ``runtime.mode = "full"``
+    (full-mode ClickHouse export is unsupported this increment).
+    """
+
+    state = context.ensure_object(CliState)
+    config, paths = _resolve_config(state)
+
+    # Fail closed on full mode rather than silently downgrade: a spool_only run stamps
+    # ``required_exporters=()`` on every committed segment, so ``commit`` records no clickhouse
+    # delivery obligation and a later ``storage export`` can NEVER drain those segments (it reports
+    # them ``unhandled`` / "export incomplete" forever, with no way to attach an obligation after
+    # the fact). Running spool_only under a ``full`` config would therefore durably strand records
+    # the operator expects in ClickHouse. Wiring the export tail is the next increment; until then
+    # reject so nothing is stranded.
+    if config.runtime.mode == "full":
+        raise ConfigCommandError(
+            ConfigError(
+                "config.runtime.full_mode_unsupported",
+                "collect run does not support full-mode ClickHouse export yet; set "
+                "runtime.mode = spool_only in your config to collect now (full-mode export lands "
+                "in the next increment)",
+            )
+        )
+
+    collectors = list(config.collectors)
+    if collector_id is not None:
+        collectors = [collector for collector in collectors if collector.id == collector_id]
+        if not collectors:
+            raise ConfigCommandError(
+                ConfigError(
+                    "config.collector.unknown", "no collector with the requested id is configured"
+                )
+            )
+    if target_id is not None:
+        if target_id not in {target.id for target in config.targets}:
+            raise ConfigCommandError(
+                ConfigError(
+                    "config.target.unknown", "no target with the requested id is configured"
+                )
+            )
+        collectors = [
+            collector for collector in collectors if getattr(collector, "target", None) == target_id
+        ]
+
+    installation_id = _require_installation_id(paths)
+    control = open_control_database(bootstrap.database_path(paths))
+    try:
+        pipeline = _build_collect_pipeline(config, paths, installation_id, control)
+        # The full target set is passed for lookup; the collector filters above scope the run.
+        summary = pipeline.run(tuple(collectors), tuple(config.targets))
+    except (SpoolError, StateError, PipelineError) as error:
+        # A spool-integrity, control-state, or pipeline-construction failure (e.g. DurableSpool
+        # reconciliation, a tampered barrier, a crashed-prior-writer orphan) must surface as the
+        # coded exit-1 contract every other command produces -- a clean ``error: MH_...`` rather
+        # than a raw traceback. Per-collector faults are already isolated INTO the summary; this
+        # catches only failures that abort the whole run. The key-missing / other PrivacyError
+        # mappings raised inside ``_build_collect_pipeline`` are ClickExceptions and propagate.
+        raise CollectCommandError(error) from None
+    finally:
+        control.close()
+
+    if as_json:
+        click.echo(json.dumps(_collect_run_payload(summary), sort_keys=True))
+    else:
+        click.echo(
+            f"collect: mode={summary.mode} committed={summary.records_committed} "
+            f"delivered={summary.records_delivered} failed={summary.records_failed} "
+            f"alerts_fired={summary.alerts_fired} alerts_resolved={summary.alerts_resolved} "
+            f"intents_emitted={summary.intents_emitted}"
+        )
+        for collector in summary.collectors:
+            code = collector.error_code or "none"
+            batch = collector.batch_id or "none"
+            click.echo(
+                f"  {collector.collector_id}: status={collector.status} error={code} "
+                f"drafts={collector.drafts_produced} committed={collector.records_committed} "
+                f"delivered={collector.records_delivered} failed={collector.records_failed} "
+                f"batch={batch}"
+            )
+    stage_error_codes: tuple[tuple[str, str | None], ...] = (
+        ("export", summary.export_error_code),
+        ("alerts", summary.alerts_error_code),
+        ("intents", summary.intents_error_code),
+    )
+    for label, stage_code in stage_error_codes:
+        if stage_code is not None:
+            click.echo(f"WARNING: the {label} stage reported {stage_code}", err=True)
+    if _collect_run_failed(summary):
+        context.exit(1)
+
+
+@collect_group.command(name="list")
+@click.option("--json", "as_json", is_flag=True, help="Emit the listing as stable JSON.")
+@click.pass_obj
+def collect_list_command(state: CliState, as_json: bool) -> None:
+    """List the configured collectors' ids and kinds (privacy-safe; config-declared, not secret)."""
+
+    config, _paths = _resolve_config(state)
+    rows = [{"id": collector.id, "type": collector.type} for collector in config.collectors]
+    if as_json:
+        click.echo(json.dumps({"collectors": rows}, sort_keys=True))
+        return
+    if not rows:
+        click.echo("no configured collectors")
+        return
+    for row in rows:
+        click.echo(f"{row['id']}  type={row['type']}")
 
 
 @main.group(name="spool")

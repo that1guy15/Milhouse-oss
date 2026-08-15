@@ -32,6 +32,18 @@ def _paths(tmp_path: Path) -> RuntimePaths:
     )
 
 
+def _init_with_key(tmp_path: Path) -> RuntimePaths:
+    """Initialize an install WITH the pseudonym key so ``health``/``doctor`` report it healthy."""
+
+    config_file = _config_file(tmp_path)
+    config, config_path = load_config(config_file, platform_default=config_file)
+    paths = resolve_runtime_paths(
+        config, config_path=config_path, platform_data_root=tmp_path / "platform"
+    )
+    bootstrap.initialize(paths, now=_NOW, config=config)
+    return paths
+
+
 def test_list_segments_reports_spooled_segments(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     first = demo.run_demo(paths, now=_NOW)
@@ -114,7 +126,8 @@ def test_show_segment_reports_an_unreadable_file(tmp_path: Path) -> None:
 
 
 def test_doctor_reports_health_and_spool_totals(tmp_path: Path) -> None:
-    paths = _paths(tmp_path)
+    # Provision the pseudonym key so the install is fully healthy; demo alone does not create it.
+    paths = _init_with_key(tmp_path)
     demo.run_demo(paths, now=_NOW)
     demo.run_demo(paths, now=_NOW)
 
@@ -139,6 +152,8 @@ def test_doctor_is_unhealthy_before_init(tmp_path: Path) -> None:
 def test_cli_spool_list_and_events_and_doctor(tmp_path: Path) -> None:
     config_file = _config_file(tmp_path)
     runner = CliRunner()
+    # A full config-aware init provisions the pseudonym key so ``doctor`` reports the install ok.
+    runner.invoke(main, ["--config", str(config_file), "init"])
     runner.invoke(main, ["--config", str(config_file), "demo"])
 
     listing = runner.invoke(main, ["--config", str(config_file), "spool", "list"])

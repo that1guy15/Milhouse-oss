@@ -7,9 +7,12 @@ non-secret installation identity; ``health`` reports whether an initialized inst
 are local, spool-only, and credential-free — no network, no secret resolution, no provider calls.
 
 The installation identity here is the record-identity ``mh_in1_`` UUID used in canonical record
-derivation (plan section 4.2), persisted as an owner-only file in the control directory. It is
-distinct from the keyed pseudonym-key lifecycle of plan section 4.7, which amendment A09 keeps
-deferred; this slice never creates or reads that key.
+derivation (plan section 4.2), persisted as an owner-only file in the control directory. When the
+validated config is supplied (the ``init`` command passes it), ``initialize`` ALSO provisions the
+keyed pseudonym key of plan section 4.7 that the runtime redactor requires — created once,
+owner-only (0600), and never rotated on a re-run — by reusing the ``privacy.keys`` primitives
+exactly. Callers that do not need the key (the spool-only demo) omit the config and never touch it.
+Key material is never logged, echoed, or returned: only whether a key was provisioned.
 """
 
 from __future__ import annotations
@@ -22,11 +25,18 @@ from datetime import datetime
 from pathlib import Path
 
 from milhouse.config import RuntimePaths
+from milhouse.config._models import MilhouseConfig
 from milhouse.config.filesystem import (
     SecureFileError,
     create_regular_file_no_follow,
     open_regular_file_no_follow,
 )
+from milhouse.privacy.keys import (
+    PseudonymKeyCommitUncertain,
+    create_pseudonym_key,
+    recover_pseudonym_key_creation,
+)
+from milhouse.privacy.pseudonym import PrivacyError
 from milhouse.state import (
     GlobalCommitBarrier,
     initialize_control_state,
@@ -66,12 +76,19 @@ class InitReport:
     created_directories: tuple[str, ...]
     schema_version: int
     installation_id_created: bool
+    #: Whether this pass created the keyed pseudonym key. Always ``False`` when ``initialize`` was
+    #: called without a config (the credential-free callers that never touch the key).
+    pseudonym_key_created: bool = False
 
     @property
     def already_initialized(self) -> bool:
         """Whether the pass changed nothing durable (fully idempotent re-run)."""
 
-        return not self.created_directories and not self.installation_id_created
+        return (
+            not self.created_directories
+            and not self.installation_id_created
+            and not self.pseudonym_key_created
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,12 +204,54 @@ def _ensure_installation_id(paths: RuntimePaths) -> bool:
     return True
 
 
-def initialize(paths: RuntimePaths, *, now: datetime) -> InitReport:
+def _ensure_pseudonym_key(config: MilhouseConfig, paths: RuntimePaths) -> bool:
+    """Provision the keyed pseudonym key iff absent; recover a commit-uncertain publish. Idempotent.
+
+    Reuses the ``privacy.keys`` primitives EXACTLY: ``create_pseudonym_key`` writes a fresh
+    owner-only (0600) key and refuses to overwrite an existing path, so a present key is left
+    untouched (never rotated) and reported as ``False``. A commit-uncertain publication is durably
+    adopted through ``recover_pseudonym_key_creation`` using the non-secret key id it carries; a
+    still-uncertain or otherwise failed provision fails closed with a fixed code. The returned
+    :class:`Pseudonymizer` is deliberately discarded — this function NEVER logs, echoes, or returns
+    key material, only whether a key was created.
+    """
+
+    try:
+        create_pseudonym_key(config, paths)
+    except PseudonymKeyCommitUncertain as uncertain:
+        # The key bytes reached disk but their durability was uncertain: verify by non-secret key id
+        # (``mh_pk1_...`` -- not key material) and fsync the parent. A still-uncertain outcome fails
+        # closed rather than leaving a possibly-unrecoverable key silently in place.
+        try:
+            recover_pseudonym_key_creation(config, paths, expected_key_id=uncertain.key_id)
+        except PrivacyError as error:
+            raise BootstrapError(
+                "MH_INIT_PSEUDONYM_KEY",
+                "the pseudonym key could not be durably provisioned",
+            ) from error
+        return True
+    except PrivacyError as error:
+        if error.code == "MH_PRIVACY_KEY_EXISTS":
+            # Idempotent: a present key is never rotated or overwritten on a re-run.
+            return False
+        raise BootstrapError(
+            "MH_INIT_PSEUDONYM_KEY",
+            "the pseudonym key could not be provisioned",
+        ) from error
+    return True
+
+
+def initialize(
+    paths: RuntimePaths, *, now: datetime, config: MilhouseConfig | None = None
+) -> InitReport:
     """Idempotently create the state-root layout, apply the schema, and establish identity.
 
     Creates ``state_root`` and its ``control``/``spool``/``reports``/``logs``/``backups`` children
     (0700), opens the control database and applies every unapplied migration under the commit
-    barrier, and generates the installation id if absent. Re-running changes nothing durable.
+    barrier, and generates the installation id if absent. When ``config`` is supplied (the ``init``
+    command passes the validated config), it ALSO provisions the keyed pseudonym key the runtime
+    redactor requires, once and owner-only, reusing the ``privacy.keys`` primitives. Re-running
+    changes nothing durable — the key is never rotated once present.
     """
 
     created: list[str] = []
@@ -208,10 +267,15 @@ def initialize(paths: RuntimePaths, *, now: datetime) -> InitReport:
         database.close()
 
     installation_created = _ensure_installation_id(paths)
+    # The pseudonym key is provisioned only when the validated config is available: its secure
+    # creation is bound to that config's resolved runtime generation, and credential-free callers
+    # (the spool-only demo) never need it. The control dir it lives under was created above (0700).
+    pseudonym_key_created = _ensure_pseudonym_key(config, paths) if config is not None else False
     return InitReport(
         created_directories=tuple(created),
         schema_version=version,
         installation_id_created=installation_created,
+        pseudonym_key_created=pseudonym_key_created,
     )
 
 
@@ -231,6 +295,25 @@ def _database_check(paths: RuntimePaths) -> HealthCheck:
     ok = version == EXPECTED_SCHEMA_VERSION
     detail = f"schema {version}" if ok else f"schema {version}, expected {EXPECTED_SCHEMA_VERSION}"
     return HealthCheck("control_database", ok, detail)
+
+
+def _pseudonym_key_present(paths: RuntimePaths) -> bool:
+    """Whether the pseudonym key file is present, checked privacy-safely (its bytes are never read).
+
+    Mirrors :func:`read_installation_id`'s no-follow presence probe: a regular non-symlink file that
+    opens is present; any :class:`SecureFileError` (missing, not regular, symlink, unsafe) means it
+    is absent. This is a PRESENCE check only — it never reads, loads, logs, or returns key material.
+    """
+
+    try:
+        opened = open_regular_file_no_follow(paths.pseudonym_key)
+    except SecureFileError:
+        return False
+    try:
+        os.close(opened.descriptor)
+    except OSError:  # pragma: no cover - defensive: close of our own fd
+        pass
+    return True
 
 
 def health(paths: RuntimePaths, *, now: datetime) -> HealthReport:
@@ -255,6 +338,19 @@ def health(paths: RuntimePaths, *, now: datetime) -> HealthReport:
             "installation_identity",
             identity_present,
             "established" if identity_present else "missing (run milhouse init)",
+        )
+    )
+
+    # The runtime redactor -- and therefore ``collect run`` -- hard-requires the pseudonym key, so
+    # an install without it is NOT usable even though its directories, schema, and identity are
+    # sound. Report its presence (a privacy-safe presence probe only) so ``health``/``doctor`` no
+    # longer call a keyless install healthy while ``collect run`` fails "run milhouse init first".
+    key_present = _pseudonym_key_present(paths)
+    checks.append(
+        HealthCheck(
+            "pseudonym_key",
+            key_present,
+            "present" if key_present else "missing (run milhouse init)",
         )
     )
     return HealthReport(checks=tuple(checks))
