@@ -13,6 +13,7 @@ from milhouse.domain.identity import (
     IdentityError,
     ObservationCoordinateV1,
     derive_alert_key,
+    derive_notification_intent_id,
     derive_transition_id,
 )
 
@@ -124,3 +125,33 @@ def test_a_malformed_transition_input_fails_closed() -> None:
             state="firing",
             triggering_observation=_observation(),
         )
+
+
+def test_the_notification_intent_id_is_deterministic_and_a_valid_opaque_id() -> None:
+    first = derive_notification_intent_id(transition_id="mh_atr1_example", channel_id="telegram1")
+    second = derive_notification_intent_id(transition_id="mh_atr1_example", channel_id="telegram1")
+    assert first == second
+    assert first.startswith("mh_nin1_")
+    assert _is_opaque_id(first)
+
+
+def test_the_notification_intent_id_is_distinct_per_transition_and_channel() -> None:
+    base = derive_notification_intent_id(transition_id="mh_atr1_example", channel_id="telegram1")
+    # A different channel for the same transition derives a distinct intent id ...
+    assert base != derive_notification_intent_id(
+        transition_id="mh_atr1_example", channel_id="github1"
+    )
+    # ... and the same channel for a different transition also derives a distinct one.
+    assert base != derive_notification_intent_id(
+        transition_id="mh_atr1_other", channel_id="telegram1"
+    )
+
+
+@pytest.mark.parametrize("bad", ["", "with\nnewline", "a" * 257])
+def test_a_malformed_notification_intent_input_fails_closed(bad: str) -> None:
+    with pytest.raises(IdentityError) as captured:
+        derive_notification_intent_id(transition_id=bad, channel_id="telegram1")
+    assert captured.value.code == "MH_IDENTITY_NOTIFICATION_INPUT"
+    with pytest.raises(IdentityError) as channel_captured:
+        derive_notification_intent_id(transition_id="mh_atr1_example", channel_id=bad)
+    assert channel_captured.value.code == "MH_IDENTITY_NOTIFICATION_INPUT"

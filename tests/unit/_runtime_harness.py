@@ -261,6 +261,7 @@ def make_pipeline(
     clock: Any,
     exporters: Any = None,
     alert_rules: Any = (),
+    notifications: Any = (),
 ) -> RuntimePipeline:
     return RuntimePipeline(
         mode=mode,  # type: ignore[arg-type]
@@ -275,6 +276,7 @@ def make_pipeline(
         retention=retention_config(),
         exporters={} if exporters is None else exporters,
         alert_rules=alert_rules,
+        notifications=notifications,
     )
 
 

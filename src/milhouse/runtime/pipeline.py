@@ -36,7 +36,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
@@ -44,15 +44,25 @@ from typing import Literal
 from milhouse.config._models import (
     CanaryStateAlertRule,
     CollectorConfig,
+    GithubIssuesNotification,
+    NotificationConfig,
     RetentionConfig,
     TargetConfig,
+    TelegramNotification,
 )
 from milhouse.core.clock import WallClock, format_timestamp
 from milhouse.core.errors import normalize_error
+from milhouse.domain.identity import (
+    ObservationCoordinateV1,
+    derive_notification_intent_id,
+)
 from milhouse.domain.records import (
+    AlertDataV1,
     EventDataV1,
+    NotificationIntentDataV1,
     RecordDraftV1,
     RecordEnvelopeV1,
+    SourceDescriptorV1,
     TargetDescriptorV1,
     finalize_record,
 )
@@ -107,6 +117,7 @@ _FREE_TEXT_FIELDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "run": (),
         "span": (),
         "alert": ("summary",),
+        "notification_intent": ("summary",),
         "feedback_item": ("title", "summary", "recommendation"),
         "feedback_transition": ("rationale",),
     }
@@ -121,6 +132,9 @@ _RETENTION_FIELDS: Mapping[str, str] = MappingProxyType(
         "run": "runs_days",
         "span": "trace_events_days",
         "alert": "alerts_days",
+        # A notification intent shares its alert's retention window (it is derived from, and expires
+        # with, one alert transition). A dedicated retention field is a follow-up, not this slice.
+        "notification_intent": "alerts_days",
         "feedback_item": "feedback_days",
         "feedback_transition": "feedback_days",
     }
@@ -128,6 +142,21 @@ _RETENTION_FIELDS: Mapping[str, str] = MappingProxyType(
 
 _SHA256_HEX_LENGTH = 64
 _BATCH_SUFFIX_LENGTH = 24
+
+_NOTIFICATION_INTENT_SOURCE_TYPE = "alert.notification_intent"
+_NOTIFICATION_INTENT_RECORD_NAME = "alert.notification_intent"
+_NOTIFICATION_INTENT_OBSERVATION_KIND = "alert.notification_intent"
+#: A fixed v4-shaped namespace for system-derived notification-intent identity; stable so an intent
+#: re-derived for the same (transition, channel) stays idempotent.
+_NOTIFICATION_INTENT_NAMESPACE = "mh_ns1_b2f88c3d4e514a6b9c0d1e2f3a4b5c6d"
+#: Nominal record expiry; true retention is governed by the segment header and storage TTL.
+_NOTIFICATION_INTENT_EXPIRY = timedelta(days=365)
+#: A FIXED, privacy-safe summary. It is NEVER interpolated: it names no channel secret, chat id,
+#: provider, repository, URL, or target, so no such value can ever reach the durable intent record.
+_NOTIFICATION_INTENT_SUMMARY = (
+    "A configured notification channel recorded a durable intent to notify for this alert "
+    "transition. No message was sent; delivery is out of scope for this record."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +185,12 @@ class PipelineRunSummary:
     alerts_fired: int = 0
     alerts_resolved: int = 0
     alerts_error_code: str | None = None
+    #: Durable notification-intent records this run emitted (one per committed alert transition x
+    #: applicable configured channel). ``intents_error_code`` is the first fixed code an isolated
+    #: per-channel intent emission failed with, or ``None``. All privacy-safe — never a channel
+    #: secret, chat id, provider, repository, URL, or target.
+    intents_emitted: int = 0
+    intents_error_code: str | None = None
 
     @property
     def records_committed(self) -> int:
@@ -213,6 +248,7 @@ class RuntimePipeline:
         "_exporters",
         "_installation_id",
         "_mode",
+        "_notifications",
         "_redactor",
         "_registry",
         "_required_exporters",
@@ -235,6 +271,7 @@ class RuntimePipeline:
         retention: RetentionConfig,
         exporters: Mapping[str, Exporter] = MappingProxyType({}),
         alert_rules: Sequence[CanaryStateAlertRule] = (),
+        notifications: Sequence[NotificationConfig] = (),
     ) -> None:
         _require(
             mode in ("full", "spool_only"),
@@ -321,6 +358,15 @@ class RuntimePipeline:
             "MH_RUNTIME_PIPELINE_ALERT_RULES",
             "each alert rule must be a canary_state alert rule",
         )
+        notification_tuple = tuple(notifications)
+        _require(
+            all(
+                isinstance(channel, (TelegramNotification, GithubIssuesNotification))
+                for channel in notification_tuple
+            ),
+            "MH_RUNTIME_PIPELINE_NOTIFICATIONS",
+            "each notification must be a configured telegram or github_issues channel",
+        )
         self._mode = mode
         self._config_generation = config_generation
         self._registry = registry
@@ -334,6 +380,7 @@ class RuntimePipeline:
         self._exporters: Mapping[str, Exporter] = MappingProxyType(exporter_map)
         self._required_exporters = tuple(sorted(exporter_map))
         self._alert_rules: tuple[CanaryStateAlertRule, ...] = alert_rule_tuple
+        self._notifications: tuple[NotificationConfig, ...] = notification_tuple
 
     def run(
         self,
@@ -382,11 +429,24 @@ class RuntimePipeline:
         # Alert stage: AFTER the whole collector loop (so every availability record is committed and
         # citable as evidence) and BEFORE the export tail (so full mode drains any alert segment
         # this run emits). Each rule is isolated; a failure never aborts the run or the other rules.
-        alerts_fired, alerts_resolved, alerts_error_code = self._drive_alerts(
+        # It also threads out the committed alert records this run emitted, so the next stage can
+        # cite each one by id.
+        alerts_fired, alerts_resolved, alerts_error_code, committed_alerts = self._drive_alerts(
             collectors=collectors,
             spool=spool,
             target_by_id=target_by_id,
             availability=availability,
+            now=now,
+        )
+
+        # Notification-intent stage: AFTER alerts are committed (so each intent cites the alert
+        # record and shares its retention window) and BEFORE the export tail (so full mode drains
+        # any intent segment this run emits). This stage only RECORDS the intent to notify -- it
+        # never sends, previews, retries, rate-limits, or tracks delivery state (all W14). Each
+        # channel is isolated: one bad channel never aborts the others or the run.
+        intents_emitted, intents_error_code = self._drive_notification_intents(
+            committed_alerts=committed_alerts,
+            spool=spool,
             now=now,
         )
 
@@ -408,6 +468,8 @@ class RuntimePipeline:
             alerts_fired=alerts_fired,
             alerts_resolved=alerts_resolved,
             alerts_error_code=alerts_error_code,
+            intents_emitted=intents_emitted,
+            intents_error_code=intents_error_code,
         )
 
     def _run_collector(
@@ -472,23 +534,25 @@ class RuntimePipeline:
         target_by_id: Mapping[str, TargetConfig],
         availability: Mapping[str, _AvailabilitySample],
         now: datetime,
-    ) -> tuple[int, int, str | None]:
+    ) -> tuple[int, int, str | None, tuple[RecordEnvelopeV1, ...]]:
         """Evaluate every configured alert rule against this run's samples; return the alert counts.
 
         Each rule is isolated exactly like a collector: a single rule raising is captured as a fixed
         code and never aborts the run or the other rules. A rule whose collector did not run this
-        pass (no sample) is a silent no-op.
+        pass (no sample) is a silent no-op. Alongside the counts, this returns every alert record
+        actually committed this run, so the notification-intent stage can cite each one by id.
         """
 
         fired_total = 0
         resolved_total = 0
         error_code: str | None = None
+        committed_alerts: list[RecordEnvelopeV1] = []
         if not self._alert_rules:
-            return fired_total, resolved_total, error_code
+            return fired_total, resolved_total, error_code, ()
         collector_by_id = {str(config.id): config for config in collectors}
         for rule in self._alert_rules:
             try:
-                fired, resolved = self._evaluate_rule(
+                fired, resolved, committed = self._evaluate_rule(
                     rule,
                     collector_by_id=collector_by_id,
                     spool=spool,
@@ -498,10 +562,12 @@ class RuntimePipeline:
                 )
                 fired_total += fired
                 resolved_total += resolved
+                if committed is not None:
+                    committed_alerts.append(committed)
             except Exception as error:
                 if error_code is None:
                     error_code = normalize_error(error).code
-        return fired_total, resolved_total, error_code
+        return fired_total, resolved_total, error_code, tuple(committed_alerts)
 
     def _evaluate_rule(
         self,
@@ -512,14 +578,18 @@ class RuntimePipeline:
         target_by_id: Mapping[str, TargetConfig],
         availability: Mapping[str, _AvailabilitySample],
         now: datetime,
-    ) -> tuple[int, int]:
-        """Run one rule's engine, commit any transition, then CAS-advance the durable rule state."""
+    ) -> tuple[int, int, RecordEnvelopeV1 | None]:
+        """Run one rule's engine, commit any transition, then CAS-advance the durable rule state.
+
+        Returns the firing/resolution counts and the committed alert record (or ``None`` when this
+        sample produced no transition), so the caller can thread the record into the intent stage.
+        """
 
         sample = availability.get(str(rule.collector))
         collector_config = collector_by_id.get(str(rule.collector))
         if sample is None or collector_config is None:
             # The referenced collector produced no sample this run (idle, errored, or unconfigured).
-            return 0, 0
+            return 0, 0, None
         target = _target_descriptor(collector_config, target_by_id)
         _require(
             target is not None,
@@ -547,6 +617,7 @@ class RuntimePipeline:
         )
         fired = 0
         resolved = 0
+        committed: RecordEnvelopeV1 | None = None
         if evaluation.draft is not None:
             record = self._finalize(evaluation.draft)
             header, frames = self._build_segment(spec.rule_id, (record,), now=now)
@@ -561,6 +632,7 @@ class RuntimePipeline:
             # id and record id differ). That is the accepted "never miss a fire, may duplicate one"
             # tradeoff, not exactly-once. A commit failure is isolated per rule.
             spool.commit_segment(header, frames, committed_at=now)
+            committed = record
             if evaluation.transition == "firing":
                 fired = 1
             else:
@@ -579,7 +651,47 @@ class RuntimePipeline:
             now=now,
             expected_revision=update.expected_revision,
         )
-        return fired, resolved
+        return fired, resolved, committed
+
+    def _drive_notification_intents(
+        self,
+        *,
+        committed_alerts: Sequence[RecordEnvelopeV1],
+        spool: DurableSpool,
+        now: datetime,
+    ) -> tuple[int, str | None]:
+        """Emit one durable notification-intent record per committed alert x applicable channel.
+
+        A channel APPLIES when it is ``enabled`` AND its ``allowed_classifications`` admits the
+        alert record's ``privacy_class``. This stage records only the INTENT to notify — it never
+        sends, previews, retries, rate-limits, or tracks delivery/"sent" state (all W14). Each
+        (alert, channel) intent commits its own homogeneous ``notification_intent`` segment (never
+        mixed with the alert segment), isolated per channel: one channel raising is captured as the
+        first fixed code and never aborts the other channels or the run.
+        """
+
+        emitted = 0
+        error_code: str | None = None
+        if not self._notifications or not committed_alerts:
+            return emitted, error_code
+        for alert in committed_alerts:
+            for channel in self._notifications:
+                if not channel.enabled:
+                    continue
+                if alert.privacy_class not in channel.allowed_classifications:
+                    continue
+                try:
+                    draft = _notification_intent_draft(alert, channel, now=now)
+                    record = self._finalize(draft)
+                    source_id = f"{alert.source.id}-{channel.id}"
+                    header, frames = self._build_segment(source_id, (record,), now=now)
+                    spool.commit_segment(header, frames, committed_at=now)
+                    emitted += 1
+                except Exception as error:
+                    # Per-channel isolation: capture only the fixed code; never abort the others.
+                    if error_code is None:
+                        error_code = normalize_error(error).code
+        return emitted, error_code
 
     def _finalize(self, draft: RecordDraftV1) -> RecordEnvelopeV1:
         """Redact a draft's free text, then assign its deterministic canonical identity."""
@@ -705,6 +817,85 @@ def _availability_sample(records: tuple[RecordEnvelopeV1, ...]) -> _Availability
             if data.status == "degraded":
                 return ("failure", record.record_id)
     return None
+
+
+def _notification_source_generation_digest(rule_id: str, rule_version: int, channel_id: str) -> str:
+    """Derive a stable 64-hex source-generation digest for a channel's notification-intent source.
+
+    It binds the source type, the originating rule and its version, and the channel id -- all stable
+    across re-runs of the same (transition, channel) -- so a re-derived intent keeps one identity.
+    """
+
+    material = f"{_NOTIFICATION_INTENT_SOURCE_TYPE}\x00{rule_id}\x00{rule_version}\x00{channel_id}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _notification_intent_draft(
+    alert: RecordEnvelopeV1,
+    channel: NotificationConfig,
+    *,
+    now: datetime,
+) -> RecordDraftV1:
+    """Build one system-produced notification-intent draft for one committed alert x one channel.
+
+    The intent references the alert ONLY by its record id (as evidence) and names the channel ONLY
+    by its non-secret configured ``id`` and ``type``: it carries no bot token, chat id, provider,
+    repository, URL, or target name/url anywhere. ``producer="system"`` with no collector provenance
+    mirrors the alert draft, and the (transition_id, channel_id) coordinate placed in
+    ``source.observation`` makes :func:`~milhouse.domain.records.finalize_record` derive a record
+    identity that is idempotent for one transition/channel pair and distinct across pairs. The
+    summary is a fixed privacy-safe constant, never interpolated; the severity couples to the
+    envelope, matching the alert.
+    """
+
+    payload = alert.data
+    assert isinstance(payload, AlertDataV1)  # the caller only threads committed alert records
+    target = alert.target
+    assert target is not None  # an alert transition is always target-scoped
+    channel_id = channel.id
+    transition_id = payload.transition_id
+    observation = ObservationCoordinateV1(
+        kind=_NOTIFICATION_INTENT_OBSERVATION_KIND,
+        parts={"transition": transition_id, "channel": channel_id},
+    )
+    source = SourceDescriptorV1(
+        id=payload.rule_id,
+        type=_NOTIFICATION_INTENT_SOURCE_TYPE,
+        producer="system",
+        observation_namespace_id=_NOTIFICATION_INTENT_NAMESPACE,
+        source_generation_digest=_notification_source_generation_digest(
+            payload.rule_id, payload.rule_version, channel_id
+        ),
+        observation=observation,
+    )
+    data = NotificationIntentDataV1(
+        intent_id=derive_notification_intent_id(transition_id=transition_id, channel_id=channel_id),
+        alert_key=payload.alert_key,
+        transition_id=transition_id,
+        channel_id=channel_id,
+        channel_type=channel.type,
+        severity=alert.severity,
+        summary=_NOTIFICATION_INTENT_SUMMARY,
+        evidence_ids=[alert.record_id],
+    )
+    stamp = format_timestamp(now)
+    return RecordDraftV1(
+        record_type="notification_intent",
+        name=_NOTIFICATION_INTENT_RECORD_NAME,
+        occurred_at=now,
+        observed_at=now,
+        ingested_at=now,
+        expires_at=now + _NOTIFICATION_INTENT_EXPIRY,
+        operation_id=f"{payload.rule_id}:{channel_id}:{stamp}",
+        scope="target",
+        source=source,
+        target=target,
+        severity=alert.severity,
+        trust_level="system",
+        privacy_class="internal",
+        redaction_version="r1-e1",
+        data=data,
+    )
 
 
 def _target_descriptor(
