@@ -96,6 +96,7 @@ test-coverage:
 		--critical 'src/milhouse/privacy/redact.py' \
 		--critical 'src/milhouse/privacy/render.py' \
 		--critical 'src/milhouse/privacy/sanitize.py' \
+		--critical 'src/milhouse/state/alert_state.py' \
 		--critical 'src/milhouse/state/audit.py' \
 		--critical 'src/milhouse/state/barrier.py' \
 		--critical 'src/milhouse/state/cursors.py' \
@@ -124,6 +125,7 @@ test-coverage:
 		--critical 'src/milhouse/storage/runner.py' \
 		--critical 'src/milhouse/storage/schema.py' \
 		--critical 'src/milhouse/runtime/__init__.py' \
+		--critical 'src/milhouse/runtime/alerting.py' \
 		--critical 'src/milhouse/runtime/context.py' \
 		--critical 'src/milhouse/runtime/errors.py' \
 		--critical 'src/milhouse/runtime/pipeline.py' \

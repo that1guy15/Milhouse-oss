@@ -3,17 +3,19 @@
 The site-canary collector is the first first-party collector. On each run it performs exactly one
 GET to its configured URL through the shared :class:`~milhouse.http.client.BoundedHttpClient` — GET
 only, no redirect following, TLS verification on, SSRF-guarded — and classifies the target as
-``healthy`` when the response status is one of the configured ``expected_statuses`` and ``degraded``
-otherwise. It emits a single ``availability`` :class:`~milhouse.domain.records.EventDataV1` draft
-and returns it to the pipeline, which owns redaction, identity, commit, and delivery.
+``healthy`` when the response status is one of the configured ``expected_statuses``, ``degraded``
+for any other response, and ``degraded`` (with a ``probe_failed`` count) when the probe itself
+fails. It emits a single ``availability`` :class:`~milhouse.domain.records.EventDataV1` draft on
+every run and returns it to the pipeline, which owns redaction, identity, commit, and delivery.
 
 Record identity (plan section 4.2): the draft carries a **deterministic observation coordinate** —
 the scheduled run instant from ``context.now`` together with the sanitized URL route — so the record
 id is stable and idempotent for one scheduled probe. Re-running the same probe at the same instant
 yields the same record id; a later scheduled instant yields a distinct one. The collector never
-renders a raw or credentialed URL: a client, SSRF, or timeout failure returns a fail-closed
-``CollectorResult(status="failed")`` with only privacy-safe counts, and any unexpected fault
-propagates to the pipeline's per-collector isolation as a fixed code.
+renders a raw or credentialed URL: a client, SSRF, TLS, or timeout failure still emits ONE
+``degraded`` availability event carrying only a privacy-safe ``{"probe_failed": 1}`` count (no URL,
+error code, or error detail) so that a fully-unreachable target stays alertable, and any unexpected
+(non-``HttpClientError``) fault propagates to the pipeline's per-collector isolation as a code.
 """
 
 from __future__ import annotations
@@ -87,7 +89,7 @@ class SiteCanaryCollector:
         )
 
     def collect(self, context: CollectorContext) -> CollectorResult:
-        """Probe the target once and return one availability event, or a fail-closed result."""
+        """Probe the target once and return one availability event (degraded on a probe failure)."""
 
         try:
             probe = self._client.get(
@@ -96,12 +98,16 @@ class SiteCanaryCollector:
                 verify_tls=True,
             )
         except HttpClientError:
-            # A client, SSRF, TLS, or timeout failure is a fail-closed run outcome, never a leaked
-            # URL: the pipeline records a failed status and the canary emits no false availability.
+            # A client, SSRF, TLS, or timeout failure never leaks a URL, but it must still be
+            # alertable: emit ONE degraded availability draft carrying only a privacy-safe
+            # ``{"probe_failed": 1}`` count (no url, no error code, no error detail) so every
+            # failing poll leaves a citable evidence record for the alert engine to fire on. An
+            # unexpected, non-HttpClientError fault still propagates to per-collector isolation.
+            draft = self._draft(context, status_code=None, health="degraded")
             return CollectorResult(
-                status="failed",
-                drafts=(),
-                diagnostics={"probes": 1, "probe_failures": 1},
+                status="ok",
+                drafts=(draft,),
+                diagnostics={"probes": 1, "probe_failures": 1, "degraded": 1},
             )
         health = "healthy" if probe.status_code in self._expected_statuses else "degraded"
         draft = self._draft(context, status_code=probe.status_code, health=health)
@@ -119,9 +125,13 @@ class SiteCanaryCollector:
         self,
         context: CollectorContext,
         *,
-        status_code: int,
+        status_code: int | None,
         health: str,
     ) -> RecordDraftV1:
+        # The record identity shape is unchanged whether or not the probe got a response: the
+        # observation coordinate is always the scheduled instant plus the sanitized route. Only the
+        # privacy-safe attribute differs -- a response carries its http_status, a probe failure
+        # carries a bare ``{"probe_failed": 1}`` count (never a url, error code, or error detail).
         now = context.now
         stamp = format_timestamp(now)
         observation = ObservationCoordinateV1(
@@ -136,10 +146,13 @@ class SiteCanaryCollector:
             source_generation_digest=self._source_generation_digest,
             observation=observation,
         )
+        attributes: dict[str, bool | int | float | str] = (
+            {"http_status": status_code} if status_code is not None else {"probe_failed": 1}
+        )
         data = EventDataV1(
             category="availability",
             status=health,
-            attributes={"http_status": status_code},
+            attributes=attributes,
         )
         return RecordDraftV1(
             record_type="event",

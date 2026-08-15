@@ -90,15 +90,25 @@ def test_a_degraded_probe_still_commits_one_event_segment(tmp_path: Path) -> Non
     assert record.data.status == "degraded"
 
 
-def test_a_blocked_target_isolates_as_a_failed_collector_and_commits_nothing(
+def test_a_blocked_target_commits_one_degraded_probe_failure_event(
     tmp_path: Path,
 ) -> None:
-    summary, _, captured = _run(
+    summary, spool_root, captured = _run(
         tmp_path, lambda request: stream_response(200), resolver=fixed_resolver("10.0.0.5")
     )
     item = summary.collectors[0]
-    assert item.status == "failed"
-    assert item.records_committed == 0
-    assert item.batch_id is None
-    assert summary.records_committed == 0
+    # A fully-blocked target stays alertable: the probe failure commits ONE degraded availability
+    # event carrying only a privacy-safe probe_failed count -- never a false-healthy record.
+    assert item.status == "ok"
+    assert item.records_committed == 1
+    assert item.batch_id is not None
+    assert summary.records_committed == 1
     assert captured == []  # the SSRF guard blocked before any transport use
+
+    path = spool_root / "pending" / _DAY / f"{item.batch_id}.jsonl"
+    record = read_trusted_segment(path, installation_id=INSTALLATION_ID).frames[0].record
+    assert record.record_type == "event"
+    assert record.data.category == "availability"
+    assert record.data.status == "degraded"
+    assert dict(record.data.attributes) == {"probe_failed": 1}
+    assert "http_status" not in record.data.attributes
