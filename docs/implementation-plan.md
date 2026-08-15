@@ -250,8 +250,9 @@ egress and never pruned early, the keyed-pseudonym lineage requirement moves to 
 owns the key lifecycle instead of being established inside compaction, and no attacker-reachable
 surface is added. Revised tests: the compaction, intents, and installation-key suites are removed
 with their modules; retention, reconciliation, replay, commit, and audit keep full crash-safe
-coverage; the control-schema tests assert version 10; and the export path proves a mixed-expiry
-segment is withheld rather than compacted.
+coverage; the control-schema tests assert version 10 (subsequently repinned to 11 when W05 claims
+migration 11 for `_alert_rule_state`, per the reconciliation above); and the export path proves a
+mixed-expiry segment is withheld rather than compacted.
 
 ## 2. Product contract
 
