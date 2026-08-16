@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -28,8 +29,15 @@ from milhouse.core.errors import MilhouseError
 from milhouse.privacy.keys import load_pseudonym_key
 from milhouse.privacy.pseudonym import PrivacyError
 from milhouse.privacy.redact import LayeredRedactor
-from milhouse.runtime import CollectorRegistry, PipelineError, PipelineRunSummary, RuntimePipeline
+from milhouse.runtime import (
+    CollectorRegistry,
+    PipelineError,
+    PipelineRunSummary,
+    RuntimeMode,
+    RuntimePipeline,
+)
 from milhouse.spooling import SpoolError, replay_segments
+from milhouse.spooling.exporter import Exporter
 from milhouse.spooling.ledger import list_segment_records
 from milhouse.state import (
     ControlDatabase,
@@ -304,9 +312,11 @@ def _build_collect_pipeline(
     installation_id: str,
     control: ControlDatabase,
     *,
+    mode: RuntimeMode,
+    exporters: Mapping[str, Exporter],
     registry: CollectorRegistry | None = None,
 ) -> RuntimePipeline:
-    """Assemble a spool-only :class:`RuntimePipeline` from validated config and control plane.
+    """Assemble a mode-aware :class:`RuntimePipeline` from validated config and control plane.
 
     Extracted as the testable seam the ``collect`` command builds through: production passes
     ``registry=None`` (the real registry, whose site_canary factory builds a live HTTP client) while
@@ -315,8 +325,11 @@ def _build_collect_pipeline(
     CLOSED with ``run milhouse init first`` when it is absent (a corrupt or foreign key surfaces its
     own fixed code instead). The redactor is built with no extra known secrets; the collectors are
     the primary redaction authority. ``config_generation`` is the deterministic 64-hex digest of
-    the fully validated config, which the pipeline re-checks. Exporters are empty (spool_only):
-    committed segments are NOT delivered to ClickHouse in this release.
+    the fully validated config, which the pipeline re-checks. The caller supplies ``mode`` and the
+    matching ``exporters`` map — empty for ``spool_only``, the ClickHouse exporter keyed by its
+    exporter id for ``full`` — and the pipeline ctor enforces that invariant (``full`` requires a
+    non-empty map, ``spool_only`` an empty one), so the full-mode obligation lives here rather than
+    in a separate reject guard.
     """
 
     if registry is None:
@@ -334,7 +347,7 @@ def _build_collect_pipeline(
         paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
     )
     return RuntimePipeline(
-        mode="spool_only",
+        mode=mode,
         config_generation=validated_config_digest(config),
         registry=registry,
         redactor=redactor,
@@ -344,7 +357,7 @@ def _build_collect_pipeline(
         installation_id=installation_id,
         clock=SystemClock(),
         retention=config.retention,
-        exporters={},
+        exporters=exporters,
         alert_rules=config.alert_rules,
         notifications=config.notifications,
     )
@@ -414,46 +427,33 @@ def collect_run_command(
     target_id: str | None,
     as_json: bool,
 ) -> None:
-    """Collect, redact, and spool every configured collector once (spool-only).
+    """Collect, redact, and spool every configured collector once; in full mode also export.
 
-    Builds the W05 runtime pipeline in spool_only mode and runs it a single time: each collector's
-    drafts are redacted, finalized, and committed to the local spool, and the configured canary
-    alert rules and notification-intent records are evaluated inside that run. Nothing is exported
-    to ClickHouse in this release — full-mode export from ``collect`` is a later increment, so a
-    config with ``runtime.mode = "full"`` is REJECTED (exit 2) rather than silently run spool-only.
-    Requires an initialized install (run ``milhouse init`` first): the pipeline's redactor needs the
-    keyed pseudonym key that ``init`` provisions.
+    Builds the W05 runtime pipeline in the configured ``runtime.mode`` and runs it a single time:
+    each collector's drafts are redacted, finalized, and committed to the local spool, and the
+    configured canary alert rules and notification-intent records are evaluated inside that run. In
+    ``spool_only`` mode nothing is exported. In ``full`` mode the committed segments are delivered
+    to ClickHouse through the same exactly-once delivery ledger ``storage export`` drives, so a
+    full-mode run additionally requires ClickHouse configured (``storage.clickhouse.enabled``) AND
+    the destination already migrated and claimed by THIS installation — run ``storage migrate``
+    first. Requires an initialized install (run ``milhouse init`` first): the pipeline's redactor
+    needs the keyed pseudonym key that ``init`` provisions.
 
     An optional ``COLLECTOR_ID`` runs only that configured collector; ``--target`` runs only the
     collectors bound to that declared target. An unknown collector or target id is a configuration
     error. The emitted summary carries ONLY privacy-safe counts, fixed codes, and config-declared
     ids — never a secret, PII, path, payload, URL, or target host.
 
-    Exit codes: 0 clean; 1 if any stage error code is set OR any records failed OR any collector
-    ended ``failed``/``error`` OR the run aborts with a coded spool/state/pipeline failure; 2 for an
-    invalid configuration — an unknown collector or target id, OR ``runtime.mode = "full"``
-    (full-mode ClickHouse export is unsupported this increment).
+    Exit codes: 0 clean; 1 if any stage error code is set OR any records failed (including a
+    contained ClickHouse delivery failure, which is non-fatal but reported) OR any collector ended
+    ``failed``/``error`` OR the run aborts with a coded spool/state/pipeline failure OR (full mode)
+    the ClickHouse destination is unclaimed/foreign-owned or ClickHouse is disabled/unbuildable; 2
+    for an invalid configuration — an unknown collector or target id, or (full mode) an unresolvable
+    ClickHouse secret/config (both surface the same exit-2 config error as ``storage export``).
     """
 
     state = context.ensure_object(CliState)
     config, paths = _resolve_config(state)
-
-    # Fail closed on full mode rather than silently downgrade: a spool_only run stamps
-    # ``required_exporters=()`` on every committed segment, so ``commit`` records no clickhouse
-    # delivery obligation and a later ``storage export`` can NEVER drain those segments (it reports
-    # them ``unhandled`` / "export incomplete" forever, with no way to attach an obligation after
-    # the fact). Running spool_only under a ``full`` config would therefore durably strand records
-    # the operator expects in ClickHouse. Wiring the export tail is the next increment; until then
-    # reject so nothing is stranded.
-    if config.runtime.mode == "full":
-        raise ConfigCommandError(
-            ConfigError(
-                "config.runtime.full_mode_unsupported",
-                "collect run does not support full-mode ClickHouse export yet; set "
-                "runtime.mode = spool_only in your config to collect now (full-mode export lands "
-                "in the next increment)",
-            )
-        )
 
     collectors = list(config.collectors)
     if collector_id is not None:
@@ -476,20 +476,53 @@ def collect_run_command(
         ]
 
     installation_id = _require_installation_id(paths)
+    # Full mode delivers committed segments to ClickHouse via the pipeline's delivery tail, so it
+    # needs an authenticated client and the ClickHouse exporter; spool_only needs neither. Open the
+    # client BEFORE the control handle so a storage-config failure (clickhouse disabled/unbuildable,
+    # or a bad secret env) surfaces its own coded exit without ever acquiring a control handle.
+    client: storage.ConnectedClickHouseClient | None = None
+    database: str | None = None
+    if config.runtime.mode == "full":
+        database, client = _storage_client(state)
     control = open_control_database(bootstrap.database_path(paths))
     try:
-        pipeline = _build_collect_pipeline(config, paths, installation_id, control)
+        exporters: dict[str, Exporter] = {}
+        if client is not None and database is not None:
+            # Refuse to deliver to a destination this installation does not own (fail closed) — the
+            # same read barrier ``storage export`` takes: an UNCLAIMED destination raises
+            # ``MH_STORAGE_OWNERSHIP`` with "run storage migrate first", a FOREIGN owner is refused.
+            # Placed BEFORE the pipeline commits/exports, so a full run over an unowned ClickHouse
+            # strands nothing.
+            storage.require_owner(client, database, installation_id=installation_id)
+            exporters = {
+                storage.CLICKHOUSE_EXPORTER_ID: storage.ClickHouseExporter(client, database)
+            }
+        pipeline = _build_collect_pipeline(
+            config,
+            paths,
+            installation_id,
+            control,
+            mode=config.runtime.mode,
+            exporters=exporters,
+        )
         # The full target set is passed for lookup; the collector filters above scope the run.
         summary = pipeline.run(tuple(collectors), tuple(config.targets))
-    except (SpoolError, StateError, PipelineError) as error:
-        # A spool-integrity, control-state, or pipeline-construction failure (e.g. DurableSpool
-        # reconciliation, a tampered barrier, a crashed-prior-writer orphan) must surface as the
-        # coded exit-1 contract every other command produces -- a clean ``error: MH_...`` rather
-        # than a raw traceback. Per-collector faults are already isolated INTO the summary; this
-        # catches only failures that abort the whole run. The key-missing / other PrivacyError
-        # mappings raised inside ``_build_collect_pipeline`` are ClickExceptions and propagate.
+    except (SpoolError, StateError, PipelineError, storage.StorageError) as error:
+        # A spool-integrity, control-state, pipeline-construction, or ClickHouse-ownership failure
+        # (e.g. DurableSpool reconciliation, a tampered barrier, a crashed-prior-writer orphan, an
+        # unclaimed/foreign destination) must surface as the coded exit-1 contract every other
+        # command produces -- a clean ``error: MH_...`` rather than a raw traceback. Per-collector
+        # faults AND a contained ClickHouse delivery failure are already isolated INTO the summary
+        # (records_failed / export_error_code → exit 1 below); this catches only failures that abort
+        # the whole run. The key-missing / other PrivacyError mappings raised inside
+        # ``_build_collect_pipeline`` are ClickExceptions and propagate.
         raise CollectCommandError(error) from None
     finally:
+        # Close the ClickHouse client and the control handle on EVERY path (ownership failure,
+        # pipeline error, or clean success), so a full run never leaks the client; spool_only opens
+        # none, so ``client is None`` and only the control handle is closed.
+        if client is not None:
+            client.close()
         control.close()
 
     if as_json:

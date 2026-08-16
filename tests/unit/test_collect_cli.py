@@ -14,11 +14,13 @@ from pathlib import Path
 
 import pytest
 from _runtime_harness import KNOWN_SECRET, FakeCollector, fake_factory, registry_with
+from _storage_fakes import FakeClickHouseClient
 from click.testing import CliRunner
 
 from milhouse.cli import bootstrap, root
 from milhouse.cli.root import main
 from milhouse.config import RuntimePaths, load_config, resolve_runtime_paths
+from milhouse.config.secrets import SecretEnvironment
 from milhouse.domain.records import CollectorDescriptorV1
 from milhouse.spooling import SpoolError
 from milhouse.state import StateError
@@ -33,13 +35,20 @@ _SECOND_COLLECTOR = (
 )
 
 
-def _config_file(tmp_path: Path, *, extra: str = "", mode: str = "spool_only") -> Path:
-    # The example config ships ``runtime.mode = "full"``; collect run rejects full mode (exit 2), so
-    # the run-path tests default to a spool_only config. ``mode="full"`` is used to test the reject.
+def _config_file(
+    tmp_path: Path, *, extra: str = "", mode: str = "spool_only", clickhouse_enabled: bool = True
+) -> Path:
+    # The example config ships ``runtime.mode = "full"``; the spool-only run-path tests default to a
+    # spool_only config, while ``mode="full"`` exercises the ClickHouse export tail (against a fake
+    # client). ``clickhouse_enabled=False`` toggles the storage block off to test the disabled path.
     config_dir = tmp_path / "cfg"
     config_dir.mkdir()
     config_file = config_dir / "config.toml"
     body = _EXAMPLE_CONFIG.replace('mode = "full"', f'mode = "{mode}"')
+    if not clickhouse_enabled:
+        body = body.replace(
+            "[storage.clickhouse]\nenabled = true", "[storage.clickhouse]\nenabled = false"
+        )
     config_file.write_text(body + extra, encoding="utf-8")
     return config_file
 
@@ -299,26 +308,6 @@ def test_collect_run_filters_to_one_collector(
     assert ids == {"second-canary"}
 
 
-def test_collect_run_rejects_full_mode_and_commits_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A full-mode config must be REJECTED (exit 2) before any run: a spool_only run would stamp
-    # required_exporters=() and permanently strand the segments from storage export. Nothing spools.
-    config_file = _config_file(tmp_path, mode="full")
-    paths = _paths(config_file, tmp_path)
-    runner = CliRunner()
-    runner.invoke(main, ["--config", str(config_file), "init"])
-    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
-
-    result = runner.invoke(main, ["--config", str(config_file), "collect", "run"])
-
-    assert result.exit_code == 2
-    assert "full-mode" in result.output
-    assert "runtime.mode = spool_only" in result.output
-    # No segment was committed — the reject happens before the pipeline is built.
-    assert not list((paths.spool / "pending").rglob("*.jsonl"))
-
-
 @pytest.mark.parametrize(
     ("error", "code"),
     [
@@ -350,6 +339,179 @@ def test_collect_run_maps_a_run_abort_to_the_coded_exit_one_contract(
     assert code in result.output
     assert isinstance(result.exception, SystemExit)
     assert not isinstance(result.exception, (SpoolError, StateError))
+
+
+# --- Part C: collect run (full mode → ClickHouse export via the delivery ledger) ------------------
+#
+# Full mode wires the SAME exactly-once delivery tail ``storage export`` drives, so these tests
+# reuse the offline fake ClickHouse seam: monkeypatch ``build_client`` → a fake and
+# ``load_secret_environment`` → an empty env, and run ``storage migrate`` first so ``require_owner``
+# passes. The real ClickHouse round-trip is host-gated (live/E06).
+
+
+class _CloseSpyClient(FakeClickHouseClient):
+    """A fake CH client that counts ``close()`` calls, to prove close-on-every-path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _RaisingCloseSpyClient(_CloseSpyClient):
+    """A close-spy whose ``insert`` raises, so a delivery is contained as a retryable failure."""
+
+    def insert(self, *args: object, **kwargs: object) -> None:
+        raise RuntimeError("clickhouse insert unavailable")
+
+
+def _stub_clickhouse(monkeypatch: pytest.MonkeyPatch, client: FakeClickHouseClient) -> None:
+    """Point the storage client seam at ``client`` with an empty secret environment (no network)."""
+
+    monkeypatch.setattr(
+        root, "load_secret_environment", lambda config, paths: SecretEnvironment({}, {})
+    )
+    monkeypatch.setattr(root.storage, "build_client", lambda config, secrets: client)
+
+
+def _migrate(config_file: Path) -> None:
+    """Claim/verify ownership of the (fake) ClickHouse by applying migrations — the full-mode
+    precondition ``require_owner`` enforces."""
+
+    result = CliRunner().invoke(main, ["--config", str(config_file), "storage", "migrate"])
+    assert result.exit_code == 0, result.output
+
+
+def test_collect_run_full_mode_delivers_to_clickhouse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A migrated (claimed) full-mode destination: the committed segment is delivered through the
+    # ClickHouse exporter, so the summary reports a delivery and the fake client received a records
+    # insert. The client is closed on the clean-success path.
+    config_file = _config_file(tmp_path, mode="full")
+    client = _CloseSpyClient()
+    _stub_clickhouse(monkeypatch, client)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    _migrate(config_file)
+    client.close_calls = 0  # isolate collect run's own finally-close from migrate's client close
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "collect", "run", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["mode"] == "full"
+    assert payload["records_committed"] >= 1
+    assert payload["records_delivered"] >= 1
+    assert payload["records_failed"] == 0
+    assert payload["export_error_code"] is None
+    # The delivery tail actually wrote the event's record row to ClickHouse (not just migrate DDL).
+    assert "records" in [table for _db, table, *_ in client.inserts]
+    assert client.close_calls >= 1  # closed on the success path (no leak)
+
+
+def test_collect_run_full_mode_fails_closed_on_an_unclaimed_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Full mode WITHOUT ``storage migrate`` (the destination is unclaimed): require_owner refuses it
+    # with MH_STORAGE_OWNERSHIP and the "run storage migrate first" guidance, BEFORE any commit — so
+    # nothing spools and the client is still closed. Click handles it (no traceback).
+    config_file = _config_file(tmp_path, mode="full")
+    paths = _paths(config_file, tmp_path)
+    client = _CloseSpyClient()
+    _stub_clickhouse(monkeypatch, client)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "collect", "run"])
+
+    assert result.exit_code == 1
+    assert "MH_STORAGE_OWNERSHIP" in result.output
+    assert "migrate" in result.output  # "...unclaimed; run storage migrate first"
+    assert isinstance(result.exception, SystemExit)  # a handled ClickException, not a raw traceback
+    # Nothing was committed (the ownership barrier precedes the pipeline) and the client was closed.
+    assert not list((paths.spool / "pending").rglob("*.jsonl"))
+    assert client.inserts == []
+    assert client.close_calls >= 1
+
+
+def test_collect_run_full_mode_with_clickhouse_disabled_is_a_config_error(
+    tmp_path: Path,
+) -> None:
+    # A full-mode config that disables ClickHouse cannot export: _storage_client raises
+    # MH_STORAGE_CONFIG (exit 1) BEFORE any control handle or client is opened.
+    config_file = _config_file(tmp_path, mode="full", clickhouse_enabled=False)
+    paths = _paths(config_file, tmp_path)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+
+    result = runner.invoke(main, ["--config", str(config_file), "collect", "run"])
+
+    assert result.exit_code == 1
+    assert "MH_STORAGE_CONFIG" in result.output
+    assert isinstance(result.exception, SystemExit)
+    # It failed before the pipeline ran: nothing spooled.
+    assert not list((paths.spool / "pending").rglob("*.jsonl"))
+
+
+def test_collect_run_full_mode_delivery_failure_is_nonfatal_but_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A ClickHouse insert that raises is CONTAINED by the delivery ledger as a retryable failure:
+    # the segment is durably committed, records_failed is set, and the run exits 1 (loud, not
+    # silent) — but the client is still closed. replay_segments does not raise, so export_error_code
+    # stays None.
+    config_file = _config_file(tmp_path, mode="full")
+    client = _RaisingCloseSpyClient()
+    _stub_clickhouse(monkeypatch, client)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    _migrate(config_file)  # migrate uses command(), not insert(), so it still claims ownership
+    client.close_calls = 0  # isolate collect run's own finally-close from migrate's client close
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "collect", "run", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["mode"] == "full"
+    assert payload["records_committed"] >= 1  # the commit is durable even though delivery failed
+    assert payload["records_delivered"] == 0
+    assert payload["records_failed"] >= 1  # the contained delivery failure forces exit 1
+    assert payload["export_error_code"] is None  # replay_segments did not itself raise
+    assert client.inserts == []  # the raising insert recorded nothing
+    assert client.close_calls >= 1  # closed on the delivery-failure path (no leak)
+
+
+def test_collect_run_spool_only_never_opens_a_clickhouse_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # spool_only must never touch the storage client seam: point build_client / load_secret_
+    # environment at raising stubs and prove the run still succeeds without invoking either.
+    config_file = _config_file(tmp_path)  # spool_only
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+
+    def _boom_secret(config: object, paths: object) -> SecretEnvironment:
+        raise AssertionError("spool_only must not load the secret environment")
+
+    def _boom_client(config: object, secrets: object) -> FakeClickHouseClient:
+        raise AssertionError("spool_only must not build a ClickHouse client")
+
+    monkeypatch.setattr(root, "load_secret_environment", _boom_secret)
+    monkeypatch.setattr(root.storage, "build_client", _boom_client)
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "collect", "run", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["mode"] == "spool_only"
+    assert payload["records_delivered"] == 0
 
 
 # --- collect list ---------------------------------------------------------------------------------
