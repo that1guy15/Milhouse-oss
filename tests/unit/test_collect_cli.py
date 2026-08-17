@@ -45,6 +45,18 @@ _SECOND_TARGET = (
     '\n[[targets]]\nid = "other-app"\nname = "Other App"\nkind = "web_service"\n'
     'environment = "production"\n'
 )
+# A second site_canary collector bound to the second declared target, to prove ``--target`` scoping
+# on ``canary`` keeps only the canaries bound to the requested target.
+_OTHER_TARGET_CANARY = (
+    '\n[[collectors]]\nid = "other-canary"\ntype = "site_canary"\n'
+    'target = "other-app"\nurl = "https://other.example/health"\nexpected_statuses = [200]\n'
+)
+# A NON-canary collector (file_outbox) on the already-declared target, to prove ``canary`` filters
+# to the site_canary type and never resolves/runs a non-canary collector.
+_NON_CANARY_COLLECTOR = (
+    '\n[[collectors]]\nid = "example-outbox"\ntype = "file_outbox"\n'
+    'target = "example-app"\npath = "outbox"\n'
+)
 
 
 def _config_file(
@@ -679,3 +691,192 @@ def test_config_selection_digest_is_the_validated_config_digest(tmp_path: Path) 
         config, config_path=config_path, platform_data_root=tmp_path / "platform"
     )
     assert paths.config_selection.config_digest == validated_config_digest(config)
+
+
+# --- Part D: the ``canary`` shorthand -------------------------------------------------------------
+#
+# ``canary`` scopes a single runtime run to the configured ``site_canary`` collectors and reuses the
+# SAME shared ``_run_collect`` body ``collect run`` drives, so these tests reuse the fake registry
+# and fake-ClickHouse seams and assert the same privacy-safe summary shape and exit-code contract.
+
+
+def test_canary_runs_the_site_canary_collectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_file = _config_file(tmp_path)
+    paths = _paths(config_file, tmp_path)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "canary", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["mode"] == "spool_only"
+    assert payload["records_committed"] >= 1
+    # The summary is the SAME privacy-safe shape ``collect run`` emits (shared helper).
+    assert set(payload) == _PRIVACY_SAFE_TOP_KEYS
+    for collector in payload["collectors"]:
+        assert set(collector) == _PRIVACY_SAFE_COLLECTOR_KEYS
+    # Only the configured site_canary collector ran, and a durable segment reached the spool.
+    assert {c["collector_id"] for c in payload["collectors"]} == {"example-canary"}
+    assert list((paths.spool / "pending").rglob("*.jsonl"))
+
+
+def test_canary_excludes_non_site_canary_collectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A file_outbox collector shares the config; ``canary`` must filter to the site_canary type
+    # only, so the non-canary collector is never resolved/run (the fake registry has only canary).
+    config_file = _config_file(tmp_path, extra=_NON_CANARY_COLLECTOR)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "canary", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert {c["collector_id"] for c in payload["collectors"]} == {"example-canary"}
+
+
+def test_canary_target_filters_to_bound_canaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two canaries on two targets: ``--target example-app`` keeps only the canary bound to it.
+    config_file = _config_file(tmp_path, extra=_SECOND_TARGET + _OTHER_TARGET_CANARY)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(
+        main, ["--config", str(config_file), "canary", "--target", "example-app", "--json"]
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert {c["collector_id"] for c in payload["collectors"]} == {"example-canary"}
+
+
+def test_canary_target_with_no_bound_canaries_reports_and_exits_zero(tmp_path: Path) -> None:
+    # other-app has no bound canary: ``canary`` reports the target-scoped message and exits 0
+    # without running anything -- so no init is required and no handle is opened.
+    config_file = _config_file(tmp_path, extra=_SECOND_TARGET)
+    result = CliRunner().invoke(
+        main, ["--config", str(config_file), "canary", "--target", "other-app"]
+    )
+    assert result.exit_code == 0
+    assert "no site_canary collectors bound to target other-app" in result.output
+
+
+def test_canary_unknown_target_is_config_error(tmp_path: Path) -> None:
+    config_file = _config_file(tmp_path)
+    CliRunner().invoke(main, ["--config", str(config_file), "init"])
+    result = CliRunner().invoke(main, ["--config", str(config_file), "canary", "--target", "nope"])
+    assert result.exit_code == 2
+
+
+def test_canary_with_no_site_canary_collectors_reports_and_opens_no_handles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A config that HAS a collector but NO site_canary one: ``canary`` reports the message and exits
+    # 0 WITHOUT loading the key or opening any control/ClickHouse handle -- there is nothing to run.
+    body = _LOCAL_ONLY_CONFIG[: _LOCAL_ONLY_CONFIG.index("[[collectors]]")]
+    body += (
+        '[[collectors]]\nid = "local-outbox"\ntype = "file_outbox"\n'
+        'target = "local-tool"\npath = "outbox"\n'
+    )
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    config_file = config_dir / "config.toml"
+    config_file.write_text(body, encoding="utf-8")
+    paths = _paths(config_file, tmp_path)
+
+    def _boom_control(path: object) -> object:
+        raise AssertionError("the empty canary run must not open a control database")
+
+    monkeypatch.setattr(root, "open_control_database", _boom_control)
+
+    result = CliRunner().invoke(main, ["--config", str(config_file), "canary"])
+
+    assert result.exit_code == 0
+    assert "no site_canary collectors configured" in result.output
+    # Nothing was opened or spooled (the empty-run guard precedes every handle).
+    assert not bootstrap.database_path(paths).exists()
+    assert not list((paths.spool / "pending").rglob("*.jsonl"))
+
+
+def test_canary_json_on_an_empty_run_emits_parseable_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --json must ALWAYS emit parseable JSON, even when nothing runs: an empty ``collectors``
+    # signals nothing ran, and (as with the plain path) no handle is opened.
+    body = _LOCAL_ONLY_CONFIG[: _LOCAL_ONLY_CONFIG.index("[[collectors]]")]
+    body += (
+        '[[collectors]]\nid = "local-outbox"\ntype = "file_outbox"\n'
+        'target = "local-tool"\npath = "outbox"\n'
+    )
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    config_file = config_dir / "config.toml"
+    config_file.write_text(body, encoding="utf-8")
+
+    def _boom_control(path: object) -> object:
+        raise AssertionError("the empty canary run must not open a control database")
+
+    monkeypatch.setattr(root, "open_control_database", _boom_control)
+
+    result = CliRunner().invoke(main, ["--config", str(config_file), "canary", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["collectors"] == []
+    assert "message" in payload
+
+
+def test_canary_full_mode_delivers_to_clickhouse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Full-mode ``canary`` reaches the SAME delivery tail: on a migrated (claimed) destination the
+    # committed canary segment is delivered through the ClickHouse exporter and the client closes.
+    config_file = _config_file(tmp_path, mode="full")
+    client = _CloseSpyClient()
+    _stub_clickhouse(monkeypatch, client)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    _migrate(config_file)
+    client.close_calls = 0  # isolate the canary run's own finally-close from migrate's client close
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "canary", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output.strip().splitlines()[-1])
+    assert payload["mode"] == "full"
+    assert payload["records_committed"] >= 1
+    assert payload["records_delivered"] >= 1
+    assert payload["records_failed"] == 0
+    assert payload["export_error_code"] is None
+    # The delivery tail actually wrote the event's record row to ClickHouse (not just migrate DDL).
+    assert "records" in [table for _db, table, *_ in client.inserts]
+    assert client.close_calls >= 1  # closed on the success path (no leak)
+
+
+def test_canary_json_is_privacy_safe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_file = _config_file(tmp_path)
+    runner = CliRunner()
+    runner.invoke(main, ["--config", str(config_file), "init"])
+    # The fake canary emits a draft whose free-text message ACTUALLY carries the target URL/host, so
+    # the no-leak assertions prove the summary is privacy-safe rather than vacuously true.
+    _use_fake_registry(monkeypatch, fake_factory((_URL_BEARING_MESSAGE,)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "canary", "--json"])
+
+    assert result.exit_code == 0
+    json_line = result.output.strip().splitlines()[-1]
+    payload = json.loads(json_line)
+    assert json_line == json.dumps(payload, sort_keys=True)
+    assert set(payload) == _PRIVACY_SAFE_TOP_KEYS
+    assert _TARGET_URL not in result.output
+    assert _TARGET_HOST not in result.output
