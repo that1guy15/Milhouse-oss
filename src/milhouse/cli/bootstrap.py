@@ -28,11 +28,13 @@ from milhouse.config import RuntimePaths
 from milhouse.config._models import MilhouseConfig
 from milhouse.config.filesystem import (
     SecureFileError,
+    SecureFileErrorKind,
     create_regular_file_no_follow,
     open_regular_file_no_follow,
 )
 from milhouse.privacy.keys import (
     PseudonymKeyCommitUncertain,
+    _validate_key_metadata,
     create_pseudonym_key,
     recover_pseudonym_key_creation,
 )
@@ -123,6 +125,17 @@ def database_path(paths: RuntimePaths) -> Path:
     return _control_dir(paths) / DATABASE_NAME
 
 
+def barrier_path(paths: RuntimePaths) -> Path:
+    """Return the single global commit-lock path (the control dir's ``commit.lock``).
+
+    The sole constructor of the :class:`GlobalCommitBarrier` path across the CLI, so every writer
+    (``collect``, ``storage`` export/migrate/backup/restore, ``demo``, ``init``) acquires the SAME
+    lock file. A divergent join at any one site would silently break the single-writer exclusion.
+    """
+
+    return _control_dir(paths) / BARRIER_NAME
+
+
 def _installation_id_path(paths: RuntimePaths) -> Path:
     return _control_dir(paths) / INSTALLATION_ID_NAME
 
@@ -148,6 +161,27 @@ def _ensure_private_directory(path: Path) -> bool:
     except OSError as error:
         raise BootstrapError("MH_INIT_DIR", "a state directory could not be created") from error
     return created
+
+
+def _ensure_private_key_parent(paths: RuntimePaths) -> None:
+    """Ensure every directory from STATE_ROOT down to the pseudonym key's parent is owner-only.
+
+    A non-default nested ``identity.pseudonym_key_path`` may put the key beneath directories the
+    managed set does not cover. Each intermediate level is created individually (0700) rather than
+    with ``mkdir(parents=True)`` in one call, because that would create the intermediates with the
+    umask default and tighten only the leaf. ``resolve_runtime_paths`` guarantees the key stays a
+    strict descendant of STATE_ROOT, so the upward walk terminates at STATE_ROOT.
+    """
+
+    pending: list[Path] = []
+    current = paths.pseudonym_key.parent
+    while True:
+        pending.append(current)
+        if current == paths.state_root or current == current.parent:
+            break
+        current = current.parent
+    for directory in reversed(pending):  # shallowest first: each level's parent already exists
+        _ensure_private_directory(directory)
 
 
 def _generate_installation_id() -> str:
@@ -261,7 +295,7 @@ def initialize(
 
     database = open_control_database(database_path(paths))
     try:
-        barrier = GlobalCommitBarrier(_control_dir(paths) / BARRIER_NAME)
+        barrier = GlobalCommitBarrier(barrier_path(paths))
         version = initialize_control_state(database, barrier=barrier, applied_at=now)
     finally:
         database.close()
@@ -269,8 +303,13 @@ def initialize(
     installation_created = _ensure_installation_id(paths)
     # The pseudonym key is provisioned only when the validated config is available: its secure
     # creation is bound to that config's resolved runtime generation, and credential-free callers
-    # (the spool-only demo) never need it. The control dir it lives under was created above (0700).
-    pseudonym_key_created = _ensure_pseudonym_key(config, paths) if config is not None else False
+    # (the spool-only demo) never need it.
+    pseudonym_key_created = False
+    if config is not None:
+        # Ensure the key's owner-only (0700) parent chain exists first, or the secure key creation
+        # would fail with an opaque parent-missing error for a non-default nested key path.
+        _ensure_private_key_parent(paths)
+        pseudonym_key_created = _ensure_pseudonym_key(config, paths)
     return InitReport(
         created_directories=tuple(created),
         schema_version=version,
@@ -297,23 +336,39 @@ def _database_check(paths: RuntimePaths) -> HealthCheck:
     return HealthCheck("control_database", ok, detail)
 
 
-def _pseudonym_key_present(paths: RuntimePaths) -> bool:
-    """Whether the pseudonym key file is present, checked privacy-safely (its bytes are never read).
+def _pseudonym_key_check(paths: RuntimePaths) -> HealthCheck:
+    """Report the pseudonym key's health, VALIDATED the way ``collect``'s key load validates it.
 
-    Mirrors :func:`read_installation_id`'s no-follow presence probe: a regular non-symlink file that
-    opens is present; any :class:`SecureFileError` (missing, not regular, symlink, unsafe) means it
-    is absent. This is a PRESENCE check only — it never reads, loads, logs, or returns key material.
+    A mere presence probe would call an install whose key is present-but-corrupt (wrong
+    mode/size/owner/nlink, an unsafe parent, or a non-regular file) "healthy" while ``collect run``
+    rejects it with a precise ``MH_PRIVACY_KEY_*`` code, so this opens the key no-follow beneath an
+    owner-only parent (as :func:`~milhouse.privacy.keys.load_pseudonym_key` does) and runs the
+    shared :func:`~milhouse.privacy.keys._validate_key_metadata` over the ``os.fstat`` METADATA
+    only. It is privacy-safe: it inspects fstat metadata ONLY and NEVER reads, loads, logs, or
+    returns key material. Absent → ``missing``; present but failing validation → ``present but
+    invalid``.
     """
 
     try:
-        opened = open_regular_file_no_follow(paths.pseudonym_key)
-    except SecureFileError:
-        return False
+        opened = open_regular_file_no_follow(paths.pseudonym_key, require_private_parent=True)
+    except SecureFileError as error:
+        detail = (
+            "missing (run milhouse init)"
+            if error.kind is SecureFileErrorKind.NOT_FOUND
+            else "present but invalid (run milhouse init)"
+        )
+        return HealthCheck("pseudonym_key", False, detail)
+    descriptor = opened.descriptor
     try:
-        os.close(opened.descriptor)
-    except OSError:  # pragma: no cover - defensive: close of our own fd
-        pass
-    return True
+        _validate_key_metadata(os.fstat(descriptor))
+    except (PrivacyError, OSError):
+        return HealthCheck("pseudonym_key", False, "present but invalid (run milhouse init)")
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:  # pragma: no cover - defensive: close of our own fd
+            pass
+    return HealthCheck("pseudonym_key", True, "present")
 
 
 def health(paths: RuntimePaths, *, now: datetime) -> HealthReport:
@@ -341,16 +396,9 @@ def health(paths: RuntimePaths, *, now: datetime) -> HealthReport:
         )
     )
 
-    # The runtime redactor -- and therefore ``collect run`` -- hard-requires the pseudonym key, so
-    # an install without it is NOT usable even though its directories, schema, and identity are
-    # sound. Report its presence (a privacy-safe presence probe only) so ``health``/``doctor`` no
-    # longer call a keyless install healthy while ``collect run`` fails "run milhouse init first".
-    key_present = _pseudonym_key_present(paths)
-    checks.append(
-        HealthCheck(
-            "pseudonym_key",
-            key_present,
-            "present" if key_present else "missing (run milhouse init)",
-        )
-    )
+    # The runtime redactor -- and therefore ``collect run`` -- hard-requires a VALID pseudonym key,
+    # so an install whose key is missing or corrupt is NOT usable even though its directories,
+    # schema, and identity are sound. Validate it (metadata only) so ``health``/``doctor`` no longer
+    # call such an install healthy while ``collect run`` fails "run milhouse init first".
+    checks.append(_pseudonym_key_check(paths))
     return HealthReport(checks=tuple(checks))

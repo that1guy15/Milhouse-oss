@@ -20,18 +20,30 @@ from click.testing import CliRunner
 from milhouse.cli import bootstrap, root
 from milhouse.cli.root import main
 from milhouse.config import RuntimePaths, load_config, resolve_runtime_paths
+from milhouse.config.loader import validated_config_digest
 from milhouse.config.secrets import SecretEnvironment
 from milhouse.domain.records import CollectorDescriptorV1
+from milhouse.runtime import PipelineError
 from milhouse.spooling import SpoolError
 from milhouse.state import StateError
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _EXAMPLE_CONFIG = (_REPO_ROOT / "config" / "example.toml").read_text(encoding="utf-8")
+# A minimal config whose single collector is its LAST block with no job/rule referencing it, so
+# truncating at ``[[collectors]]`` yields a valid ZERO-collector config for the empty-list branch.
+_LOCAL_ONLY_CONFIG = (_REPO_ROOT / "config" / "examples" / "local-only.toml").read_text(
+    encoding="utf-8"
+)
 # A second site_canary collector on the already-declared target, so a per-collector isolation run
 # has one collector that fails and one that succeeds. Appended text appends to the collectors array.
 _SECOND_COLLECTOR = (
     '\n[[collectors]]\nid = "second-canary"\ntype = "site_canary"\n'
     'target = "example-app"\nurl = "https://example.com/health2"\nexpected_statuses = [200]\n'
+)
+# A second declared target that no example collector is bound to.
+_SECOND_TARGET = (
+    '\n[[targets]]\nid = "other-app"\nname = "Other App"\nkind = "web_service"\n'
+    'environment = "production"\n'
 )
 
 
@@ -108,6 +120,25 @@ _PRIVACY_SAFE_COLLECTOR_KEYS = {
     "records_failed",
     "batch_id",
 }
+
+# The example config's example-canary target URL/host; a fake collector emits it inside a draft's
+# free-text field so a privacy assertion that it never reaches the summary is meaningful.
+_TARGET_URL = "https://example.com/health"
+_TARGET_HOST = "example.com"
+_URL_BEARING_MESSAGE = f"probe of {_TARGET_URL} failed for host {_TARGET_HOST}"
+
+
+def _json_payload(output: str) -> dict[str, object]:
+    """Parse the ``--json`` summary object from mixed stdout/stderr CLI output.
+
+    ``collect run`` may trail its JSON summary with privacy-safe stderr WARNING/NOTE lines (a failed
+    collector, a stage error), which CliRunner mixes into ``output``; the summary is therefore the
+    last line that starts with ``{``, not simply the last line.
+    """
+
+    json_lines = [line for line in output.splitlines() if line.startswith("{")]
+    assert json_lines, output
+    return json.loads(json_lines[-1])
 
 
 # --- Part A: init provisions the pseudonym key, idempotently --------------------------------------
@@ -191,7 +222,10 @@ def test_collect_run_json_is_stable_and_privacy_safe(
     config_file = _config_file(tmp_path)
     runner = CliRunner()
     runner.invoke(main, ["--config", str(config_file), "init"])
-    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+    # The fake collector emits a draft whose free-text message ACTUALLY carries the target URL/host,
+    # so the no-leak assertions below prove the summary is privacy-safe (it never renders draft
+    # payloads) rather than being vacuously true against a URL-free draft.
+    _use_fake_registry(monkeypatch, fake_factory((_URL_BEARING_MESSAGE,)))
 
     result = runner.invoke(main, ["--config", str(config_file), "collect", "run", "--json"])
 
@@ -203,9 +237,9 @@ def test_collect_run_json_is_stable_and_privacy_safe(
     assert set(payload) == _PRIVACY_SAFE_TOP_KEYS
     for collector in payload["collectors"]:
         assert set(collector) == _PRIVACY_SAFE_COLLECTOR_KEYS
-    # No target url or host leaks into the summary.
-    assert "example.com" not in result.output
-    assert "health2" not in result.output
+    # The draft carried the target URL/host in a free-text field; neither leaks into the summary.
+    assert _TARGET_URL not in result.output
+    assert _TARGET_HOST not in result.output
 
 
 def test_collect_run_exits_one_when_a_collector_fails(
@@ -219,12 +253,16 @@ def test_collect_run_exits_one_when_a_collector_fails(
     result = runner.invoke(main, ["--config", str(config_file), "collect", "run", "--json"])
 
     assert result.exit_code == 1
-    payload = json.loads(result.output.strip().splitlines()[-1])
+    payload = _json_payload(result.output)
     assert payload["collectors"][0]["status"] == "error"
     assert payload["collectors"][0]["error_code"] is not None
     # The fake's raised exception embeds KNOWN_SECRET; per-collector isolation must reduce it to a
     # fixed code, so the secret in the exception message never surfaces in any rendered output.
     assert KNOWN_SECRET not in result.output
+    # A failed/error collector emits a uniform stderr WARNING carrying ONLY the config-declared
+    # collector id and its fixed error code (never the secret-bearing exception message).
+    assert "WARNING: collector example-canary ended error" in result.output
+    assert payload["collectors"][0]["error_code"] in result.output
 
 
 def test_collect_run_isolates_a_failing_collector_from_a_healthy_one(
@@ -239,12 +277,15 @@ def test_collect_run_isolates_a_failing_collector_from_a_healthy_one(
     result = runner.invoke(main, ["--config", str(config_file), "collect", "run", "--json"])
 
     assert result.exit_code == 1  # a failed collector forces exit 1
-    payload = json.loads(result.output.strip().splitlines()[-1])
+    payload = _json_payload(result.output)
     by_id = {c["collector_id"]: c for c in payload["collectors"]}
     assert by_id["example-canary"]["status"] == "ok"
     assert by_id["example-canary"]["records_committed"] >= 1
     assert by_id["second-canary"]["status"] == "error"
     assert by_id["second-canary"]["error_code"] is not None
+    # The uniform per-collector WARNING names only the failing collector, not the healthy one.
+    assert "WARNING: collector second-canary ended error" in result.output
+    assert "WARNING: collector example-canary" not in result.output
 
 
 def test_collect_run_fails_closed_without_init(tmp_path: Path) -> None:
@@ -274,6 +315,30 @@ def test_collect_run_fails_closed_when_the_pseudonym_key_is_absent(
     assert not list((paths.spool / "pending").rglob("*.jsonl"))
 
 
+def test_collect_run_missing_key_opens_no_control_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A2: the pseudonym-key fail-closed guard runs BEFORE any control-DB (or ClickHouse client)
+    # handle is opened, so a run whose key is absent leaves no (empty) control DB behind. Simulate a
+    # partial state -- identity present, but BOTH the key and the control DB gone -- and prove the
+    # DB is not recreated.
+    config_file = _config_file(tmp_path)
+    paths = _paths(config_file, tmp_path)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    paths.pseudonym_key.unlink()
+    database = bootstrap.database_path(paths)
+    database.unlink()
+    assert bootstrap.read_installation_id(paths) is not None  # identity persists (separate file)
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "collect", "run"])
+
+    assert result.exit_code == 1
+    assert "run milhouse init first" in result.output
+    assert not database.exists()  # the key guard preceded open_control_database
+
+
 def test_collect_run_unknown_collector_id_is_config_error(tmp_path: Path) -> None:
     config_file = _config_file(tmp_path)
     CliRunner().invoke(main, ["--config", str(config_file), "init"])
@@ -288,6 +353,36 @@ def test_collect_run_unknown_target_is_config_error(tmp_path: Path) -> None:
         main, ["--config", str(config_file), "collect", "run", "--target", "nope"]
     )
     assert result.exit_code == 2
+
+
+def test_collect_run_collector_not_bound_to_target_is_config_error(tmp_path: Path) -> None:
+    # example-canary is bound to example-app, not other-app. Naming BOTH a collector and a target it
+    # is not bound to is an operator mistake -- a config error (exit 2), not a silent empty run.
+    config_file = _config_file(tmp_path, extra=_SECOND_TARGET)
+    result = CliRunner().invoke(
+        main,
+        ["--config", str(config_file), "collect", "run", "example-canary", "--target", "other-app"],
+    )
+    assert result.exit_code == 2
+
+
+def test_collect_run_target_only_with_no_bound_collectors_is_an_empty_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ``--target`` alone (no collector id) over a target that has no bound collectors stays a
+    # legitimate empty run (exit 0), NOT a config error -- only the both-given case is an error.
+    config_file = _config_file(tmp_path, extra=_SECOND_TARGET)
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(
+        main, ["--config", str(config_file), "collect", "run", "--target", "other-app", "--json"]
+    )
+
+    assert result.exit_code == 0
+    payload = _json_payload(result.output)
+    assert payload["collectors"] == []
 
 
 def test_collect_run_filters_to_one_collector(
@@ -313,13 +408,14 @@ def test_collect_run_filters_to_one_collector(
     [
         (SpoolError("MH_SPOOL_TEST", "spool integrity check failed"), "MH_SPOOL_TEST"),
         (StateError("MH_STATE_TEST", "control state check failed"), "MH_STATE_TEST"),
+        (PipelineError("MH_PIPELINE_TEST", "pipeline construction failed"), "MH_PIPELINE_TEST"),
     ],
 )
 def test_collect_run_maps_a_run_abort_to_the_coded_exit_one_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, code: str
 ) -> None:
-    # A whole-run abort (spool integrity, control state, pipeline ctor) must surface as the coded
-    # exit-1 ClickException every other command produces -- never a raw traceback.
+    # A whole-run abort (spool integrity, control state, or a pipeline ctor PipelineError) must
+    # surface as the coded exit-1 ClickException every other command produces -- never a traceback.
     config_file = _config_file(tmp_path)
     runner = CliRunner()
     runner.invoke(main, ["--config", str(config_file), "init"])
@@ -335,10 +431,11 @@ def test_collect_run_maps_a_run_abort_to_the_coded_exit_one_contract(
     assert result.exit_code == 1
     # The coded message is rendered by the ClickException handler (an escaped raw error would not
     # reach the captured output), and the recorded exception is the clean SystemExit Click raises
-    # for a handled ClickException -- NOT the raw SpoolError/StateError with a traceback.
+    # for a handled ClickException -- NOT the raw SpoolError/StateError/PipelineError with a
+    # traceback.
     assert code in result.output
     assert isinstance(result.exception, SystemExit)
-    assert not isinstance(result.exception, (SpoolError, StateError))
+    assert not isinstance(result.exception, (SpoolError, StateError, PipelineError))
 
 
 # --- Part C: collect run (full mode → ClickHouse export via the delivery ledger) ------------------
@@ -523,3 +620,62 @@ def test_collect_list_reports_configured_collectors(tmp_path: Path) -> None:
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert {"id": "example-canary", "type": "site_canary"} in payload["collectors"]
+
+
+# --- human-mode (non --json) render paths ---------------------------------------------------------
+
+
+def test_collect_run_human_mode_renders_summary_and_per_collector_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_file = _config_file(tmp_path)  # spool_only
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    _use_fake_registry(monkeypatch, fake_factory(("probe ok",)))
+
+    result = runner.invoke(main, ["--config", str(config_file), "collect", "run"])  # no --json
+
+    assert result.exit_code == 0
+    # The human-mode summary line and the per-collector line for the configured, healthy collector.
+    assert "collect: mode=spool_only committed=" in result.output
+    assert "delivered=0" in result.output
+    assert "example-canary: status=ok" in result.output
+    # Human mode emits no JSON object.
+    assert "{" not in result.output
+
+
+def test_collect_list_human_mode_renders_configured_collectors(tmp_path: Path) -> None:
+    config_file = _config_file(tmp_path)
+    result = CliRunner().invoke(
+        main, ["--config", str(config_file), "collect", "list"]
+    )  # no --json
+    assert result.exit_code == 0
+    assert "example-canary  type=site_canary" in result.output
+
+
+def test_collect_list_human_mode_reports_no_configured_collectors(tmp_path: Path) -> None:
+    body = _LOCAL_ONLY_CONFIG[: _LOCAL_ONLY_CONFIG.index("[[collectors]]")]
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    config_file = config_dir / "config.toml"
+    config_file.write_text(body, encoding="utf-8")
+
+    result = CliRunner().invoke(main, ["--config", str(config_file), "collect", "list"])
+
+    assert result.exit_code == 0
+    assert "no configured collectors" in result.output
+
+
+# --- config_generation digest reuse (locks B4 byte-identity) --------------------------------------
+
+
+def test_config_selection_digest_is_the_validated_config_digest(tmp_path: Path) -> None:
+    # ``_build_collect_pipeline`` reuses ``paths.config_selection.config_digest`` as the pipeline's
+    # ``config_generation`` INSTEAD of recomputing ``validated_config_digest(config)``; the loader
+    # binds them equal and ``verify_config_generation`` enforces it, so lock byte-identity here.
+    config_file = _config_file(tmp_path)
+    config, config_path = load_config(config_file, platform_default=config_file)
+    paths = resolve_runtime_paths(
+        config, config_path=config_path, platform_data_root=tmp_path / "platform"
+    )
+    assert paths.config_selection.config_digest == validated_config_digest(config)
