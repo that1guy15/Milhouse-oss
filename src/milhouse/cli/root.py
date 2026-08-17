@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Protocol
@@ -14,7 +14,7 @@ from platformdirs import user_config_path, user_data_path
 
 from milhouse import __version__, storage
 from milhouse.cli import bootstrap, demo, views
-from milhouse.collectors.site_canary import register_site_canary
+from milhouse.collectors.site_canary import SITE_CANARY_TYPE, register_site_canary
 from milhouse.config import (
     ConfigError,
     RuntimePaths,
@@ -23,7 +23,7 @@ from milhouse.config import (
     load_secret_environment,
     resolve_runtime_paths,
 )
-from milhouse.config._models import MilhouseConfig
+from milhouse.config._models import CollectorConfig, MilhouseConfig, TargetConfig
 from milhouse.core.clock import SystemClock
 from milhouse.privacy.keys import load_pseudonym_key
 from milhouse.privacy.pseudonym import PrivacyError
@@ -411,6 +411,134 @@ def _collect_run_failed(summary: PipelineRunSummary) -> bool:
     )
 
 
+def _run_collect(
+    context: click.Context,
+    state: CliState,
+    config: MilhouseConfig,
+    paths: RuntimePaths,
+    collectors: Sequence[CollectorConfig],
+    targets: Sequence[TargetConfig],
+    *,
+    as_json: bool,
+) -> None:
+    """Run the already-filtered ``collectors`` once through the runtime pipeline, then exit.
+
+    The shared body ``collect run`` and the ``canary`` shorthand both call after doing their own
+    collector selection. It takes the ALREADY-FILTERED ``collectors`` plus the full ``targets`` set
+    (passed to the pipeline for lookup) and performs everything from the pseudonym-key/redactor load
+    through the exit: the fail-closed key guard BEFORE any handle opens, the mode-aware full-mode
+    ClickHouse client lifecycle (client closed in ``finally`` on every path), the coded exit-1
+    mapping for a whole-run abort, the privacy-safe ``--json``/human summary, the per-stage and
+    per-collector stderr WARNINGs, and the exit-code contract (``context.exit(1)`` on failure). The
+    behaviour is identical for either caller — the only thing that differs is which collectors were
+    selected upstream.
+    """
+
+    installation_id = _require_installation_id(paths)
+    # Load the pseudonym key and build the redactor the pipeline hard-requires BEFORE opening any
+    # ClickHouse client or control handle, so a missing/corrupt key fails closed "run milhouse init
+    # first" without wasting a client/DB open — which could otherwise leave an empty control DB
+    # behind. The collectors are the primary redaction authority, so no extra known secrets here.
+    try:
+        pseudonymizer = load_pseudonym_key(config, paths)
+    except PrivacyError as error:
+        if error.code == "MH_PRIVACY_KEY_NOT_FOUND":
+            raise BootstrapCommandError(
+                bootstrap.BootstrapError("MH_NOT_INITIALIZED", "run milhouse init first")
+            ) from None
+        raise CollectCommandError(error) from None
+    redactor = LayeredRedactor(pseudonymizer, known_secrets=())
+
+    # Full mode delivers committed segments to ClickHouse via the pipeline's delivery tail, so it
+    # needs an authenticated client and the ClickHouse exporter; spool_only needs neither. Open the
+    # client BEFORE the control handle so a storage-config failure (clickhouse disabled/unbuildable,
+    # or a bad secret env) surfaces its own coded exit without ever acquiring a control handle.
+    client: storage.ConnectedClickHouseClient | None = None
+    database: str | None = None
+    if config.runtime.mode == "full":
+        database, client = _storage_client(state)
+    control = open_control_database(bootstrap.database_path(paths))
+    try:
+        exporters: dict[str, Exporter] = {}
+        if client is not None and database is not None:
+            # Refuse to deliver to a destination this installation does not own (fail closed) — the
+            # same read barrier ``storage export`` takes: an UNCLAIMED destination raises
+            # ``MH_STORAGE_OWNERSHIP`` with "run storage migrate first", a FOREIGN owner is refused.
+            # Placed BEFORE the pipeline commits/exports, so a full run over an unowned ClickHouse
+            # strands nothing.
+            storage.require_owner(client, database, installation_id=installation_id)
+            exporters = {
+                storage.CLICKHOUSE_EXPORTER_ID: storage.ClickHouseExporter(client, database)
+            }
+        pipeline = _build_collect_pipeline(
+            config,
+            paths,
+            installation_id,
+            control,
+            mode=config.runtime.mode,
+            exporters=exporters,
+            redactor=redactor,
+        )
+        # The full target set is passed for lookup; the collector filters above scope the run.
+        summary = pipeline.run(tuple(collectors), tuple(targets))
+    except (SpoolError, StateError, PipelineError, storage.StorageError) as error:
+        # A spool-integrity, control-state, pipeline-construction, or ClickHouse-ownership failure
+        # (e.g. DurableSpool reconciliation, a tampered barrier, a crashed-prior-writer orphan, an
+        # unclaimed/foreign destination) must surface as the coded exit-1 contract every other
+        # command produces -- a clean ``error: MH_...`` rather than a raw traceback. Per-collector
+        # faults AND a contained ClickHouse delivery failure are already isolated INTO the summary
+        # (records_failed / export_error_code → exit 1 below); this catches only failures that abort
+        # the whole run. The key-missing / other PrivacyError mapping ran earlier (before any handle
+        # opened), so it never reaches here.
+        raise CollectCommandError(error) from None
+    finally:
+        # Close the ClickHouse client and the control handle on EVERY path (ownership failure,
+        # pipeline error, or clean success), so a full run never leaks the client; spool_only opens
+        # none, so ``client is None`` and only the control handle is closed.
+        if client is not None:
+            client.close()
+        control.close()
+
+    if as_json:
+        click.echo(json.dumps(_collect_run_payload(summary), sort_keys=True))
+    else:
+        click.echo(
+            f"collect: mode={summary.mode} committed={summary.records_committed} "
+            f"delivered={summary.records_delivered} failed={summary.records_failed} "
+            f"alerts_fired={summary.alerts_fired} alerts_resolved={summary.alerts_resolved} "
+            f"intents_emitted={summary.intents_emitted}"
+        )
+        for collector in summary.collectors:
+            code = collector.error_code or "none"
+            batch = collector.batch_id or "none"
+            click.echo(
+                f"  {collector.collector_id}: status={collector.status} error={code} "
+                f"drafts={collector.drafts_produced} committed={collector.records_committed} "
+                f"delivered={collector.records_delivered} failed={collector.records_failed} "
+                f"batch={batch}"
+            )
+    stage_error_codes: tuple[tuple[str, str | None], ...] = (
+        ("export", summary.export_error_code),
+        ("alerts", summary.alerts_error_code),
+        ("intents", summary.intents_error_code),
+    )
+    for label, stage_code in stage_error_codes:
+        if stage_code is not None:
+            click.echo(f"WARNING: the {label} stage reported {stage_code}", err=True)
+    # A failed/error collector forces exit 1; emit a uniform per-collector stderr WARNING (the same
+    # operator signal the stage errors give), privacy-safe: only the config-declared collector id
+    # and its fixed error code -- never a payload, path, URL, or secret.
+    for collector in summary.collectors:
+        if collector.status in ("failed", "error"):
+            click.echo(
+                f"WARNING: collector {collector.collector_id} ended {collector.status} "
+                f"({collector.error_code or 'none'})",
+                err=True,
+            )
+    if _collect_run_failed(summary):
+        context.exit(1)
+
+
 @main.group(name="collect")
 def collect_group() -> None:
     """Run configured collectors once into the local spool (spool-only), or list them."""
@@ -491,109 +619,9 @@ def collect_run_command(
                 )
             )
 
-    installation_id = _require_installation_id(paths)
-    # Load the pseudonym key and build the redactor the pipeline hard-requires BEFORE opening any
-    # ClickHouse client or control handle, so a missing/corrupt key fails closed "run milhouse init
-    # first" without wasting a client/DB open — which could otherwise leave an empty control DB
-    # behind. The collectors are the primary redaction authority, so no extra known secrets here.
-    try:
-        pseudonymizer = load_pseudonym_key(config, paths)
-    except PrivacyError as error:
-        if error.code == "MH_PRIVACY_KEY_NOT_FOUND":
-            raise BootstrapCommandError(
-                bootstrap.BootstrapError("MH_NOT_INITIALIZED", "run milhouse init first")
-            ) from None
-        raise CollectCommandError(error) from None
-    redactor = LayeredRedactor(pseudonymizer, known_secrets=())
-
-    # Full mode delivers committed segments to ClickHouse via the pipeline's delivery tail, so it
-    # needs an authenticated client and the ClickHouse exporter; spool_only needs neither. Open the
-    # client BEFORE the control handle so a storage-config failure (clickhouse disabled/unbuildable,
-    # or a bad secret env) surfaces its own coded exit without ever acquiring a control handle.
-    client: storage.ConnectedClickHouseClient | None = None
-    database: str | None = None
-    if config.runtime.mode == "full":
-        database, client = _storage_client(state)
-    control = open_control_database(bootstrap.database_path(paths))
-    try:
-        exporters: dict[str, Exporter] = {}
-        if client is not None and database is not None:
-            # Refuse to deliver to a destination this installation does not own (fail closed) — the
-            # same read barrier ``storage export`` takes: an UNCLAIMED destination raises
-            # ``MH_STORAGE_OWNERSHIP`` with "run storage migrate first", a FOREIGN owner is refused.
-            # Placed BEFORE the pipeline commits/exports, so a full run over an unowned ClickHouse
-            # strands nothing.
-            storage.require_owner(client, database, installation_id=installation_id)
-            exporters = {
-                storage.CLICKHOUSE_EXPORTER_ID: storage.ClickHouseExporter(client, database)
-            }
-        pipeline = _build_collect_pipeline(
-            config,
-            paths,
-            installation_id,
-            control,
-            mode=config.runtime.mode,
-            exporters=exporters,
-            redactor=redactor,
-        )
-        # The full target set is passed for lookup; the collector filters above scope the run.
-        summary = pipeline.run(tuple(collectors), tuple(config.targets))
-    except (SpoolError, StateError, PipelineError, storage.StorageError) as error:
-        # A spool-integrity, control-state, pipeline-construction, or ClickHouse-ownership failure
-        # (e.g. DurableSpool reconciliation, a tampered barrier, a crashed-prior-writer orphan, an
-        # unclaimed/foreign destination) must surface as the coded exit-1 contract every other
-        # command produces -- a clean ``error: MH_...`` rather than a raw traceback. Per-collector
-        # faults AND a contained ClickHouse delivery failure are already isolated INTO the summary
-        # (records_failed / export_error_code → exit 1 below); this catches only failures that abort
-        # the whole run. The key-missing / other PrivacyError mapping ran earlier (before any handle
-        # opened), so it never reaches here.
-        raise CollectCommandError(error) from None
-    finally:
-        # Close the ClickHouse client and the control handle on EVERY path (ownership failure,
-        # pipeline error, or clean success), so a full run never leaks the client; spool_only opens
-        # none, so ``client is None`` and only the control handle is closed.
-        if client is not None:
-            client.close()
-        control.close()
-
-    if as_json:
-        click.echo(json.dumps(_collect_run_payload(summary), sort_keys=True))
-    else:
-        click.echo(
-            f"collect: mode={summary.mode} committed={summary.records_committed} "
-            f"delivered={summary.records_delivered} failed={summary.records_failed} "
-            f"alerts_fired={summary.alerts_fired} alerts_resolved={summary.alerts_resolved} "
-            f"intents_emitted={summary.intents_emitted}"
-        )
-        for collector in summary.collectors:
-            code = collector.error_code or "none"
-            batch = collector.batch_id or "none"
-            click.echo(
-                f"  {collector.collector_id}: status={collector.status} error={code} "
-                f"drafts={collector.drafts_produced} committed={collector.records_committed} "
-                f"delivered={collector.records_delivered} failed={collector.records_failed} "
-                f"batch={batch}"
-            )
-    stage_error_codes: tuple[tuple[str, str | None], ...] = (
-        ("export", summary.export_error_code),
-        ("alerts", summary.alerts_error_code),
-        ("intents", summary.intents_error_code),
-    )
-    for label, stage_code in stage_error_codes:
-        if stage_code is not None:
-            click.echo(f"WARNING: the {label} stage reported {stage_code}", err=True)
-    # A failed/error collector forces exit 1; emit a uniform per-collector stderr WARNING (the same
-    # operator signal the stage errors give), privacy-safe: only the config-declared collector id
-    # and its fixed error code -- never a payload, path, URL, or secret.
-    for collector in summary.collectors:
-        if collector.status in ("failed", "error"):
-            click.echo(
-                f"WARNING: collector {collector.collector_id} ended {collector.status} "
-                f"({collector.error_code or 'none'})",
-                err=True,
-            )
-    if _collect_run_failed(summary):
-        context.exit(1)
+    # The selected collectors and the full target set (for lookup) drive the shared run body, which
+    # owns the key/redactor load, the mode-aware client lifecycle, the summary, and the exit codes.
+    _run_collect(context, state, config, paths, collectors, config.targets, as_json=as_json)
 
 
 @collect_group.command(name="list")
@@ -612,6 +640,79 @@ def collect_list_command(state: CliState, as_json: bool) -> None:
         return
     for row in rows:
         click.echo(f"{row['id']}  type={row['type']}")
+
+
+@main.command(name="canary")
+@click.option(
+    "--target",
+    "target_id",
+    default=None,
+    metavar="TARGET_ID",
+    help="Run only the site_canary collectors bound to this declared target id.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the run summary as stable JSON.")
+@click.pass_context
+def canary_command(context: click.Context, target_id: str | None, as_json: bool) -> None:
+    """Run the configured ``site_canary`` collectors once — a shorthand for ``collect run``.
+
+    A convenience wrapper that scopes a single runtime run to the configured ``site_canary``
+    collectors (a network probe turned into one availability event each) and drives them through the
+    SAME pipeline ``collect run`` uses: collect → redact → spool, plus the configured canary alert
+    rules and notification-intent records evaluated in the same run, and — in ``full`` mode — the
+    exactly-once ClickHouse delivery tail. Like ``collect run`` it requires an initialized install
+    (the pipeline's redactor needs the keyed pseudonym key ``init`` provisions), and what a run does
+    follows the required ``runtime.mode``: ``spool_only`` spools locally with no egress, while
+    ``full`` additionally delivers to a ClickHouse destination that must already be migrated and
+    claimed by THIS installation — run ``storage migrate`` first.
+
+    ``--target`` runs only the canaries bound to that declared target; an unknown target id is a
+    configuration error. If no ``site_canary`` collector matches, nothing is run: the command says
+    so and exits 0 without opening any handle. The emitted summary carries ONLY privacy-safe counts,
+    fixed codes, and config-declared ids — never a secret, PII, path, payload, URL, or target host.
+
+    Exit codes match ``collect run``: 0 clean; 1 if any stage error code is set OR any records fail
+    (including a contained ClickHouse delivery failure) OR any collector ended ``failed``/``error``
+    OR the run aborts with a coded spool/state/pipeline failure OR (full mode) the ClickHouse
+    destination is unclaimed/foreign-owned or ClickHouse is disabled/unbuildable; 2 for an invalid
+    configuration — an unknown target id, or (full mode) an unresolvable ClickHouse secret/config.
+    """
+
+    state = context.ensure_object(CliState)
+    config, paths = _resolve_config(state)
+
+    collectors = [
+        collector for collector in config.collectors if collector.type == SITE_CANARY_TYPE
+    ]
+    if target_id is not None:
+        if target_id not in {target.id for target in config.targets}:
+            raise ConfigCommandError(
+                ConfigError(
+                    "config.target.unknown", "no target with the requested id is configured"
+                )
+            )
+        collectors = [
+            collector for collector in collectors if getattr(collector, "target", None) == target_id
+        ]
+
+    # Nothing to run: report a clear, privacy-safe message (config-declared id only) and exit 0
+    # WITHOUT loading the key or opening a control/ClickHouse handle -- there is nothing to spool.
+    if not collectors:
+        message = (
+            f"no site_canary collectors bound to target {target_id}"
+            if target_id is not None
+            else "no site_canary collectors configured"
+        )
+        if as_json:
+            # Honor the --json contract even on an empty run so a machine consumer always parses:
+            # an empty ``collectors`` signals nothing ran.
+            click.echo(json.dumps({"collectors": [], "message": message}, sort_keys=True))
+        else:
+            click.echo(message)
+        return
+
+    # The selected canaries and the full target set (for lookup) drive the shared run body, which
+    # owns the key/redactor load, the mode-aware client lifecycle, the summary, and the exit codes.
+    _run_collect(context, state, config, paths, collectors, config.targets, as_json=as_json)
 
 
 @main.group(name="spool")

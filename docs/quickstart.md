@@ -111,6 +111,18 @@ $ milhouse --config ./config.toml collect list    # the configured collectors' i
 example-canary  type=site_canary
 ```
 
+`milhouse canary` is a shorthand that runs only the configured `site_canary` collectors (the network
+probes) through the same pipeline, with the same modes, summary, and exit codes as `collect run`.
+`--target TARGET_ID` scopes it to the canaries bound to one target. If no `site_canary` collector is
+configured — or none is bound to the given target — it reports that and exits 0 without running
+anything.
+
+```console
+$ milhouse --config ./config.toml canary          # runs the site_canary collectors once
+collect: mode=spool_only committed=1 delivered=0 failed=0 alerts_fired=0 alerts_resolved=0 intents_emitted=0
+  example-canary: status=ok error=none drafts=1 committed=1 delivered=0 failed=0 batch=2026-08-16/...
+```
+
 An optional `COLLECTOR_ID` runs only that collector, and `--target TARGET_ID` runs only the
 collectors bound to that declared target. An unknown collector or target id — or a named collector
 that is not bound to the named target — is a configuration error (exit 2). For a **full**-mode flow,
