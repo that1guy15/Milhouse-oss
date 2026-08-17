@@ -7,6 +7,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Protocol
 
 import click
 from platformdirs import user_config_path, user_data_path
@@ -23,9 +24,7 @@ from milhouse.config import (
     resolve_runtime_paths,
 )
 from milhouse.config._models import MilhouseConfig
-from milhouse.config.loader import validated_config_digest
 from milhouse.core.clock import SystemClock
-from milhouse.core.errors import MilhouseError
 from milhouse.privacy.keys import load_pseudonym_key
 from milhouse.privacy.pseudonym import PrivacyError
 from milhouse.privacy.redact import LayeredRedactor
@@ -62,6 +61,29 @@ class CliState:
         )
 
     __str__ = __repr__
+
+
+class _CodedError(Protocol):
+    """Structural type for an underlying failure that carries a fixed machine ``.code``."""
+
+    @property
+    def code(self) -> str: ...
+
+
+class _CodedCommandError(click.ClickException):
+    """Base for CLI failures that surface an underlying coded error's fixed machine code.
+
+    Carries the common body every exit-1 command error shares: it records the fixed ``.code`` of an
+    underlying coded failure (a bootstrap, spool, state, pipeline, privacy, or storage error) and
+    renders that error's bounded, value-safe string. Those errors expose only fixed strings — never
+    key material, a secret, a path, a URL, or a payload — so rendering the code and message here
+    leaks nothing. Subclasses set only their ``exit_code``; behaviour (exit code and rendering) is
+    identical to the per-class bodies this base replaces.
+    """
+
+    def __init__(self, error: _CodedError) -> None:
+        self.code = error.code
+        super().__init__(str(error))
 
 
 class ConfigCommandError(click.ClickException):
@@ -153,14 +175,10 @@ def config_schema_command() -> None:
     output.flush()
 
 
-class BootstrapCommandError(click.ClickException):
+class BootstrapCommandError(_CodedCommandError):
     """A stable bootstrap failure using the CLI contract's exit code 1."""
 
     exit_code = 1
-
-    def __init__(self, error: bootstrap.BootstrapError) -> None:
-        self.code = error.code
-        super().__init__(str(error))
 
 
 @main.command(name="init")
@@ -278,7 +296,7 @@ def _require_installation_id(paths: RuntimePaths) -> str:
     return installation_id
 
 
-class CollectCommandError(click.ClickException):
+class CollectCommandError(_CodedCommandError):
     """A stable ``collect`` failure using the CLI contract's exit code 1.
 
     Carries the fixed machine code of an underlying coded failure — a privacy, spool, state, or
@@ -288,10 +306,6 @@ class CollectCommandError(click.ClickException):
     """
 
     exit_code = 1
-
-    def __init__(self, error: MilhouseError) -> None:
-        self.code = error.code
-        super().__init__(str(error))
 
 
 def _new_collect_registry() -> CollectorRegistry:
@@ -314,41 +328,33 @@ def _build_collect_pipeline(
     *,
     mode: RuntimeMode,
     exporters: Mapping[str, Exporter],
-    registry: CollectorRegistry | None = None,
+    redactor: LayeredRedactor,
 ) -> RuntimePipeline:
     """Assemble a mode-aware :class:`RuntimePipeline` from validated config and control plane.
 
-    Extracted as the testable seam the ``collect`` command builds through: production passes
-    ``registry=None`` (the real registry, whose site_canary factory builds a live HTTP client) while
-    a test injects a registry holding a network-free fake collector. The pipeline hard-requires a
-    :class:`LayeredRedactor`, so this loads the keyed pseudonym key ``init`` provisions and FAILS
-    CLOSED with ``run milhouse init first`` when it is absent (a corrupt or foreign key surfaces its
-    own fixed code instead). The redactor is built with no extra known secrets; the collectors are
-    the primary redaction authority. ``config_generation`` is the deterministic 64-hex digest of
-    the fully validated config, which the pipeline re-checks. The caller supplies ``mode`` and the
-    matching ``exporters`` map — empty for ``spool_only``, the ClickHouse exporter keyed by its
-    exporter id for ``full`` — and the pipeline ctor enforces that invariant (``full`` requires a
-    non-empty map, ``spool_only`` an empty one), so the full-mode obligation lives here rather than
-    in a separate reject guard.
+    The testable seam the ``collect`` command builds through. It always uses the production
+    first-party registry (:func:`_new_collect_registry`, whose site_canary factory builds a live
+    HTTP client); a network-free test substitutes it by monkeypatching that module-level factory.
+    The caller supplies the already-built :class:`LayeredRedactor` the pipeline hard-requires,
+    loaded from the keyed pseudonym key ``init`` provisions BEFORE any client or control handle is
+    opened — so a missing/corrupt key fails closed "run milhouse init first" without leaving a
+    ClickHouse client or an empty control DB behind. ``config_generation`` is the deterministic
+    64-hex digest of the fully validated config, which the pipeline re-checks. The caller supplies
+    ``mode`` and the matching ``exporters`` map — empty for ``spool_only``, the ClickHouse exporter
+    keyed by its exporter id for ``full`` — and the pipeline ctor enforces that invariant (``full``
+    requires a non-empty map, ``spool_only`` an empty one), so the full-mode obligation lives here
+    rather than in a separate reject guard.
     """
 
-    if registry is None:
-        registry = _new_collect_registry()
-    try:
-        pseudonymizer = load_pseudonym_key(config, paths)
-    except PrivacyError as error:
-        if error.code == "MH_PRIVACY_KEY_NOT_FOUND":
-            raise BootstrapCommandError(
-                bootstrap.BootstrapError("MH_NOT_INITIALIZED", "run milhouse init first")
-            ) from None
-        raise CollectCommandError(error) from None
-    redactor = LayeredRedactor(pseudonymizer, known_secrets=())
-    barrier = GlobalCommitBarrier(
-        paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
-    )
+    registry = _new_collect_registry()
+    barrier = GlobalCommitBarrier(bootstrap.barrier_path(paths))
     return RuntimePipeline(
         mode=mode,
-        config_generation=validated_config_digest(config),
+        # Reuse the digest ``_resolve_config`` already computed and bound into the runtime paths:
+        # the loader sets ``config_selection.config_digest = validated_config_digest(config)`` for
+        # this exact config, and ``verify_config_generation`` enforces their equality as a runtime
+        # invariant, so it is byte-identical to recomputing it here (a unit test locks this).
+        config_generation=paths.config_selection.config_digest,
         registry=registry,
         redactor=redactor,
         control=control,
@@ -474,8 +480,32 @@ def collect_run_command(
         collectors = [
             collector for collector in collectors if getattr(collector, "target", None) == target_id
         ]
+        # A named collector that is not bound to the named target is an operator mistake, not an
+        # empty run: fail closed (exit 2) rather than silently doing nothing. (``--target`` alone
+        # with no bound collectors stays a legitimate empty run — exit 0 — and is not caught here.)
+        if collector_id is not None and not collectors:
+            raise ConfigCommandError(
+                ConfigError(
+                    "config.collector.unbound",
+                    f"collector {collector_id} is not bound to target {target_id}",
+                )
+            )
 
     installation_id = _require_installation_id(paths)
+    # Load the pseudonym key and build the redactor the pipeline hard-requires BEFORE opening any
+    # ClickHouse client or control handle, so a missing/corrupt key fails closed "run milhouse init
+    # first" without wasting a client/DB open — which could otherwise leave an empty control DB
+    # behind. The collectors are the primary redaction authority, so no extra known secrets here.
+    try:
+        pseudonymizer = load_pseudonym_key(config, paths)
+    except PrivacyError as error:
+        if error.code == "MH_PRIVACY_KEY_NOT_FOUND":
+            raise BootstrapCommandError(
+                bootstrap.BootstrapError("MH_NOT_INITIALIZED", "run milhouse init first")
+            ) from None
+        raise CollectCommandError(error) from None
+    redactor = LayeredRedactor(pseudonymizer, known_secrets=())
+
     # Full mode delivers committed segments to ClickHouse via the pipeline's delivery tail, so it
     # needs an authenticated client and the ClickHouse exporter; spool_only needs neither. Open the
     # client BEFORE the control handle so a storage-config failure (clickhouse disabled/unbuildable,
@@ -504,6 +534,7 @@ def collect_run_command(
             control,
             mode=config.runtime.mode,
             exporters=exporters,
+            redactor=redactor,
         )
         # The full target set is passed for lookup; the collector filters above scope the run.
         summary = pipeline.run(tuple(collectors), tuple(config.targets))
@@ -514,8 +545,8 @@ def collect_run_command(
         # command produces -- a clean ``error: MH_...`` rather than a raw traceback. Per-collector
         # faults AND a contained ClickHouse delivery failure are already isolated INTO the summary
         # (records_failed / export_error_code → exit 1 below); this catches only failures that abort
-        # the whole run. The key-missing / other PrivacyError mappings raised inside
-        # ``_build_collect_pipeline`` are ClickExceptions and propagate.
+        # the whole run. The key-missing / other PrivacyError mapping ran earlier (before any handle
+        # opened), so it never reaches here.
         raise CollectCommandError(error) from None
     finally:
         # Close the ClickHouse client and the control handle on EVERY path (ownership failure,
@@ -551,6 +582,16 @@ def collect_run_command(
     for label, stage_code in stage_error_codes:
         if stage_code is not None:
             click.echo(f"WARNING: the {label} stage reported {stage_code}", err=True)
+    # A failed/error collector forces exit 1; emit a uniform per-collector stderr WARNING (the same
+    # operator signal the stage errors give), privacy-safe: only the config-declared collector id
+    # and its fixed error code -- never a payload, path, URL, or secret.
+    for collector in summary.collectors:
+        if collector.status in ("failed", "error"):
+            click.echo(
+                f"WARNING: collector {collector.collector_id} ended {collector.status} "
+                f"({collector.error_code or 'none'})",
+                err=True,
+            )
     if _collect_run_failed(summary):
         context.exit(1)
 
@@ -701,17 +742,13 @@ def doctor_command(context: click.Context, as_json: bool) -> None:
         context.exit(1)
 
 
-class StorageCommandError(click.ClickException):
+class StorageCommandError(_CodedCommandError):
     """A stable ClickHouse-storage failure using the CLI contract's exit code 1."""
 
     exit_code = 1
 
-    def __init__(self, error: storage.StorageError) -> None:
-        self.code = error.code
-        super().__init__(str(error))
 
-
-class StorageExportError(click.ClickException):
+class StorageExportError(_CodedCommandError):
     """A stable ``storage export`` drain failure using the CLI contract's exit code 1.
 
     The ledger-gated export spans two fail-closed layers — the spool's replay/delivery machine
@@ -721,12 +758,8 @@ class StorageExportError(click.ClickException):
 
     exit_code = 1
 
-    def __init__(self, error: SpoolError | storage.StorageError) -> None:
-        self.code = error.code
-        super().__init__(str(error))
 
-
-class StorageRestoreError(click.ClickException):
+class StorageRestoreError(_CodedCommandError):
     """A stable ``storage restore`` failure using the CLI contract's exit code 1.
 
     Restore spans two fail-closed layers — the native ClickHouse round-trip/verification
@@ -737,10 +770,6 @@ class StorageRestoreError(click.ClickException):
     """
 
     exit_code = 1
-
-    def __init__(self, error: SpoolError | storage.StorageError) -> None:
-        self.code = error.code
-        super().__init__(str(error))
 
 
 def _storage_client(state: CliState) -> tuple[str, storage.ConnectedClickHouseClient]:
@@ -863,9 +892,7 @@ def storage_migrate_command(state: CliState, reclaim: bool, as_json: bool) -> No
     paths = _resolve_paths(state)
     installation_id = _require_installation_id(paths)  # the commit lock lives under a control dir
     database, client = _storage_client(state)
-    barrier = GlobalCommitBarrier(
-        paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
-    )
+    barrier = GlobalCommitBarrier(bootstrap.barrier_path(paths))
     try:
         with barrier.exclusive():
             result = storage.migrate(
@@ -936,9 +963,7 @@ def storage_backup_command(state: CliState, destination: str, as_json: bool) -> 
     paths = _resolve_paths(state)
     installation_id = _require_installation_id(paths)  # the commit lock lives under a control dir
     database, client = _storage_client(state)
-    barrier = GlobalCommitBarrier(
-        paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
-    )
+    barrier = GlobalCommitBarrier(bootstrap.barrier_path(paths))
     try:
         with barrier.exclusive():
             # Refuse to back up a destination this installation does not own (fail closed): the
@@ -1012,9 +1037,7 @@ def storage_restore_command(context: click.Context, source: str, as_json: bool) 
     try:
         database, client = _storage_client(state)
         try:
-            barrier = GlobalCommitBarrier(
-                paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
-            )
+            barrier = GlobalCommitBarrier(bootstrap.barrier_path(paths))
             with barrier.exclusive():
                 # A native RESTORE DATABASE rejects a non-empty target, and this command never drops
                 # or overwrites live data (that is W16). A present schema (any applied migration)
@@ -1130,9 +1153,7 @@ def storage_export_command(context: click.Context, as_json: bool) -> None:
             # — unlike backup/restore, which check inside their exclusive scope because they hold it
             # the whole operation — the placement here is a correctness no-op vs the barrier.
             storage.require_owner(client, database, installation_id=installation_id)
-            barrier = GlobalCommitBarrier(
-                paths.state_root / bootstrap.CONTROL_DIRNAME / bootstrap.BARRIER_NAME
-            )
+            barrier = GlobalCommitBarrier(bootstrap.barrier_path(paths))
             report = replay_segments(
                 control,
                 barrier,

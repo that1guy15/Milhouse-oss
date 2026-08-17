@@ -125,10 +125,9 @@ def run_demo(paths: RuntimePaths, *, now: datetime) -> DemoReport:
     frames = [SpoolFrameV1(batch_id=batch_id, sequence=1, record=record)]
     header = _demo_header(batch_id, frames)
 
-    control = paths.state_root / bootstrap.CONTROL_DIRNAME
     database = open_control_database(bootstrap.database_path(paths))
     try:
-        barrier = GlobalCommitBarrier(control / bootstrap.BARRIER_NAME)
+        barrier = GlobalCommitBarrier(bootstrap.barrier_path(paths))
         store = DurableSpool(
             database=database,
             barrier=barrier,
