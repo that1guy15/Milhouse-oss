@@ -66,6 +66,7 @@ from milhouse.domain.records import (
     TargetDescriptorV1,
     finalize_record,
 )
+from milhouse.outbox import CursorAdvanceV1, write_outbox_ack
 from milhouse.privacy.redact import LayeredRedactor
 from milhouse.runtime.alerting import (
     CANARY_STATE_RULE_VERSION,
@@ -90,8 +91,11 @@ from milhouse.spooling.reader import INSTALLATION_ID_PATTERN
 from milhouse.state import (
     ControlDatabase,
     GlobalCommitBarrier,
+    SourceCursor,
     advance_alert_state,
+    advance_cursor,
     read_alert_state,
+    read_cursor,
 )
 from milhouse.storage import CLICKHOUSE_EXPORTER_ID
 
@@ -490,6 +494,12 @@ class RuntimePipeline:
             "the resolved collector id does not match its configuration",
         )
         target = _target_descriptor(config, target_by_id)
+        # Read the collector's durable source cursor BEFORE building the context so a cursor-bearing
+        # collector resumes its incremental read from it (generic opt-in: a non-cursor collector
+        # ignores it, and this read never creates a row, so its runtime behaviour is unchanged). The
+        # SAME snapshot's revision is the compare-and-set base for the post-commit advance below, so
+        # the frontier can only advance from the position this run actually read.
+        prior_cursor = read_cursor(self._control, source=str(config.id))
         context = CollectorContext(
             now=now,
             installation_id=self._installation_id,
@@ -497,6 +507,7 @@ class RuntimePipeline:
             target=target,
             request_timeout_seconds=int(getattr(config, "request_timeout_seconds", 30)),
             redactor=self._redactor,
+            prior_cursor=prior_cursor,
         )
         result = collector.collect(context)
         if not isinstance(result, CollectorResult):
@@ -507,6 +518,15 @@ class RuntimePipeline:
             )
         item.status = result.status
         item.drafts_produced = len(result.drafts)
+        advance = result.cursor_advance
+        if advance is not None and advance.loss_signal is not None:
+            # INVARIANT (c): a data-loss read commits NOTHING and advances NOTHING. Surface the
+            # fixed loss code as the collector's error, and return BEFORE the availability sample so
+            # a loss never becomes an alert failure sample (firing on a loss is a deferred
+            # follow-up, not this slice). The reader guarantees no drafts accompany a loss.
+            item.status = "failed"
+            item.error_code = advance.loss_signal.code
+            return
         if result.status == "failed":
             # A collector that failed with no drafts is a failure sample with no privacy-safe
             # record to cite as evidence. The site_canary no longer reaches this path (its probe
@@ -514,17 +534,69 @@ class RuntimePipeline:
             # collector, whose transition then defers to the first evidence-bearing failure.
             availability[str(config.id)] = ("failure", None)
         if not result.drafts:
+            # INVARIANT (a): no drafts -> no commit -> no advance. An empty/unchanged outbox read
+            # leaves the cursor untouched, so the next run re-reads from the same position -- an
+            # idempotent no-op, never a silent skip past unread bytes.
             return
         records = tuple(self._finalize(draft) for draft in result.drafts)
         header, frames = self._build_segment(str(config.id), records, now=context.now)
         committed = spool.commit_segment(header, frames, committed_at=context.now)
         item.records_committed = committed.record_count
         item.batch_id = committed.batch_id
+        # INVARIANT (a): the cursor advances STRICTLY AFTER the segment is durably committed above.
+        if advance is not None and advance.next_position is not None:
+            self._advance_source_cursor(
+                item, advance, source=str(config.id), prior_cursor=prior_cursor, now=now
+            )
         # Capture the committed availability record as the alert sample; its record id is the
         # evidence a firing/resolution transition cites.
         sample = _availability_sample(records)
         if sample is not None:
             availability[str(config.id)] = sample
+
+    def _advance_source_cursor(
+        self,
+        item: _CollectorWork,
+        advance: CursorAdvanceV1,
+        *,
+        source: str,
+        prior_cursor: SourceCursor | None,
+        now: datetime,
+    ) -> None:
+        """Advance the durable cursor and write the ack, in isolation, AFTER the segment committed.
+
+        The commit-before-frontier ordering the source cursors and the alert-rule state already use
+        (see :meth:`_evaluate_rule`): the segment is durably committed, so this only moves the
+        checkpoint forward against ``committed.batch_id``. The cursor is the PRIMARY checkpoint and
+        is advanced FIRST -- under a revision compare-and-set against the exact ``prior_cursor``
+        this run read -- then the auxiliary ack (whose ``last_sequence`` high-water the collector
+        folded monotonically) is written. Any failure here is isolated exactly like an alert
+        advance: it NEVER unwinds the durable commit and NEVER aborts the run; it records a fixed
+        code, and the un-advanced cursor makes the next run re-read and re-commit the same frames --
+        which, because the frame->record identity is deterministic (invariant (b)), the downstream
+        delivery ledger collapses. This is commit-before-frontier AT-LEAST-ONCE, not exactly-once.
+        """
+
+        assert advance.next_position is not None  # guarded by the caller
+        try:
+            advance_cursor(
+                self._control,
+                source=source,
+                position=advance.next_position,
+                batch_id=item.batch_id or "",
+                now=now,
+                expected_revision=prior_cursor.revision if prior_cursor is not None else 0,
+            )
+            if (
+                advance.ack is not None
+                and advance.ack_directory is not None
+                and advance.ack_filename is not None
+            ):
+                write_outbox_ack(advance.ack_directory, advance.ack_filename, advance.ack)
+        except Exception as error:
+            # The commit is durable; a failed advance is retried next run (at-least-once). Record
+            # the fixed code without touching the committed segment or the other collectors.
+            item.error_code = normalize_error(error).code
 
     def _drive_alerts(
         self,
