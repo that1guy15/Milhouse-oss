@@ -468,14 +468,16 @@ def test_unpadded_monotonic_names_order_numerically_without_false_loss(tmp_path:
     assert result.diagnostics.rotations_crossed == 3
 
 
-def test_top_run_deletion_is_the_documented_undetectable_residual(tmp_path: Path) -> None:
-    # DOCUMENTED RESIDUAL (increment 1, reader._recover_rotation docstring): the active file carries
-    # no sequence, so deletion of a RUN of the TOPMOST rotated segments (next to the active file)
-    # leaves the survivors a contiguous run that passes the gap check -- a stateless single-file
-    # cursor keeps no record of the highest sequence that ever existed, so it cannot know those top
-    # segments were dropped. This is closed in increment 2 by the durable ack persisting the last
-    # committed sequence. We PIN the known window here so a future change that widens OR (once
-    # increment 2 lands) narrows it is caught.
+def test_top_run_deletion_is_undetectable_without_a_high_water(tmp_path: Path) -> None:
+    # DOCUMENTED RESIDUAL when NO high-water is supplied (reader._recover_rotation docstring): the
+    # active file carries no sequence, so deletion of a RUN of the TOPMOST rotated segments (next to
+    # the active file) leaves the survivors a contiguous run that passes the gap check. A stateless
+    # single-file cursor keeps no record of the highest sequence that ever existed, so on its own it
+    # cannot know those top segments were dropped. Increment 2a CLOSES this by threading a durable
+    # rotation high-water (the ack's ``last_sequence``) back as ``last_acknowledged_sequence`` (see
+    # test_top_run_deletion_detected_with_high_water). We keep this test with NO high-water passed
+    # to PIN that, without one, the window is still (necessarily) silent, so a regression that
+    # either widens it or spuriously fires here is caught.
     path = _outbox(tmp_path, _frame_line(kind="a") + _frame_line(kind="b"))
     cursor = _cursor_for(path, _frame_line(kind="a"))
     for sequence, kind in ((1, "c"), (2, "d"), (3, "e")):
@@ -490,10 +492,161 @@ def test_top_run_deletion_is_the_documented_undetectable_residual(tmp_path: Path
     config = OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
     result = read_outbox(file_path=path, prior_cursor=cursor, config=config)
 
-    # NO loss is signalled (the known increment-1 limitation) and d (seg3) + e (seg4) are silently
-    # absent -- exactly the top-run window increment 2's ack must close.
+    # NO high-water -> NO loss is signalled and d (seg3) + e (seg4) are silently absent. But the
+    # reader still REPORTS the surviving top M (=2) so a caller that persisted it as the high-water
+    # would trip the detector on the next read (that is exactly the closure path).
     assert result.loss_signal is None
     assert [frame.kind for frame in result.new_frames] == ["b", "c", "f"]
+    assert result.max_observed_sequence == 2
+
+
+def test_top_run_deletion_detected_with_high_water(tmp_path: Path) -> None:
+    # TRUE POSITIVE (increment 2a): identical top-run deletion, but this time the reader is told the
+    # durable high-water H=4 (segment 4 was OBSERVED in a prior read). The current top retained
+    # rotated sequence M is only 2, so the run (segs 3, 4) -- above the cursor in seg1, hence
+    # UNCONSUMED -- is a genuine data loss the reader now flags.
+    path = _outbox(tmp_path, _frame_line(kind="a") + _frame_line(kind="b"))
+    cursor = _cursor_for(path, _frame_line(kind="a"))  # cursor in seg1, consumed only "a"
+    for sequence, kind in ((1, "c"), (2, "d"), (3, "e")):
+        _rotate(path, sequence)
+        _write(path, _frame_line(kind=kind))
+    _rotate(path, 4)
+    _write(path, _frame_line(kind="f"))  # active
+    # seg1=[a,b] seg2=[c] seg3=[d] seg4=[e] active=[f]; drop the TOP RUN (segs 3+4).
+    os.unlink(path.parent / "feedback-outbox.00000003.jsonl")
+    os.unlink(path.parent / "feedback-outbox.00000004.jsonl")
+
+    config = OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    result = read_outbox(
+        file_path=path, prior_cursor=cursor, config=config, last_acknowledged_sequence=4
+    )
+    assert result.new_frames == ()  # zero frames on a loss
+    assert result.loss_signal is not None
+    assert result.loss_signal.code == "MH_OUTBOX_LOSS_TOP_RUN_GONE"
+    assert result.loss_signal.priority == "P1"
+    assert result.next_position_string == cursor.position  # cursor NOT advanced
+    assert result.max_observed_sequence == 2  # the surviving top, reported for the caller
+
+
+@pytest.mark.parametrize("high_water", [None, 1, 2, 3])
+def test_contiguous_rotation_with_high_water_reports_no_top_run_loss(
+    tmp_path: Path, high_water: int | None
+) -> None:
+    # NO FALSE POSITIVE: a compliant contiguous rotation whose top retained M == 3. A high-water of
+    # None, or any value at/below M (nothing observed is missing from the top), must NOT trip the
+    # detector; the whole chain reads cleanly.
+    path = _outbox(tmp_path, _frame_line(kind="a") + _frame_line(kind="b"))
+    cursor = _cursor_for(path, _frame_line(kind="a"))
+    _rotate(path, 1)
+    _write(path, _frame_line(kind="c"))
+    _rotate(path, 2)
+    _write(path, _frame_line(kind="d"))
+    _rotate(path, 3)
+    _write(path, _frame_line(kind="e"))
+
+    config = OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    result = read_outbox(
+        file_path=path,
+        prior_cursor=cursor,
+        config=config,
+        last_acknowledged_sequence=high_water,
+    )
+    assert result.loss_signal is None
+    assert [frame.kind for frame in result.new_frames] == ["b", "c", "d", "e"]
+    assert result.diagnostics.rotations_crossed == 3
+    assert result.max_observed_sequence == 3
+
+
+def test_deleting_consumed_segment_below_cursor_does_not_flag_top_run(tmp_path: Path) -> None:
+    # NO FALSE POSITIVE on an acked-below deletion: a rotated segment the cursor already CONSUMED
+    # (strictly below it) may be deleted safely, and the top-run detector must not fire on it. The
+    # cursor is in seg2; seg1 (fully consumed) is removed while the top M (=3) still matches the
+    # high-water, so neither ROTATION_GONE nor TOP_RUN_GONE is raised.
+    path = _outbox(tmp_path, _frame_line(kind="a") + _frame_line(kind="b"))
+    _rotate(path, 1)  # seg1 = [a, b]
+    _write(path, _frame_line(kind="c") + _frame_line(kind="d"))
+    cursor = _cursor_for(path, _frame_line(kind="c"))  # cursor in the future seg2, consumed "c"
+    _rotate(path, 2)  # seg2 = [c, d]
+    _write(path, _frame_line(kind="e"))
+    _rotate(path, 3)  # seg3 = [e]
+    _write(path, _frame_line(kind="f"))  # active = [f]
+    os.unlink(path.parent / "feedback-outbox.00000001.jsonl")  # drop the consumed below-cursor seg
+
+    config = OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    result = read_outbox(
+        file_path=path, prior_cursor=cursor, config=config, last_acknowledged_sequence=3
+    )
+    # seg1 was below the cursor and already consumed, so its deletion is invisible; M (=3) equals
+    # the high-water, so TOP_RUN_GONE does not fire either. (Deleting the cursor's OWN file would
+    # instead surface as ROTATION_GONE -- still not a top-run false positive.)
+    assert result.loss_signal is None
+    assert [frame.kind for frame in result.new_frames] == ["d", "e", "f"]
+    assert result.max_observed_sequence == 3
+
+
+def test_max_observed_sequence_reports_top_retained_padded_rotation(tmp_path: Path) -> None:
+    # The highest retained rotated sequence (M) is reported for the caller's monotonic high-water.
+    path = _outbox(tmp_path, _frame_line(kind="a") + _frame_line(kind="b"))
+    cursor = _cursor_for(path, _frame_line(kind="a"))
+    _rotate(path, 1)
+    _write(path, _frame_line(kind="c"))
+    _rotate(path, 2)
+    _write(path, _frame_line(kind="d"))
+
+    config = OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    result = read_outbox(file_path=path, prior_cursor=cursor, config=config)
+    assert result.loss_signal is None
+    assert result.max_observed_sequence == 2
+
+
+def test_max_observed_sequence_orders_unpadded_names_numerically(tmp_path: Path) -> None:
+    # Unpadded "...9"/"...10"/"...11": M must be the NUMERIC max (11), not the lexical max ("9").
+    path = _outbox(tmp_path, _frame_line(kind="a") + _frame_line(kind="b"))
+    cursor = _cursor_for(path, _frame_line(kind="a"))
+    _rotate_to(path, "feedback-outbox.9.jsonl")
+    _write(path, _frame_line(kind="c"))
+    _rotate_to(path, "feedback-outbox.10.jsonl")
+    _write(path, _frame_line(kind="d"))
+    _rotate_to(path, "feedback-outbox.11.jsonl")
+    _write(path, _frame_line(kind="e"))
+
+    config = OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    result = read_outbox(file_path=path, prior_cursor=cursor, config=config)
+    assert result.loss_signal is None
+    assert result.max_observed_sequence == 11
+
+
+def test_max_observed_sequence_is_none_when_reading_only_active_file(tmp_path: Path) -> None:
+    # No rotation this read (the cursor stays in the active file): nothing rotated was observed, so
+    # the high-water output is None even when a rotation glob is configured.
+    path = _outbox(tmp_path, _frame_line(kind="a"))
+    first = read_outbox(file_path=path, prior_cursor=None, config=OutboxReaderConfig())
+    assert first.max_observed_sequence is None  # bootstrap read of the active file only
+
+    _append(path, _frame_line(kind="b"))
+    second = read_outbox(
+        file_path=path,
+        prior_cursor=_cursor(first.next_position_string),
+        config=OutboxReaderConfig(rotation_glob=_ROTATION_GLOB),
+    )
+    assert second.loss_signal is None
+    assert [frame.kind for frame in second.new_frames] == ["b"]
+    assert second.max_observed_sequence is None  # same active inode, no rotation crossed
+
+
+@pytest.mark.parametrize("bad_high_water", [-1, 2**63, "3"])
+def test_reader_rejects_malformed_high_water(tmp_path: Path, bad_high_water: object) -> None:
+    # The high-water is defensively bounded: a negative, over-ceiling, or non-int value fails closed
+    # with a fixed code rather than letting the reader reason from a bogus mark.
+    path = _outbox(tmp_path, _frame_line(kind="a"))
+    with pytest.raises(OutboxError) as raised:
+        read_outbox(
+            file_path=path,
+            prior_cursor=None,
+            config=OutboxReaderConfig(),
+            last_acknowledged_sequence=bad_high_water,  # type: ignore[arg-type]
+        )
+    assert raised.value.code == "MH_OUTBOX_HIGH_WATER"
 
 
 def test_unparseable_rotated_name_fails_closed(tmp_path: Path) -> None:
@@ -762,6 +915,34 @@ def test_ack_read_rejects_corrupt_and_foreign_content(tmp_path: Path) -> None:
     directory = _ack_dir(tmp_path)
     published = directory / "outbox-ack.json"
     published.write_bytes(b'{"not":"an ack"}')
+    os.chmod(published, 0o600)
+    with pytest.raises(OutboxError) as raised:
+        read_outbox_ack(directory, "outbox-ack.json")
+    assert raised.value.code == "MH_OUTBOX_ACK"
+
+
+def test_ack_round_trips_last_sequence_high_water(tmp_path: Path) -> None:
+    # The rotation high-water persists in the ack and reads back atomically; a default ack (None)
+    # still omits it, so the field is backward-compatible.
+    directory = _ack_dir(tmp_path)
+    assert _ack().last_sequence is None  # default: omitted from the canonical bytes
+    ack = _ack(last_sequence=7)
+    write_outbox_ack(directory, "outbox-ack.json", ack)
+    loaded = read_outbox_ack(directory, "outbox-ack.json")
+    assert loaded == ack
+    assert loaded is not None
+    assert loaded.last_sequence == 7
+
+
+@pytest.mark.parametrize("bad_value", [-1, 2**63, 1.5, "5"])
+def test_ack_rejects_malformed_last_sequence(tmp_path: Path, bad_value: object) -> None:
+    # A negative, over-ceiling, non-integer, or string last_sequence in a planted ack is rejected
+    # value-free with the fixed MH_OUTBOX_ACK code (never resuming from a bogus high-water).
+    directory = _ack_dir(tmp_path)
+    published = directory / "outbox-ack.json"
+    planted = json.loads(outbox_ack_bytes(_ack()))
+    planted["last_sequence"] = bad_value
+    published.write_bytes(json.dumps(planted).encode("utf-8"))
     os.chmod(published, 0o600)
     with pytest.raises(OutboxError) as raised:
         read_outbox_ack(directory, "outbox-ack.json")
