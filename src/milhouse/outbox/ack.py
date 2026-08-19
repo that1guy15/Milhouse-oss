@@ -49,7 +49,7 @@ from milhouse.config.filesystem import (
 from milhouse.core.canonical import CanonicalizationError, canonical_json_bytes
 from milhouse.domain._validation import ValueSafeRecordModel
 from milhouse.domain.identity import MachineIdV1, Sha256HexV1
-from milhouse.domain.records import UtcTimestampV1
+from milhouse.domain.records import NonNegativeIntV1, UtcTimestampV1
 from milhouse.outbox.errors import OutboxError
 
 #: A generous ceiling for the canonical ack object (it holds a handful of small scalar fields).
@@ -64,6 +64,7 @@ _ACK_KEYS = frozenset(
         "file_device",
         "file_inode",
         "last_line_sha256",
+        "last_sequence",
         "producer_id",
         "schema_version",
     }
@@ -78,6 +79,14 @@ class OutboxAckV1(ValueSafeRecordModel):
     the SHA-256 over that whole ``[0, committed_offset)`` prefix (the same anchor the cursor
     carries), ``last_line_sha256`` is the digest of the last committed line (the "last record hash",
     ``None`` for an empty commit), and ``acknowledged_at`` is the commit time.
+
+    ``last_sequence`` is the durable ROTATION high-water mark: the highest rotated-file integer
+    sequence the reader has ever OBSERVED (``None`` until a rotation is seen). It is the anchor the
+    reader's top-run detection reads back as ``last_acknowledged_sequence`` (plan section 4.9 /
+    :func:`milhouse.outbox.reader.read_outbox`): if the highest retained rotated sequence has since
+    dropped below it, a run of the topmost (unconsumed) segments was deleted -- a P1 data loss that
+    a stateless single-file cursor could not otherwise see. The caller advances this monotonically
+    as ``max(persisted, reader_output)``; the reader never lowers it.
     """
 
     model_config = ConfigDict(
@@ -96,6 +105,7 @@ class OutboxAckV1(ValueSafeRecordModel):
     committed_offset: int
     content_sha256: Sha256HexV1
     last_line_sha256: Sha256HexV1 | None = None
+    last_sequence: NonNegativeIntV1 | None = None
     acknowledged_at: UtcTimestampV1
 
 

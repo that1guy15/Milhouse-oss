@@ -152,6 +152,15 @@ class OutboxReadResult:
     later durable ``advance_cursor`` write) and ``loss_signal`` is ``None``. On a data-loss find
     ``loss_signal`` is set, ``new_frames`` is empty, and ``next_position``/``next_position_string``
     equal the prior cursor unchanged -- the caller must raise the P1 alert and NOT advance.
+
+    ``max_observed_sequence`` is the highest RETAINED rotated-file integer sequence this single read
+    saw: ``M`` (the top of the contiguous rotated run) during a rotation read, the cursor's own
+    sequence when the cursor is in a rotated file with nothing retained above it, and ``None`` when
+    the cursor is in the active file (or no rotated files were seen). It is a pure per-read
+    observation -- the reader NEVER reads or lowers any persisted state. The CALLER owns the durable
+    monotonic rotation high-water and advances it as ``max(persisted, max_observed_sequence)``, then
+    threads it back as ``read_outbox(..., last_acknowledged_sequence=...)`` so a later read can flag
+    a deleted top-run of rotated segments (``MH_OUTBOX_LOSS_TOP_RUN_GONE``).
     """
 
     new_frames: tuple[OutboxFrameV1, ...]
@@ -159,6 +168,7 @@ class OutboxReadResult:
     next_position_string: str | None
     loss_signal: OutboxLossSignal | None
     diagnostics: OutboxDiagnostics
+    max_observed_sequence: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +293,7 @@ def _loss(
     *,
     observed_size: int | None = None,
     observed_sha256: str | None = None,
+    max_observed_sequence: int | None = None,
 ) -> OutboxReadResult:
     signal = OutboxLossSignal(
         code=code,
@@ -307,6 +318,7 @@ def _loss(
         next_position_string=prior_string,
         loss_signal=signal,
         diagnostics=diagnostics,
+        max_observed_sequence=max_observed_sequence,
     )
 
 
@@ -318,6 +330,7 @@ def _success(
     bytes_consumed: int,
     rotations_crossed: int,
     torn_tail_bytes: int,
+    max_observed_sequence: int | None = None,
 ) -> OutboxReadResult:
     diagnostics = OutboxDiagnostics(
         frames_emitted=len(frames),
@@ -333,6 +346,7 @@ def _success(
         next_position_string=encode_outbox_position(next_position),
         loss_signal=None,
         diagnostics=diagnostics,
+        max_observed_sequence=max_observed_sequence,
     )
 
 
@@ -341,13 +355,32 @@ def read_outbox(
     file_path: str | Path,
     prior_cursor: SourceCursor | None,
     config: OutboxReaderConfig,
+    last_acknowledged_sequence: int | None = None,
 ) -> OutboxReadResult:
-    """Incrementally read the outbox from ``prior_cursor``; see the module docstring for details."""
+    """Incrementally read the outbox from ``prior_cursor``; see the module docstring for details.
+
+    ``last_acknowledged_sequence`` is the caller-maintained durable ROTATION high-water mark: the
+    highest rotated-file integer sequence the reader has OBSERVED in prior reads (``None`` if never
+    set; persisted in the ack's ``last_sequence`` field). It is consulted only during rotation
+    recovery to detect a deleted top-run of the most-recent rotated segments -- see
+    :func:`_recover_rotation`. Passing ``None`` is the fully backward-compatible increment-1
+    behaviour. The reader never reads or writes this durable state itself; the caller advances it
+    monotonically as ``max(persisted, result.max_observed_sequence)`` and threads it back here.
+    """
 
     if not isinstance(config, OutboxReaderConfig):
         raise OutboxError("MH_OUTBOX_CONFIG", "an outbox reader configuration is required")
     if prior_cursor is not None and not isinstance(prior_cursor, SourceCursor):
         raise OutboxError("MH_OUTBOX_CURSOR", "a source cursor or None is required")
+    if last_acknowledged_sequence is not None and (
+        type(last_acknowledged_sequence) is not int
+        or not 0 <= last_acknowledged_sequence <= MAX_CANONICAL_INT
+    ):
+        # ``bool`` is an ``int`` subtype; the ``type is int`` check rejects it so a stray flag
+        # cannot pose as a high-water sequence. Fail closed rather than reason from a bogus mark.
+        raise OutboxError(
+            "MH_OUTBOX_HIGH_WATER", "a bounded non-negative high-water sequence or None is required"
+        )
 
     prior = outbox_position_from_cursor(prior_cursor) if prior_cursor is not None else None
     prior_string = prior_cursor.position if prior_cursor is not None else None
@@ -356,7 +389,9 @@ def read_outbox(
     if prior is None or (active.device, active.inode) == (prior.device, prior.inode):
         return _read_same_file(active, prior, config)
     assert prior_string is not None
-    return _recover_rotation(file_path, active, prior, prior_string, config)
+    return _recover_rotation(
+        file_path, active, prior, prior_string, config, last_acknowledged_sequence
+    )
 
 
 def _read_same_file(
@@ -409,6 +444,7 @@ def _recover_rotation(
     prior: OutboxPosition,
     prior_string: str,
     config: OutboxReaderConfig,
+    last_acknowledged_sequence: int | None,
 ) -> OutboxReadResult:
     """Recover across a rotation, requiring a parseable, CONTIGUOUS rotated sequence (no gaps).
 
@@ -420,16 +456,32 @@ def _recover_rotation(
     active file. ANY gap -- a missing intermediate sequence -- is un-recoverable P1 data loss
     (``MH_OUTBOX_LOSS_ROTATION_GONE``): a single-file cursor cannot re-materialize deleted bytes.
 
-    Residual limitation (documented, not a silent skip): the active file carries no sequence in its
-    name, so the reader treats the highest retained rotation as the active file's immediate
-    predecessor. Deletion of ANY RUN of the TOPMOST rotated segments -- the most-recent ones next
-    to the active file, with nothing retained above the survivors -- therefore leaves the retained
-    set a contiguous run that passes the gap check, and the missing top segments are
-    indistinguishable from "there were no further rotations". A stateless single-file cursor cannot
-    detect this: it keeps no record of the highest sequence ever seen. Requiring a contiguous
-    sequence makes every gap BELOW the highest survivor a detected loss; the top-run case is closed
-    in increment 2 by the durable ack persisting the last committed sequence (so the reader can tell
-    the current top is below what it already acknowledged).
+    Top-run detection via the high-water (increment 2a): the active file carries no sequence in its
+    name, so the reader treats the highest retained rotation ``M`` as the active file's immediate
+    predecessor. Deletion of a RUN of the TOPMOST rotated segments -- the most-recent ones adjacent
+    to the active file, with nothing retained above the survivors -- leaves the retained set a
+    contiguous run that passes the gap check above. To catch THAT, once ``{S+1..M}`` is proven
+    contiguous the reader compares ``M`` against ``last_acknowledged_sequence`` (``H``, the durable
+    high-water of the highest rotated sequence ever OBSERVED). If ``H`` is set and ``M < H`` the
+    segments ``(M+1 .. H)`` that were once observed are gone from the top; because this branch runs
+    only during rotation recovery (the cursor sits in a rotated file at ``S <= M < H``), those
+    missing segments are strictly ABOVE the cursor and therefore UNCONSUMED -- a genuine P1 loss,
+    ``MH_OUTBOX_LOSS_TOP_RUN_GONE``.
+
+    Why this has NO false positive: a compliant producer deletes a rotated segment only once the
+    ack covers it (fully consumed). Deleting a CONSUMED segment at or below the cursor never reaches
+    this branch -- a consumed segment means the cursor already advanced to/past it, so the next read
+    finds the cursor either in the ACTIVE file (which never enters this function) or in a HIGHER
+    rotated file, and a missing lower file surfaces as the ``ROTATION_GONE`` cursor-file-missing
+    case, not this one. This branch fires only for segments strictly ABOVE the cursor that were
+    previously observed, i.e. genuinely unconsumed loss.
+
+    Irreducible residual (documented, not papered over): a top-run is caught only for PREVIOUSLY
+    OBSERVED segments (those the high-water recorded). Segments a producer creates AND deletes
+    entirely BETWEEN two reads never enter the reader's observation, so they are absent from the
+    high-water and remain undetectable -- fundamentally so for a cursor-based reader unless the
+    producer sequences the active file (out of scope). Everything the reader has ever seen at the
+    top is now detected.
     """
 
     if config.rotation_glob is None:
@@ -442,6 +494,12 @@ def _recover_rotation(
     if discovery_loss is not None:
         return _loss(discovery_loss, prior, prior_string)
 
+    # The highest retained rotated sequence seen THIS read (``None`` if the glob matched only the
+    # active file). This is the pure per-read observation the caller folds into its high-water; it
+    # is reported on every post-discovery return, loss or success alike, and the reader never uses
+    # it to lower any persisted state.
+    max_observed = max(by_sequence) if by_sequence else None
+
     cursor_sequence = next(
         (
             sequence
@@ -453,19 +511,51 @@ def _recover_rotation(
     if cursor_sequence is None:
         # The file the cursor was consuming is not among the retained, parseable rotations: its
         # unacknowledged bytes are gone and cannot be recovered.
-        return _loss("MH_OUTBOX_LOSS_ROTATION_GONE", prior, prior_string)
+        return _loss(
+            "MH_OUTBOX_LOSS_ROTATION_GONE",
+            prior,
+            prior_string,
+            max_observed_sequence=max_observed,
+        )
 
     # The retained rotations strictly above the cursor MUST be the contiguous run
     # {S+1, S+2, ..., S+k}; any gap is a dropped unconsumed segment we cannot recover.
     above = sorted(sequence for sequence in by_sequence if sequence > cursor_sequence)
     if above != list(range(cursor_sequence + 1, cursor_sequence + 1 + len(above))):
-        return _loss("MH_OUTBOX_LOSS_ROTATION_GONE", prior, prior_string)
+        return _loss(
+            "MH_OUTBOX_LOSS_ROTATION_GONE",
+            prior,
+            prior_string,
+            max_observed_sequence=max_observed,
+        )
+
+    # Top-run high-water check: with ``{S+1..M}`` now proven contiguous, ``max_observed`` == M (the
+    # cursor's own sequence when nothing is retained above it). If a strictly higher sequence H was
+    # observed before but M has since fallen below it, the top run (M+1 .. H) was deleted. Those
+    # segments are above the cursor (S <= M < H) hence unconsumed -> a genuine P1 loss. See the
+    # docstring for the no-false-positive argument; ``max_observed is not None`` here because the
+    # cursor itself is a retained rotation.
+    if (
+        last_acknowledged_sequence is not None
+        and max_observed is not None
+        and (max_observed < last_acknowledged_sequence)
+    ):
+        return _loss(
+            "MH_OUTBOX_LOSS_TOP_RUN_GONE",
+            prior,
+            prior_string,
+            max_observed_sequence=max_observed,
+        )
 
     # Phase A: validate the whole chain BEFORE emitting anything, so any loss yields zero frames.
     cursor_file = by_sequence[cursor_sequence]
     if len(cursor_file.content) < prior.offset:
         return _loss(
-            "MH_OUTBOX_LOSS_TRUNCATED", prior, prior_string, observed_size=len(cursor_file.content)
+            "MH_OUTBOX_LOSS_TRUNCATED",
+            prior,
+            prior_string,
+            observed_size=len(cursor_file.content),
+            max_observed_sequence=max_observed,
         )
     prefix_hash = _sha256_hex(cursor_file.content[: prior.offset])
     if prefix_hash != prior.content_sha256:
@@ -475,6 +565,7 @@ def _recover_rotation(
             prior_string,
             observed_size=len(cursor_file.content),
             observed_sha256=prefix_hash,
+            max_observed_sequence=max_observed,
         )
     if _has_torn_tail(cursor_file.content):
         return _loss(
@@ -482,6 +573,7 @@ def _recover_rotation(
             prior,
             prior_string,
             observed_size=len(cursor_file.content),
+            max_observed_sequence=max_observed,
         )
 
     regions: list[bytes] = [cursor_file.content[prior.offset :]]
@@ -490,7 +582,11 @@ def _recover_rotation(
         read = by_sequence[sequence]
         if _has_torn_tail(read.content):
             return _loss(
-                "MH_OUTBOX_LOSS_ROTATED_TORN", prior, prior_string, observed_size=len(read.content)
+                "MH_OUTBOX_LOSS_ROTATED_TORN",
+                prior,
+                prior_string,
+                observed_size=len(read.content),
+                max_observed_sequence=max_observed,
             )
         regions.append(read.content)
         bytes_consumed += len(read.content)
@@ -518,6 +614,7 @@ def _recover_rotation(
         bytes_consumed=bytes_consumed,
         rotations_crossed=1 + len(above),
         torn_tail_bytes=len(active.content) - complete_end,
+        max_observed_sequence=max_observed,
     )
 
 
