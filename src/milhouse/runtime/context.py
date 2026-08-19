@@ -19,6 +19,7 @@ from milhouse.domain.records import CollectorDescriptorV1, TargetDescriptorV1
 from milhouse.privacy.redact import LayeredRedactor
 from milhouse.runtime.errors import PipelineError
 from milhouse.spooling.reader import INSTALLATION_ID_PATTERN
+from milhouse.state.cursors import SourceCursor
 
 # Matches the collector configuration bound (``_CollectorBase.request_timeout_seconds``): a request
 # budget is a positive, bounded number of seconds so a collector cannot be handed an unbounded one.
@@ -36,6 +37,11 @@ class CollectorContext:
     target: TargetDescriptorV1 | None
     request_timeout_seconds: int
     redactor: LayeredRedactor
+    #: The collector's current durable source cursor, or ``None`` if it has never advanced (W07
+    #: increment 2b). A cursor-bearing collector resumes its incremental read from here; every
+    #: non-cursor collector ignores it. The pipeline reads it with
+    #: :func:`~milhouse.state.cursors.read_cursor` before building this context.
+    prior_cursor: SourceCursor | None = None
 
     def __post_init__(self) -> None:
         # Normalize and re-validate the run instant to an aware UTC millisecond value; the injected
@@ -72,6 +78,10 @@ class CollectorContext:
         if type(self.redactor) is not LayeredRedactor:
             raise PipelineError(
                 "MH_RUNTIME_CONTEXT_REDACTOR", "a layered redactor handle is required"
+            )
+        if self.prior_cursor is not None and not isinstance(self.prior_cursor, SourceCursor):
+            raise PipelineError(
+                "MH_RUNTIME_CONTEXT_CURSOR", "the prior cursor must be a source cursor or absent"
             )
 
 

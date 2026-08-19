@@ -17,6 +17,7 @@ from typing import Literal
 from milhouse.core.canonical import MAX_CANONICAL_INT
 from milhouse.core.immutable import freeze_dict
 from milhouse.domain.records import RecordDraftV1
+from milhouse.outbox.advance import CursorAdvanceV1
 from milhouse.runtime.errors import PipelineError
 
 CollectorStatus = Literal["ok", "failed"]
@@ -29,11 +30,21 @@ _DIAGNOSTIC_KEY = re.compile(r"[a-z][a-z0-9_]{0,63}", flags=re.ASCII)
 
 @dataclass(frozen=True, slots=True)
 class CollectorResult:
-    """One collector's ordered drafts, run status, and privacy-safe diagnostic counts."""
+    """One collector's ordered drafts, run status, and privacy-safe diagnostic counts.
+
+    ``cursor_advance`` is the OPTIONAL post-commit sidecar a cursor-bearing collector (the
+    ``file_outbox`` collector) returns so the pipeline can advance its durable source cursor and
+    write its acknowledgement STRICTLY AFTER the segment commits (W07 increment 2b, plan section
+    4.9). It is ``None`` for every non-cursor collector, whose behaviour is entirely unchanged. On a
+    data-loss read it carries only ``loss_signal`` (with no drafts), so the pipeline commits and
+    advances nothing and surfaces the loss code -- see
+    :class:`~milhouse.outbox.advance.CursorAdvanceV1`.
+    """
 
     status: CollectorStatus
     drafts: tuple[RecordDraftV1, ...] = ()
     diagnostics: Mapping[str, int] = field(default_factory=dict)
+    cursor_advance: CursorAdvanceV1 | None = None
 
     def __post_init__(self) -> None:
         if self.status not in ("ok", "failed"):
@@ -67,6 +78,10 @@ class CollectorResult:
                     "MH_RUNTIME_RESULT_DIAGNOSTICS",
                     "each diagnostic must be a machine key and a non-negative count",
                 )
+        if self.cursor_advance is not None and not isinstance(self.cursor_advance, CursorAdvanceV1):
+            raise PipelineError(
+                "MH_RUNTIME_RESULT_CURSOR", "a cursor advance sidecar must be a CursorAdvanceV1"
+            )
         object.__setattr__(self, "diagnostics", freeze_dict(dict(self.diagnostics)))
 
 

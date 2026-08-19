@@ -13,8 +13,10 @@ from _record_factories import INSTALLATION_ID, NOW, event_record
 from _runtime_harness import make_redactor
 
 from milhouse.domain.records import CollectorDescriptorV1, TargetDescriptorV1
+from milhouse.outbox import CursorAdvanceV1, OutboxLossSignal
 from milhouse.runtime import CollectorContext, CollectorResult
 from milhouse.runtime.errors import PipelineError
+from milhouse.state import SourceCursor
 
 _COLLECTOR = CollectorDescriptorV1(id="canary1", type="site.canary", implementation_version="1.0.0")
 _TARGET = TargetDescriptorV1(id="t1", name="Example", kind="web_service", environment="test")
@@ -96,6 +98,20 @@ def test_a_non_redactor_handle_fails_closed() -> None:
     assert caught.value.code == "MH_RUNTIME_CONTEXT_REDACTOR"
 
 
+def test_a_valid_prior_cursor_is_accepted() -> None:
+    cursor = SourceCursor(
+        source="app-outbox", position="pos", batch_id=None, revision=0, updated_at="2026-01-01"
+    )
+    context = _context(prior_cursor=cursor)
+    assert context.prior_cursor is cursor
+
+
+def test_a_non_cursor_prior_cursor_fails_closed() -> None:
+    with pytest.raises(PipelineError) as caught:
+        _context(prior_cursor=object())
+    assert caught.value.code == "MH_RUNTIME_CONTEXT_CURSOR"
+
+
 # --- result ------------------------------------------------------------------------------------
 
 
@@ -142,3 +158,22 @@ def test_a_non_mapping_diagnostics_collection_fails_closed() -> None:
     with pytest.raises(PipelineError) as caught:
         CollectorResult(status="ok", diagnostics=[("samples", 1)])  # type: ignore[arg-type]
     assert caught.value.code == "MH_RUNTIME_RESULT_DIAGNOSTICS"
+
+
+def test_a_valid_cursor_advance_sidecar_is_accepted() -> None:
+    loss = OutboxLossSignal(
+        code="MH_OUTBOX_LOSS_TRUNCATED",
+        cursor_device=1,
+        cursor_inode=2,
+        cursor_offset=0,
+        cursor_sha256="0" * 64,
+    )
+    result = CollectorResult(status="failed", cursor_advance=CursorAdvanceV1(loss_signal=loss))
+    assert result.cursor_advance is not None
+    assert result.cursor_advance.loss_signal is not None
+
+
+def test_a_non_cursor_advance_sidecar_fails_closed() -> None:
+    with pytest.raises(PipelineError) as caught:
+        CollectorResult(status="ok", cursor_advance=object())  # type: ignore[arg-type]
+    assert caught.value.code == "MH_RUNTIME_RESULT_CURSOR"

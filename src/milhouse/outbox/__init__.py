@@ -18,6 +18,7 @@ from milhouse.outbox.ack import (
     read_outbox_ack,
     write_outbox_ack,
 )
+from milhouse.outbox.advance import CursorAdvanceV1
 from milhouse.outbox.cursor import (
     OUTBOX_POSITION_VERSION,
     OutboxPosition,
@@ -44,6 +45,7 @@ __all__ = [
     "MAX_ACK_BYTES",
     "MAX_OUTBOX_FRAME_BYTES",
     "OUTBOX_POSITION_VERSION",
+    "CursorAdvanceV1",
     "OutboxAckV1",
     "OutboxActionabilityV1",
     "OutboxDiagnostics",
