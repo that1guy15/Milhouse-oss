@@ -1,6 +1,6 @@
 """Append-only maintenance audit trail (W03 slice 5b, plan sections 4.4/4.6/4.9; D05 privacy fix).
 
-Every deliberate maintenance mutation — retention pruning, compaction, purge, restore — records one
+Every deliberate maintenance mutation — retention pruning, purge, restore — records one
 append-only row in ``_audit`` describing what happened in privacy-safe terms: a fixed action code, a
 fixed actor class, a fixed outcome and reason code, an optional KEYED resource pseudonym, and safe
 counts. An audit row never carries the acted-on raw payload, a secret, a path, a URL, or free text
@@ -64,17 +64,6 @@ class AuditRecord:
     byte_size: int | None
     content_sha256: str | None
     file_sha256: str | None
-
-
-_SHA256_HEX = re.compile(r"[0-9a-f]{64}", flags=re.ASCII)
-
-
-def _validate_digest(value: object, subject: str) -> str:
-    # A full-segment SHA-256 is a high-entropy digest of many records (not a low-entropy id), so it
-    # is privacy-safe to store raw as immutable evidence of the retired/replacement bytes.
-    if type(value) is not str or _SHA256_HEX.fullmatch(value) is None:
-        _fail("MH_STATE_AUDIT", f"an audit {subject} must be a lowercase 64-hex sha-256 digest")
-    return value
 
 
 def _validate_resource(value: object) -> str:
@@ -229,80 +218,6 @@ def record_retention_prune(
         resource=_keyed_resource(pseudonymizer, batch_id),
         record_count=record_count,
         byte_size=byte_size,
-    )
-
-
-def record_compaction(
-    connection: sqlite3.Connection,
-    *,
-    now: datetime,
-    old_batch_id: str,
-    new_batch_id: str,
-    old_record_count: int,
-    old_byte_size: int,
-    new_record_count: int,
-    new_byte_size: int,
-    old_content_sha256: str,
-    old_file_sha256: str,
-    new_content_sha256: str,
-    new_file_sha256: str,
-    pseudonymizer: Pseudonymizer,
-) -> None:
-    """Record a mixed-expiry compaction as a linked pair of append-only audit rows.
-
-    The ``_audit`` table carries one resource per row, so old→new lineage is expressed as two rows
-    written on the caller's transaction: a ``compacted_from`` row for the superseded old segment and
-    a ``compacted_into`` row for the new segment. They share ``action="compaction"`` and
-    ``recorded_at``, and their adjacent ids preserve the from→into order. Each batch id is
-    charset-validated and persisted only as a keyed pseudonym when ``pseudonymizer`` is supplied,
-    OMITTED (resource ``NULL``) otherwise, so a reversible unsalted hash is never stored (plan
-    section 4.7). The dropped (expired) record count is the difference of the two ``record_count``
-    values.
-
-    Plan sections 4.8-4.9 additionally require the OLD/NEW content and file hashes recorded
-    transactionally as immutable evidence of the exact retired and replacement bytes: the
-    ``compacted_from`` row carries the old segment's ``content_sha256``/``file_sha256`` and the
-    ``compacted_into`` row the new segment's. They are validated 64-hex digests (a full-segment
-    SHA-256 is high-entropy, so privacy-safe to store raw, unlike the low-entropy batch id). Call
-    inside the SAME transaction as the ledger swap: any digest that fails validation, or any backend
-    fault, raises the fixed code so the swap and the audit roll back together.
-    """
-
-    _validate_resource(old_batch_id)
-    _validate_resource(new_batch_id)
-    _validate_count(old_record_count, "record count")
-    _validate_count(old_byte_size, "byte size")
-    _validate_count(new_record_count, "record count")
-    _validate_count(new_byte_size, "byte size")
-    _validate_digest(old_content_sha256, "content digest")
-    _validate_digest(old_file_sha256, "file digest")
-    _validate_digest(new_content_sha256, "content digest")
-    _validate_digest(new_file_sha256, "file digest")
-    _insert_audit(
-        connection,
-        now=now,
-        action="compaction",
-        actor="maintenance",
-        outcome="compacted_from",
-        reason="mixed_expiry",
-        resource=_keyed_resource(pseudonymizer, old_batch_id),
-        record_count=old_record_count,
-        byte_size=old_byte_size,
-        content_sha256=old_content_sha256,
-        file_sha256=old_file_sha256,
-    )
-    _insert_audit(
-        connection,
-        now=now,
-        action="compaction",
-        actor="maintenance",
-        outcome="compacted_into",
-        reason="mixed_expiry",
-        resource=_keyed_resource(pseudonymizer, new_batch_id),
-        record_count=new_record_count,
-        byte_size=new_byte_size,
-        content_sha256=new_content_sha256,
-        file_sha256=new_file_sha256,
     )
 
 

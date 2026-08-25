@@ -251,7 +251,7 @@ def test_the_real_register_and_index_are_compliant() -> None:
 
 def test_every_expected_amendment_is_enumerated() -> None:
     blocks = _amendment_blocks(_register(_PLAN))
-    for amendment in ("A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08"):
+    for amendment in ("A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08", "A09"):
         assert amendment in blocks, f"{amendment} is not enumerated from the section-1 register"
 
 
@@ -259,7 +259,7 @@ def test_each_real_amendment_maps_to_exactly_one_canonical_paragraph() -> None:
     declarations, violations = _declarations(_register(_PLAN))
     assert violations == []
     ids = [aid for aid, _kind, _block in declarations]
-    assert ids == ["A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08"]
+    assert ids == ["A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08", "A09"]
 
 
 def test_the_process_allowlist_reads_as_process_or_disposition() -> None:

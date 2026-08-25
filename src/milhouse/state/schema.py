@@ -238,68 +238,38 @@ CONTROL_MIGRATIONS: tuple[Migration, ...] = (
     ),
     Migration(
         11,
-        "create_installation_key",
+        "create_alert_rule_state",
         (
-            # Durable installation pseudonym-key identity (ADR 0007 addendum A07, §4.7). A keyed
-            # audit derivative is trustworthy only if produced by THIS installation's own key, and a
-            # `Pseudonymizer` is constructible from any 32 bytes, so loading a file at that path
-            # proves file hygiene, not installation identity. W03's first confirmed compaction
-            # creates or adopts the bound key under the global barrier, then records the NON-SECRET
-            # key ID and epoch here; W06 init reuses that identity. Later audited compaction loads
-            # with these exact expected values and fails closed before spool mutation on a
-            # missing/malformed key or ID/epoch mismatch — so a wrong, restored, rotated, or
-            # cross-installation key can never write unattributable lineage. Singleton (`id = 1`):
-            # one identity per control plane. No secret is
-            # stored — only the public key ID (`mh_pk1_` + 16 hex) and the 1..2^31-1 epoch.
-            "CREATE TABLE _installation_key ("
-            "id INTEGER PRIMARY KEY NOT NULL, "
-            "key_id TEXT NOT NULL, "
-            "epoch INTEGER NOT NULL, "
-            "established_at TEXT NOT NULL, "
-            "CHECK (id = 1), "
-            "CHECK (length(key_id) = 23), "
-            "CHECK (key_id GLOB 'mh_pk1_*'), "
-            "CHECK (epoch BETWEEN 1 AND 2147483647))",
-        ),
-    ),
-    Migration(
-        12,
-        "create_compaction_intents",
-        (
-            # Authoritative compaction/rehome provenance (ADR 0007 addendum A07; G03 review of the
-            # reserved-namespace upgrade). A ``c[0-9a-f]{64}`` id was a valid producer id before
-            # the reservation, so origin alone cannot distinguish a genuine successor from
-            # a legal pre-reservation occupant (a producer-committed row OR a pre-upgrade producer
-            # crash orphan reconciliation registers ``origin=reconciled``). Compaction instead
-            # records an INTENT for each successor BEFORE publishing it, so a reserved id is
-            # successor ONLY if an intent proves it — and a crash-published successor is still
-            # adoptable, never rehomed (which would duplicate its records). The table starts empty
-            # on schema-12 upgrade, so the first exclusive compaction pass discovers and verifies
-            # the complete successor set for every old source, then atomically collapses the source
-            # and every redundant successor to one current target before treating the remaining
-            # reserved rows as legacy occupants. A rehome intent binds its source to a
-            # collision-resistant target so a restart reuses the same allocation.
-            "CREATE TABLE _compaction_intents ("
-            "target_batch_id TEXT PRIMARY KEY NOT NULL, "
-            "source_batch_id TEXT NOT NULL, "
-            "kind TEXT NOT NULL, "
-            "created_at TEXT NOT NULL, "
-            "CHECK (kind IN ('successor', 'rehome')), "
-            "CHECK (length(target_batch_id) > 0), "
-            "CHECK (length(source_batch_id) > 0), "
-            "CHECK (length(created_at) > 0))",
-            "CREATE INDEX _compaction_intents_by_source ON _compaction_intents (source_batch_id)",
-            "CREATE UNIQUE INDEX _compaction_intents_one_kind_per_source "
-            "ON _compaction_intents (source_batch_id, kind)",
-            # Generic durable counters for later control-plane workflows. Rehome allocation does
-            # NOT use an SQLite integer sequence: its collision-resistant 256-bit target selection
-            # retries without a finite probe terminal, so neither caller-chosen occupation nor
-            # SQLite's signed-integer ceiling can strand the namespace upgrade.
-            "CREATE TABLE _sequences ("
-            "name TEXT PRIMARY KEY NOT NULL, "
-            "value INTEGER NOT NULL, "
-            "CHECK (length(name) > 0), "
-            "CHECK (value >= 0))",
+            # Per-rule/version canary alert-engine state (plan section 4.6, W05 alerting). The
+            # canary_state engine derives alert transitions from committed availability records and
+            # advances THIS row via a compare-and-set against the exact prior ``revision`` — the
+            # same projection-CAS protocol the derivation checkpoints and feedback transitions use
+            # — so a replayed, restarted, or concurrent pass cannot fork current alert state or
+            # double-emit a firing transition. The (rule_id, rule_version) key keeps a rule-logic
+            # revision from inheriting a prior version's consecutive-sample counters, cooldown, or
+            # state. The row carries only the consecutive fail/success counters, the system-derived
+            # inactive|firing|resolved state, the cooldown/last-sample instants, the last transition
+            # id, and the monotonic revision — never a raw payload, URL, or probe body. The nullable
+            # cooldown_until/last_sample_at/last_transition_id are NULL until a sample or transition
+            # sets them.
+            "CREATE TABLE _alert_rule_state ("
+            "rule_id TEXT NOT NULL, "
+            "rule_version INTEGER NOT NULL, "
+            "consecutive_fail_count INTEGER NOT NULL, "
+            "consecutive_success_count INTEGER NOT NULL, "
+            "current_state TEXT NOT NULL, "
+            "cooldown_until TEXT, "
+            "last_sample_at TEXT, "
+            "last_transition_id TEXT, "
+            "revision INTEGER NOT NULL, "
+            "updated_at TEXT NOT NULL, "
+            "PRIMARY KEY (rule_id, rule_version), "
+            "CHECK (length(rule_id) > 0), "
+            "CHECK (rule_version >= 1), "
+            "CHECK (consecutive_fail_count >= 0), "
+            "CHECK (consecutive_success_count >= 0), "
+            "CHECK (current_state IN ('inactive', 'firing', 'resolved')), "
+            "CHECK (revision >= 1))",
         ),
     ),
 )

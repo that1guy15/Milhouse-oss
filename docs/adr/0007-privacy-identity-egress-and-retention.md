@@ -2,7 +2,7 @@
 
 - Status: Accepted (ratification)
 - Date: 2026-07-18
-- Amended by: ADR 0016 (adds the `local_log` egress surface and the persisted structured-log contract, 2026-07-22); Addendum A07 (installation-key provenance and reserved compaction-namespace upgrade, 2026-08-01); Addendum A08 (dependency-ready key lifecycle and complete successor-set recovery, 2026-08-02)
+- Amended by: ADR 0016 (adds the `local_log` egress surface and the persisted structured-log contract, 2026-07-22); Addendum A07 (installation-key provenance and reserved compaction-namespace upgrade, 2026-08-01); Addendum A08 (dependency-ready key lifecycle and complete successor-set recovery, 2026-08-02); Addendum A09 (defers the W03 audited mixed-expiry compaction rewrite and withdraws its reserved namespace and migrations 11–12, 2026-08-03)
 
 ## Context
 
@@ -104,6 +104,38 @@ as independent old-source/successor pairs.
   to prove the exact final target protects the complete affected set and fails closed without
   partial rehome/compaction. Repeated restart, reconciliation, and maintenance therefore converge
   to exactly one ledger/file copy of each live record.
+
+## Addendum A09 (2026-08-03) — defer the W03 audited mixed-expiry compaction rewrite
+
+Owner-approved amendment A09 defers the audited mixed-expiry compaction rewrite defined by this ADR
+and the A07/A08 addenda out of package W03 and gate G03. Thirteen consecutive independent reviews
+failed exclusively inside the compaction subsystem, which had no production caller and could not run
+before W06 established its installation key; its content-derived successor id had spawned a reserved
+namespace, legacy-occupant rehoming, durable intents, and crash-during-upgrade recovery for
+scenarios impossible in a pre-alpha with no released install. The rewrite is a separately owned
+obligation, reachable only once a runtime produces delivered mixed-expiry segments and W06 `init`
+provisions the installation pseudonym key.
+
+Contract after this addendum:
+
+- W03 no longer implements or gates the mixed-expiry rewrite. The `_installation_key` (migration 11)
+  and `_compaction_intents`/`_sequences` (migration 12) tables and the reserved `c[0-9a-f]{64}`
+  successor namespace are withdrawn; the control schema returns to version 10. The retention
+  retirement tombstone (migration 10) is retained. Because these migration numbers are withdrawn (not
+  reserved) and control migrations are strictly contiguous, the next control migration to land takes
+  slot 11: **W05 alerting claims migration 11 for the `_alert_rule_state` table** (schema 11). When
+  the deferred installation-key and compaction tables are re-scoped in (W06/later) they take the next
+  free contiguous migration numbers at that time — the "migration 11 = `_installation_key`" / "12"
+  references elsewhere in this ADR and the plan describe the pre-A09 plan and are superseded here.
+- Retention prunes only fully-expired segments, behind the durable retirement tombstone, and leaves
+  a mixed-expiry segment classified and in place — never deleted, never egressed. Export withholds a
+  mixed-expiry or fully-expired segment (fail-closed), so no expired record is ever forwarded and no
+  privacy-expired record can outlive its deadline once the deferred rewrite lands.
+- The keyed-pseudonym lineage requirement of this ADR is preserved and moves to the package that
+  owns the installation-key lifecycle (W06 and the later compaction owner), rather than being
+  established inside compaction. No wire byte, record envelope, privacy class, retention day, or
+  egress rule changes. A future package reintroduces the rewrite behind its own accepted amendment
+  and forward migration.
 
 ## Plan references
 

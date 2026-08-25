@@ -62,6 +62,7 @@ for bounded direct dependency ranges or a maintenance/license/security assessmen
 | Canonical command | Purpose |
 |---|---|
 | `./scripts/run_make.py setup` | Safely synchronize every development group and extra from the existing lock with restrictive environment permissions. |
+| `./scripts/run_make.py worktree-check` | Read-only local preflight for a clean synchronized primary, bounded task worktrees, live registrations, and classified secondary dirtiness; invoke `python3 -I scripts/check_worktree_hygiene.py --expect LABEL=PATH` directly for an expected registration and add `--strict` at task close. |
 | `./scripts/run_make.py lock` | Intentionally resolve and rewrite `uv.lock` with exact uv. |
 | `./scripts/run_make.py lock-check` | Fail if project metadata and the checked-in lock disagree. |
 | `./scripts/run_make.py format` | Apply Ruff formatting to owned Python source and tests. |

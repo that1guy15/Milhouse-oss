@@ -350,6 +350,29 @@ class AlertDataV1(_StrictRecordModel):
         return self
 
 
+class NotificationIntentDataV1(_StrictRecordModel):
+    """A durable record of one channel's INTENT to notify for one alert transition (plan 4.14).
+
+    It is emitted the moment an alert transition is committed, one per applicable configured
+    notification channel, and captures only the INTENT — no message is ever sent, and no delivery,
+    retry, rate-limit, or "sent" state lives here (all W14). It references the alert by id via
+    ``evidence_ids`` and names the channel by its non-secret configured ``channel_id`` and
+    ``channel_type`` ONLY: it never carries a bot token, chat id, provider, repository, URL, or
+    target. The ``summary`` is a fixed privacy-safe constant supplied by its producer, never
+    interpolated. ``severity`` couples to the envelope, mirroring :class:`AlertDataV1`.
+    """
+
+    type: Literal["notification_intent"] = "notification_intent"
+    intent_id: OpaqueIdV1
+    alert_key: OpaqueIdV1
+    transition_id: OpaqueIdV1
+    channel_id: MachineIdV1
+    channel_type: Literal["telegram", "github_issues"]
+    severity: SeverityV1
+    summary: FreeTextV1
+    evidence_ids: EvidenceIdsV1 = Field(min_length=1)
+
+
 class IncidentDataV1(_StrictRecordModel):
     type: Literal["incident"] = "incident"
     incident_key: OpaqueIdV1
@@ -552,6 +575,7 @@ RecordDataV1 = Annotated[
     | SpanDataV1
     | RunDataV1
     | AlertDataV1
+    | NotificationIntentDataV1
     | IncidentDataV1
     | FeedbackItemDataV1
     | FeedbackTransitionDataV1
@@ -606,7 +630,10 @@ class RecordDraftV1(_StrictRecordModel):
             raise ValueError("ingested_at must not precede observed_at")
         if self.expires_at <= self.ingested_at:
             raise ValueError("expires_at must be after ingested_at")
-        if isinstance(self.data, (AlertDataV1, IncidentDataV1, FeedbackItemDataV1)):
+        if isinstance(
+            self.data,
+            (AlertDataV1, NotificationIntentDataV1, IncidentDataV1, FeedbackItemDataV1),
+        ):
             if self.severity != self.data.severity:
                 raise ValueError("envelope severity must match payload severity")
         if isinstance(self.data, FeedbackItemDataV1):

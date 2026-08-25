@@ -795,15 +795,6 @@ class _Scan:
                 barrier_acquired = True
                 ledger, malformed = self._ledger_index()
                 retirements = self._retirement_index()
-                # A07 reserved-namespace upgrade: a COMMITTED-origin segment in the reserved
-                # ``c[0-9a-f]{64}`` namespace is a legacy producer occupant that predates the
-                # reservation (compaction successors are always ``origin='reconciled'``, and the
-                # producer commit ingress now rejects the namespace). Reconciliation does NOT wedge
-                # acquisition on it — the earlier fail-closed guard blocked writers, retention, and
-                # recovery on a legal upgraded install (G03 review #79-P1-4). It is a committed
-                # segment here (verified like any other); audited compaction AUTO-CONVERGES it,
-                # rewriting it to a non-reserved id before compacting, so the namespace holds only
-                # successors. On pre-alpha installs (none released) no such occupant exists.
                 for batch_id in sorted(malformed):
                     # The batch id came from a row that failed validation, so it may not be well
                     # formed.

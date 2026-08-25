@@ -21,8 +21,9 @@ Delivery is *fenced* and *expiry-aware* (D05 re-review):
   for in-flight deliveries to drain, exactly as a readers-writer lock requires.
 * **Expiry-aware.** A segment with any expired record is withheld — never forwarded — because
   record-class privacy expiry is a hard upper bound (plan §§4.8-4.9): expired data must never
-  egress, even if retention has not pruned it yet. A mixed-expiry segment waits for audited
-  compaction (slice 5c) rather than leaking its expired records.
+  egress, even if retention has not pruned it yet. A mixed-expiry segment is withheld (fail-closed)
+  rather than leaking its expired records; rewriting it into a live-only segment is deferred
+  compaction work (plan §4.7).
 
 The delivery ledger (``_segment_exporters.delivery_status``) is a per-(segment, exporter) state
 machine: ``pending``/``failed`` are retryable, ``delivered`` is terminal. Rule 12 requires the
@@ -157,9 +158,9 @@ def _segment_is_expired(frames: Sequence[SpoolFrameV1], now: datetime) -> bool:
     """Return whether ANY record in ``frames`` has reached its ``expires_at`` at ``now``.
 
     Record-class privacy expiry is a hard upper bound: a fully-live segment (every record still
-    unexpired) may egress; a mixed or fully-expired one must be withheld until audited compaction
-    (slice 5c) can strip the expired records, so no expired record is ever forwarded. An empty frame
-    set carries no record to reason about and is not expired.
+    unexpired) may egress; a mixed or fully-expired one is withheld (fail-closed), so no expired
+    record is ever forwarded. Stripping expired records out of a mixed segment is deferred
+    compaction work (plan §4.7). An empty frame set carries no record to reason about, not expired.
     """
 
     if not frames:

@@ -16,6 +16,7 @@ from milhouse.domain.records import (
     FeedbackTransitionDataV1,
     IncidentDataV1,
     MetricDataV1,
+    NotificationIntentDataV1,
     RatioAtLeastPredicateV1,
     RecordDraftV1,
     RecordEnvelopeV1,
@@ -488,6 +489,57 @@ def test_alert_and_incident_transitions_are_append_only_and_consistent() -> None
         )
     with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
         _draft(alert, record_type="alert", severity="warning")
+
+
+def test_notification_intent_record_round_trips_and_couples_severity() -> None:
+    intent = NotificationIntentDataV1(
+        intent_id="mh_nin1_example",
+        alert_key="mh_ak1_example",
+        transition_id="mh_atr1_example",
+        channel_id="telegram1",
+        channel_type="telegram",
+        severity="error",
+        summary="A configured channel recorded a durable intent to notify.",
+        evidence_ids=[EVIDENCE_ID],
+    )
+    # A notification intent is system-produced, so it carries NO collector provenance.
+    record = finalize_record(
+        _draft(
+            intent,
+            record_type="notification_intent",
+            name="alert.notification_intent",
+            severity="error",
+            source=_source(producer="system"),
+            collector=None,
+            collector_run_id=None,
+        ),
+        installation_id=INSTALLATION_ID,
+    )
+    assert record.data.type == "notification_intent"
+    assert record.record_type == "notification_intent"
+    assert record.severity == record.data.severity == "error"  # type: ignore[union-attr]
+    verify_record_identity(record, installation_id=INSTALLATION_ID)
+
+    # The envelope severity must couple to the payload severity, exactly like an alert.
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
+        _draft(
+            intent,
+            record_type="notification_intent",
+            name="alert.notification_intent",
+            severity="warning",
+            source=_source(producer="system"),
+            collector=None,
+            collector_run_id=None,
+        )
+    # A system-produced record forbids collector provenance.
+    with pytest.raises(ValidationError, match=RECORD_VALIDATION_MESSAGE):
+        _draft(
+            intent,
+            record_type="notification_intent",
+            name="alert.notification_intent",
+            severity="error",
+            source=_source(producer="system"),
+        )
 
 
 def test_feedback_item_and_transition_contracts_enforce_authority_and_evidence() -> None:
