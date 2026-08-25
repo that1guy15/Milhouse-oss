@@ -61,8 +61,12 @@ remain W05 work; that registry must revalidate and bind the exact object it will
 
 ## Contributor quickstart
 
-Contributors need Python 3.11-3.14 and exactly uv 0.11.29. The bootstrap verifies that uv version
-and installs the hash-locked development environment:
+Contributors need Python 3.11-3.14 and exactly uv 0.11.29. A package manager will usually install a
+different version, so pin it explicitly (`curl -LsSf https://astral.sh/uv/0.11.29/install.sh | sh`,
+or `pipx install uv==0.11.29`). Set `MILHOUSE_UV` if the exact executable is not the one found on
+`PATH`, and `MILHOUSE_PYTHON` to choose a different bootstrap interpreter — see
+[setup](docs/setup.md) for both. The bootstrap verifies that uv version and installs the hash-locked
+development environment:
 
 ```bash
 ./setup.sh

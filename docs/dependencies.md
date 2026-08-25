@@ -141,7 +141,8 @@ mutable tag.
 
 ## Lock and update procedure
 
-The only supported resolver is exactly uv 0.11.29:
+The only supported resolver is exactly uv 0.11.29 ([how to install that
+version](setup.md#installing-exactly-uv-01129)):
 
 ```bash
 python3 -I scripts/run_uv.py
