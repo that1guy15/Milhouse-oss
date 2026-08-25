@@ -87,6 +87,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 milhouse = ["py.typed"]
 "milhouse.resources" = ["*.json"]
+"milhouse.storage.migrations" = ["*.sql"]
 
 [tool.uv]
 required-version = ">=0.11.29,<0.12"
@@ -113,6 +114,7 @@ markers = [
   "contract: public and repository contract tests",
   "e2e: installed or end-to-end workflow tests",
   "integration: multi-module integration tests",
+  "live: opt-in tests against a real loopback ClickHouse; self-skip and stay out of Required CI",
   "migration: migration foundation tests",
   "packaging: artifact and package inventory tests",
   "property: Hypothesis property tests",

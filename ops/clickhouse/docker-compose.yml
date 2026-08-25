@@ -1,16 +1,68 @@
+# Loopback-only, authenticated reference ClickHouse for local Milhouse development (W04, plan 4.5 /
+# 10.4, ADR 0005). It is NOT a production deployment and it is NOT started by `milhouse init`.
+#
+# Hardening:
+#   * pinned to the ClickHouse 26.3 LTS reference line by exact image digest (25.8 is the
+#     compatibility line);
+#   * every published port is bound to 127.0.0.1 only — never reachable off the host;
+#   * the application connects as a dedicated, non-empty credential supplied from the environment
+#     (see .env.example); no secret is committed here;
+#   * `CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=0` plus the mounted users.d config lock the built-in
+#     `default` account, so there is no remotely usable or unauthenticated default user;
+#   * a health check and resource guidance are provided.
+#
+# Native backup:
+#   * config.d/backups.xml declares the `backups` disk and allow-lists it so `storage backup` /
+#     `storage restore` work; it is a local dir on the durable `clickhouse-backups` named volume,
+#     kept SEPARATE from the data volume (a `down -v` of data does not delete backups). See
+#     README.md for retention and permissions.
+#
+# Copy .env.example to .env, set the credentials, then: `docker compose --env-file .env up -d`.
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:26.3@sha256:422be85ae7344058369cdd366ac0efea9daa8428b55c9cf50258e83a7d12fcb3
     container_name: milhouse-clickhouse
+    restart: unless-stopped
     ports:
-      - "8123:8123"
-      - "9000:9000"
-    volumes:
-      - clickhouse-data:/var/lib/clickhouse
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
     environment:
       CLICKHOUSE_DB: milhouse
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_USER: ${MILHOUSE_CLICKHOUSE_APP_USER:?set a dedicated ClickHouse user in .env}
+      CLICKHOUSE_PASSWORD: ${MILHOUSE_CLICKHOUSE_APP_PASSWORD:?set a non-empty ClickHouse password in .env}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "0"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      # Native BACKUP/RESTORE target: a durable volume SEPARATE from the data volume, at the path
+      # config.d/backups.xml declares for the allow-listed `backups` disk.
+      - clickhouse-backups:/var/lib/clickhouse/backups
+      - ./users.d:/etc/clickhouse-server/users.d:ro
+      - ./config.d:/etc/clickhouse-server/config.d:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    deploy:
+      resources:
+        limits:
+          # Guidance only (honored by the compose spec); size to the host.
+          memory: 4g
+    healthcheck:
+      test:
+        - "CMD"
+        - "clickhouse-client"
+        - "--user"
+        - "${MILHOUSE_CLICKHOUSE_APP_USER}"
+        - "--password"
+        - "${MILHOUSE_CLICKHOUSE_APP_PASSWORD}"
+        - "--query"
+        - "SELECT 1"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
 volumes:
   clickhouse-data:
+  # Durable native-backup store, separate from clickhouse-data so a data reset never deletes backups.
+  clickhouse-backups:

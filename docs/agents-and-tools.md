@@ -50,6 +50,14 @@ and hidden state; the primary agent integrates and verifies the combined tree. R
 read-only. Selecting a skill grants no source, GitHub, provider, external-model, tag, publication, or
 messaging authority.
 
+Local development follows the canonical [worktree hygiene contract](../AGENTS.md#worktree-hygiene).
+The primary checkout is a clean, synchronized `main`; agent changes live in named task worktrees;
+and the creator removes each task worktree when its PR merges, closes, or is superseded. Run
+`./scripts/run_make.py worktree-check` before starting work. Invoke
+`python3 -I scripts/check_worktree_hygiene.py --expect LABEL=PATH` for active handoff registrations
+and add `--strict` at task close. Runtime handoffs use the precise states `clean-main`, `active`,
+`recovery-stashed`, or `blocked` and do not commit private machine paths.
+
 The [engineering journal](engineering-journal.md) is the public, human-readable output of selected
 `merged_verified` milestones. It summarizes only protected public evidence and cannot pass a gate,
 publish a package, claim release readiness, or expose raw/private inputs.
