@@ -257,6 +257,30 @@ def test_cross_process_exclusion_and_recovery(tmp_path: Path) -> None:
         pass
 
 
+def test_a_cross_process_shared_holder_blocks_the_exclusive_side(tmp_path: Path) -> None:
+    # The storage-migrate fence relies on this cross-PROCESS guarantee (the mirror of the recovery
+    # case above): while an export in ANOTHER process holds the shared delivery side of
+    # control/commit.lock, migrate's exclusive acquisition cannot proceed — a non-blocking probe
+    # fails busy (blocking migrate would instead wait for the export to drain), so a schema change
+    # never overlaps a cross-process ClickHouse writer. The full proof against a REAL migration is
+    # host-gated (live ClickHouse, E06).
+    lock = _lock_path(tmp_path)
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    holder = _spawn_holder(lock, "shared", ready, release)
+    try:
+        barrier = GlobalCommitBarrier(lock)
+        with pytest.raises(StateError) as captured:
+            with barrier.exclusive(blocking=False):
+                pass
+        assert captured.value.code == "MH_STATE_BARRIER_BUSY"
+    finally:
+        release.write_text("go")
+        assert holder.wait(timeout=25) == 0
+    with barrier.exclusive(blocking=False):  # free once the shared holder exits
+        pass
+
+
 def test_writer_preference_a_queued_exclusive_blocks_new_shared(tmp_path: Path) -> None:
     # A holds shared; B queues an exclusive (grabs the gate, blocks on the drained main lock); while
     # B is queued a new shared entrant is refused at the gate (the writer-preference turnstile).

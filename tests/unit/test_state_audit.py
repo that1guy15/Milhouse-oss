@@ -26,7 +26,6 @@ from milhouse.state import (
     initialize_control_state,
     list_audit,
     open_control_database,
-    record_compaction,
     record_retention_prune,
     schema_version,
 )
@@ -113,7 +112,7 @@ def _audit_bytes(database) -> bytes:
 def test_the_migration_creates_the_audit_table(tmp_path: Path) -> None:
     database = _database(tmp_path)
     try:
-        assert schema_version(database) == 12
+        assert schema_version(database) == 11
         tables = {
             row[0]
             for row in database.connection.execute(
@@ -142,7 +141,7 @@ def test_records_a_delivered_prune_with_fixed_codes(tmp_path: Path) -> None:
                 reason="expired",
                 record_count=3,
                 byte_size=128,
-                content_sha256=None,  # retention prune has no compaction old/new byte digests
+                content_sha256=None,  # retention prune records no old/new byte digests
                 file_sha256=None,
             ),
         )
@@ -261,8 +260,8 @@ def test_migration_8_clears_legacy_unsalted_audit_resources(tmp_path: Path) -> N
         # At v7 the digest columns migration 9 adds do not exist yet, so read the resource directly.
         assert database.connection.execute("SELECT resource FROM _audit").fetchone()[0] == legacy
 
-        migrate(database, CONTROL_MIGRATIONS, barrier=barrier, applied_at=_NOW)  # apply 8..12
-        assert schema_version(database) == 12
+        migrate(database, CONTROL_MIGRATIONS, barrier=barrier, applied_at=_NOW)  # apply 8..11
+        assert schema_version(database) == 11
         assert list_audit(database)[0].resource is None  # reversible hash cleared
         assert legacy.encode("utf-8") not in _audit_bytes(database)
     finally:
@@ -532,75 +531,5 @@ def test_a_pseudonymizer_that_misbehaves_is_contained(tmp_path: Path, output: ob
             )
         assert captured.value.code == "MH_STATE_AUDIT"
         assert list_audit(database) == ()
-    finally:
-        database.close()
-
-
-def test_record_compaction_with_a_key_stores_keyed_lineage_for_both_segments(
-    tmp_path: Path,
-) -> None:
-    # PR #72 review: when a keyed pseudonymizer is supplied, compaction records an attributable
-    # old->new lineage as two keyed identifiers — never a raw id or a public SHA-256.
-    database = _database(tmp_path)
-    try:
-        pseudonymizer = Pseudonymizer(_KEY_A)
-        old_id, new_id = "batch-old", "c" + "0" * 64
-        old_content, old_file = "a" * 64, "b" * 64
-        new_content, new_file = "c" * 64, "d" * 64
-        with database.transaction() as connection:
-            record_compaction(
-                connection,
-                now=_NOW,
-                old_batch_id=old_id,
-                new_batch_id=new_id,
-                old_record_count=2,
-                old_byte_size=200,
-                new_record_count=1,
-                new_byte_size=100,
-                old_content_sha256=old_content,
-                old_file_sha256=old_file,
-                new_content_sha256=new_content,
-                new_file_sha256=new_file,
-                pseudonymizer=pseudonymizer,
-            )
-        rows = list_audit(database, action="compaction")
-        assert [r.outcome for r in rows] == ["compacted_from", "compacted_into"]
-        assert rows[0].resource == pseudonymizer.fingerprint("batch", old_id)
-        assert rows[1].resource == pseudonymizer.fingerprint("batch", new_id)
-        assert all(r.resource is not None and r.resource.startswith("mh_fp1_") for r in rows)
-        # Plan §§4.8-4.9: each row carries its segment's verified content + file digests as
-        # immutable evidence of the retired (from) and replacement (into) bytes.
-        assert (rows[0].content_sha256, rows[0].file_sha256) == (old_content, old_file)
-        assert (rows[1].content_sha256, rows[1].file_sha256) == (new_content, new_file)
-        blob = _audit_bytes(database)
-        assert old_id.encode("utf-8") not in blob and new_id.encode("utf-8") not in blob
-        assert _fp(old_id).encode("utf-8") not in blob and _fp(new_id).encode("utf-8") not in blob
-    finally:
-        database.close()
-
-
-def test_record_compaction_rejects_a_malformed_digest_and_rolls_back(tmp_path: Path) -> None:
-    # P1 (review finding #4): the old/new content/file digests are validated and written in the
-    # SAME transaction as the ledger swap, so a malformed digest fails closed and nothing persists.
-    database = _database(tmp_path)
-    try:
-        with pytest.raises(StateError) as captured, database.transaction() as connection:
-            record_compaction(
-                connection,
-                now=_NOW,
-                old_batch_id="batch-old",
-                new_batch_id="c" + "0" * 64,
-                old_record_count=2,
-                old_byte_size=200,
-                new_record_count=1,
-                new_byte_size=100,
-                old_content_sha256="not-a-digest",  # invalid
-                old_file_sha256="b" * 64,
-                new_content_sha256="c" * 64,
-                new_file_sha256="d" * 64,
-                pseudonymizer=Pseudonymizer(_KEY_A),
-            )
-        assert captured.value.code == "MH_STATE_AUDIT"
-        assert list_audit(database, action="compaction") == ()  # rolled back, nothing persisted
     finally:
         database.close()

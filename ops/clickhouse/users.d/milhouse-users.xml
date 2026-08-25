@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- Defense in depth for the loopback reference deployment (W04, ADR 0005): even with
+         CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=0, deny the built-in `default` account every network
+         so its empty password can never be used, on loopback or off-host. The application connects
+         as the dedicated CLICKHOUSE_USER created from the environment, never as `default`. -->
+    <users>
+        <default>
+            <networks replace="replace">
+                <host>milhouse-default-account-disabled.invalid</host>
+            </networks>
+            <access_management>0</access_management>
+        </default>
+    </users>
+</clickhouse>

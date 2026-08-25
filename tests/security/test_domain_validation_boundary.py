@@ -1125,7 +1125,7 @@ def test_every_public_domain_model_inherits_the_value_safe_guard() -> None:
     record_models = _public_models(record_module)
 
     assert len(identity_models) == 5
-    assert len(record_models) == 23
+    assert len(record_models) == 24  # + NotificationIntentDataV1 (W05 increment 4)
     assert all(issubclass(model, ValueSafeIdentityModel) for model in identity_models)
     assert all(issubclass(model, ValueSafeRecordModel) for model in record_models)
 

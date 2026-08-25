@@ -2,9 +2,11 @@
 
 Retention is driven by each record's own ``expires_at``, not the segment's commit time: a committed
 segment can be pruned wholesale only when EVERY record it contains has expired. A segment with some
-expired and some live records is a *mixed-expiry* segment that must be rewritten by audited
-compaction (slice 5c), never deleted here, so no unexpired record is ever lost. Record-class privacy
-expiry is a hard upper bound — an expired segment is removed even if it was never delivered — so an
+expired and some live records is a *mixed-expiry* segment: it is classified and left in place here,
+never deleted, so no unexpired record is ever lost. Rewriting the expired frames out of a
+mixed-expiry segment (audited compaction) is deferred — see the deferred W03 compaction obligation
+in the plan (§4.7) — so retention only prunes fully-expired segments. Record-class privacy expiry is
+a hard upper bound — a fully-expired segment is removed even if it was never delivered — so an
 expired-yet-undelivered segment is flagged for a critical audit/health event before removal.
 
 This module classifies each segment by reading its durable frames back through the trusted reader
@@ -98,7 +100,7 @@ class RetentionPreview:
 
     @property
     def compaction_candidates(self) -> tuple[SegmentRetention, ...]:
-        """Mixed-expiry segments that slice-5c compaction must rewrite rather than delete."""
+        """Mixed-expiry segments a future compaction pass would rewrite; reported, never pruned."""
 
         return tuple(s for s in self.segments if s.status == STATUS_MIXED)
 
@@ -456,9 +458,9 @@ def retention_apply(
     while segments are pruned. Each segment is re-read and re-verified against its ledger row under
     the lock; only a segment that agrees and is fully expired (max record ``expires_at`` past
     ``now``) is pruned, row-first, with an audit row (``pruned`` or ``pruned_undelivered`` for the
-    critical case). Mixed-expiry segments are left for compaction; unreadable or disagreeing
-    segments are left for verify/reconciliation. Every failure normalizes to a fixed ``MH_SPOOL_*``
-    code.
+    critical case). Mixed-expiry segments are left in place (deferred compaction); unreadable or
+    disagreeing segments are left for verify/reconciliation. Every failure normalizes to a fixed
+    ``MH_SPOOL_*`` code.
     """
 
     _validate_common(database, spool_root, installation_id)

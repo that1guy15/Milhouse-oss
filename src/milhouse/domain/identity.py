@@ -50,6 +50,7 @@ RecordTypeV1 = Literal[
     "span",
     "run",
     "alert",
+    "notification_intent",
     "incident",
     "feedback_item",
     "feedback_transition",
@@ -63,6 +64,9 @@ _DEDUPE_KEY = re.compile(r"^mh_d1_[a-z2-7]{51}[aq]$")
 _RECORD_ID_DOMAIN = b"milhouse-record-id-v1\0"
 _CONTENT_DOMAIN = b"milhouse-content-v1\0"
 _DEDUPE_DOMAIN = b"milhouse-dedupe-v1\0"
+_ALERT_KEY_DOMAIN = b"milhouse-alert-key-v1\0"
+_ALERT_TRANSITION_DOMAIN = b"milhouse-alert-transition-v1\0"
+_NOTIFICATION_INTENT_DOMAIN = b"milhouse-notification-intent-v1\0"
 
 
 def _contains_unsafe_identifier_characters(value: str) -> bool:
@@ -232,6 +236,99 @@ def derive_dedupe_key(dedupe: RecordDedupeV1) -> str:
     dedupe = RecordDedupeV1.model_validate(dedupe)
     projection = dedupe.model_dump(mode="python", exclude_none=True)
     return f"mh_d1_{_base32_digest(_domain_digest(_DEDUPE_DOMAIN, projection))}"
+
+
+def _require_bounded_safe_text(value: object, *, code: str, subject: str) -> str:
+    if type(value) is not str or not value or _contains_unsafe_identifier_characters(value):
+        raise IdentityError(code, f"{subject} must be safe text")
+    if len(value.encode("utf-8")) > 256:
+        raise IdentityError(code, f"{subject} exceeds its byte bound")
+    return value
+
+
+def _require_alert_text(value: object, subject: str) -> str:
+    return _require_bounded_safe_text(
+        value, code="MH_IDENTITY_ALERT_INPUT", subject=f"an alert {subject}"
+    )
+
+
+def _require_notification_text(value: object, subject: str) -> str:
+    return _require_bounded_safe_text(
+        value, code="MH_IDENTITY_NOTIFICATION_INPUT", subject=f"a notification intent {subject}"
+    )
+
+
+def _require_alert_version(value: object) -> int:
+    # ``bool`` is an ``int`` subtype; reject it so a stray flag cannot pose as a rule version.
+    if type(value) is not int or value < 1:
+        raise IdentityError(
+            "MH_IDENTITY_ALERT_INPUT", "an alert rule version must be a whole number >= 1"
+        )
+    return value
+
+
+def derive_alert_key(*, rule_id: str, rule_version: int, collector: str, target: str) -> str:
+    """Derive a stable, deterministic alert key from the rule, its version, collector, and target.
+
+    The alert key is the alert's identity across every transition it produces (plan section 4.6,
+    "stable ``alert_key``"): it excludes the transition's state and instant, so a re-fire under the
+    same rule reuses the same key. It is a domain-separated digest, so it never renders or reverses
+    the inputs and is safe to persist or surface. The returned ``mh_ak1_`` token is a bounded,
+    single-line, ``OpaqueIdV1``-valid identifier.
+    """
+
+    projection = {
+        "collector": _require_alert_text(collector, "collector"),
+        "rule_id": _require_alert_text(rule_id, "rule id"),
+        "rule_version": _require_alert_version(rule_version),
+        "target": _require_alert_text(target, "target"),
+    }
+    return f"mh_ak1_{_base32_digest(_domain_digest(_ALERT_KEY_DOMAIN, projection))}"
+
+
+def derive_transition_id(
+    *,
+    alert_key: str,
+    previous_state: str,
+    state: str,
+    triggering_observation: ObservationCoordinateV1,
+) -> str:
+    """Derive a deterministic transition id from the alert key, the state edge, and its coordinate.
+
+    Two transitions that share an alert key and a ``previous -> state`` edge are disambiguated by
+    the triggering observation coordinate (which carries the sample instant), so a re-fire and its
+    original firing get distinct ids while an identical sample re-derives the identical id. The
+    returned ``mh_atr1_`` token is a bounded, single-line, ``OpaqueIdV1``-valid identifier.
+    """
+
+    observation = ObservationCoordinateV1.model_validate(triggering_observation)
+    projection = {
+        "alert_key": _require_alert_text(alert_key, "alert key"),
+        "observation": observation.model_dump(mode="python", exclude_none=True),
+        "previous_state": _require_alert_text(previous_state, "previous state"),
+        "state": _require_alert_text(state, "state"),
+    }
+    return f"mh_atr1_{_base32_digest(_domain_digest(_ALERT_TRANSITION_DOMAIN, projection))}"
+
+
+def derive_notification_intent_id(*, transition_id: str, channel_id: str) -> str:
+    """Derive a deterministic notification-intent id from its alert transition and its channel.
+
+    A notification intent is one configured channel's durable INTENT to notify for one committed
+    alert transition (plan section 4.14); this id binds exactly the transition and the channel. Two
+    intents that share a transition and a channel re-derive the identical token, while a different
+    transition or a different channel yields a distinct one — so re-running the same transition for
+    the same channel stays idempotent. It is a domain-separated one-way digest, exactly like
+    :func:`derive_transition_id`, so it never renders or reverses its inputs and is safe to persist
+    or surface. The returned ``mh_nin1_`` token is a bounded, single-line, ``OpaqueIdV1``-valid
+    identifier.
+    """
+
+    projection = {
+        "channel_id": _require_notification_text(channel_id, "channel id"),
+        "transition_id": _require_notification_text(transition_id, "transition id"),
+    }
+    return f"mh_nin1_{_base32_digest(_domain_digest(_NOTIFICATION_INTENT_DOMAIN, projection))}"
 
 
 def _validate_digest_token(value: str, *, prefix: str, pattern: re.Pattern[str]) -> str:

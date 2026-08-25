@@ -26,7 +26,7 @@ def test_github_style_slugs_and_duplicate_heading_suffixes(tmp_path: Path) -> No
 
     assert slug("Release 1.0: `Milhouse`_OSS") == "release-10-milhouse_oss"
     assert "repeated-heading-1" in anchors(page)
-    assert validate((page,), tmp_path.resolve(), False, 1, 1.0, 0) == (2, 0)
+    assert validate((page,), tmp_path.resolve(), False, 1, 1.0, 0) == (2, 0, 0)
 
 
 def test_local_link_cannot_escape_repo_through_encoded_traversal(tmp_path: Path) -> None:
@@ -459,7 +459,10 @@ def test_external_check_accepts_success_and_head_fallback(
     check_links.check_external("https://example.test/page", 1.0, 0)
     assert methods == ["HEAD", "GET"]
 
-    outcomes = iter(((405, None), (500, None)))
+    # A retryable 500 on the GET fallback is retried up to the bound, then surfaces as a
+    # genuine failure once exhausted (the 500 is yielded once per attempt).
+    monkeypatch.setattr(check_links.time, "sleep", lambda _seconds: None)
+    outcomes = iter(((405, None), (500, None), (500, None), (500, None)))
     monkeypatch.setattr(check_links, "_request_once", lambda *_args: next(outcomes))
     with pytest.raises(LinkError, match="HTTP 500"):
         check_links.check_external("https://example.test/page", 1.0, 0)
@@ -492,6 +495,7 @@ def test_external_check_follows_bounded_redirects(
 def test_external_check_rejects_unsafe_or_failed_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(check_links.time, "sleep", lambda _seconds: None)
     with pytest.raises(LinkError, match="unsupported external URL"):
         check_links.check_external("ftp://example.test/file", 1.0, 0)
     with pytest.raises(LinkError, match="credentials"):
@@ -537,7 +541,7 @@ def test_validate_handles_directory_anchors_mailto_and_bounded_external_links(
         lambda url, _timeout, _redirects: probes.append(url),
     )
 
-    assert validate((page,), tmp_path.resolve(), True, 1, 1.0, 0) == (3, 1)
+    assert validate((page,), tmp_path.resolve(), True, 1, 1.0, 0) == (3, 1, 0)
     assert probes == ["https://example.test/page"]
 
     page.write_text("[one](https://one.test)\n[two](https://two.test)\n", encoding="utf-8")
@@ -569,7 +573,7 @@ def test_validate_accepts_a_local_file_without_an_anchor(tmp_path: Path) -> None
     page = tmp_path / "README.md"
     page.write_text("[guide](guide.md)\n", encoding="utf-8")
 
-    assert validate((page,), tmp_path.resolve(), False, 1, 1.0, 0) == (1, 0)
+    assert validate((page,), tmp_path.resolve(), False, 1, 1.0, 0) == (1, 0, 0)
 
 
 @pytest.mark.parametrize(
@@ -610,3 +614,163 @@ def test_link_main_validates_bounds_and_reports_errors(
         check_links.main([str(missing)])
     assert caught.value.code == 1
     assert "links:" in capsys.readouterr().err
+
+
+def _resolve_global(*args: object, **_kwargs: object) -> list[object]:
+    port = int(args[1]) if len(args) > 1 else 443
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", port))]
+
+
+def test_external_check_retries_transient_status_until_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(check_links.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        check_links, "_public_endpoints", lambda _host, port: (_public_endpoint(port=port),)
+    )
+    methods: list[str] = []
+    outcomes = iter(((429, None), (200, None)))
+
+    def request(*args: object) -> tuple[int, str | None]:
+        methods.append(str(args[-2]))
+        return next(outcomes)
+
+    monkeypatch.setattr(check_links, "_request_once", request)
+    assert check_links.check_external("https://example.test/page", 5.0, 0) is None
+    assert methods == ["HEAD", "HEAD"]
+
+
+def test_external_check_exhausts_retries_on_persistent_retryable_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr(check_links.time, "sleep", lambda seconds: slept.append(seconds))
+    monkeypatch.setattr(
+        check_links, "_public_endpoints", lambda _host, port: (_public_endpoint(port=port),)
+    )
+    methods: list[str] = []
+
+    def request(*args: object) -> tuple[int, str | None]:
+        methods.append(str(args[-2]))
+        return 503, None
+
+    monkeypatch.setattr(check_links, "_request_once", request)
+    with pytest.raises(LinkError, match="HTTP 503"):
+        check_links.check_external("https://example.test/page", 5.0, 0)
+    assert methods == ["HEAD", "HEAD", "HEAD"]
+    assert slept == [0.5, 1.0]
+
+
+def test_github_raw_url_maps_blob_tree_raw_and_rejects_other_shapes() -> None:
+    expected = "https://raw.githubusercontent.com/owner/repo/main/docs/guide.md"
+    assert check_links._github_raw_url("https://github.com/owner/repo/blob/main/docs/guide.md") == (
+        expected
+    )
+    assert check_links._github_raw_url("https://github.com/owner/repo/tree/main/docs/guide.md") == (
+        expected
+    )
+    assert check_links._github_raw_url("https://github.com/owner/repo/raw/main/docs/guide.md") == (
+        expected
+    )
+    assert check_links._github_raw_url("https://www.github.com/owner/repo/blob/main/x.md") == (
+        "https://raw.githubusercontent.com/owner/repo/main/x.md"
+    )
+    assert check_links._github_raw_url("https://github.com/owner/repo/blob/feat/a/b/c.md") == (
+        "https://raw.githubusercontent.com/owner/repo/feat/a/b/c.md"
+    )
+    # Non-github host.
+    assert check_links._github_raw_url("https://gitlab.com/owner/repo/blob/main/x.md") is None
+    assert check_links._github_raw_url("https://example.test/owner/repo/blob/main/x.md") is None
+    # Too few path segments (nothing after the ref).
+    assert check_links._github_raw_url("https://github.com/owner/repo/blob/main") is None
+    assert check_links._github_raw_url("https://github.com/owner/repo") is None
+    # Unrecognized kind.
+    assert check_links._github_raw_url("https://github.com/owner/repo/commits/main/x.md") is None
+
+
+def test_github_html_rate_limit_is_tolerated_when_raw_is_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(check_links.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(check_links.socket, "getaddrinfo", _resolve_global)
+    seen: list[str] = []
+
+    def request(host: str, *_rest: object) -> tuple[int, str | None]:
+        seen.append(host)
+        if host == "raw.githubusercontent.com":
+            return 200, None
+        return 404, None
+
+    monkeypatch.setattr(check_links, "_request_once", request)
+    result = check_links.check_external(
+        "https://github.com/owner/repo/blob/main/docs/guide.md", 5.0, 3
+    )
+    assert result is not None
+    assert "raw.githubusercontent.com/owner/repo/main/docs/guide.md" in result
+    # The github HTML page and then its derived raw URL were probed, in exactly that order
+    # (exact list equality, not host-substring membership, keeps the host check unambiguous).
+    assert seen == ["github.com", "raw.githubusercontent.com"]
+
+
+def test_validate_and_main_tolerate_github_rate_limit_without_failing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(check_links.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(check_links.socket, "getaddrinfo", _resolve_global)
+
+    def request(host: str, *_rest: object) -> tuple[int, str | None]:
+        return (200, None) if host == "raw.githubusercontent.com" else (404, None)
+
+    monkeypatch.setattr(check_links, "_request_once", request)
+    page = tmp_path / "README.md"
+    page.write_text(
+        "[live](https://github.com/owner/repo/blob/main/docs/guide.md)\n",
+        encoding="utf-8",
+    )
+    assert check_links.main(["--repo-root", str(tmp_path), "--external", str(page)]) == 0
+    captured = capsys.readouterr()
+    assert "warning:" in captured.err
+    assert "1 tolerated" in captured.out
+
+
+def test_github_html_dead_link_fails_when_raw_is_also_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(check_links.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(check_links.socket, "getaddrinfo", _resolve_global)
+    monkeypatch.setattr(check_links, "_request_once", lambda *_args: (404, None))
+    with pytest.raises(LinkError, match="HTTP 404"):
+        check_links.check_external("https://github.com/owner/repo/blob/main/missing.md", 5.0, 3)
+
+
+def test_non_github_404_is_not_tolerated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(check_links.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(check_links.socket, "getaddrinfo", _resolve_global)
+    monkeypatch.setattr(check_links, "_request_once", lambda *_args: (404, None))
+    assert check_links._github_raw_url("https://example.test/owner/repo/blob/main/x.md") is None
+    with pytest.raises(LinkError, match="HTTP 404"):
+        check_links.check_external("https://example.test/owner/repo/blob/main/x.md", 5.0, 3)
+
+
+def test_github_raw_probe_is_not_exempt_from_the_ssrf_public_endpoint_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(check_links.time, "sleep", lambda _seconds: None)
+    resolved: list[str] = []
+
+    def getaddrinfo(host: str, port: int, *_a: object, **_k: object) -> list[object]:
+        resolved.append(host)
+        address = "127.0.0.1" if host == "raw.githubusercontent.com" else "8.8.8.8"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))]
+
+    monkeypatch.setattr(check_links.socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(check_links, "_request_once", lambda *_args: (404, None))
+    # The github page 404s, the raw probe would tolerate it, but the raw host resolves to a
+    # non-global address, so the SSRF guard rejects it and the link stays a genuine failure.
+    with pytest.raises(LinkError, match="HTTP 404"):
+        check_links.check_external("https://github.com/owner/repo/blob/main/x.md", 5.0, 3)
+    assert resolved == ["github.com", "raw.githubusercontent.com"]
