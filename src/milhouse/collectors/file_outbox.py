@@ -36,6 +36,9 @@ Three safety properties this collector upholds (the crux of the increment):
 Privacy: a rejected or malformed line's raw bytes never leave the reader; the drafts carry only the
 producer's declared, bounded frame fields (mapped through the value-safe record models), and the
 record's target is the collector's configured target, never a raw producer path or the outbox URL.
+Untrusted producer attributes are redacted by this collector before they reach a draft -- see
+:func:`_redact_attributes` for exactly which value classes are replaced and which are only
+sanitized.
 """
 
 from __future__ import annotations
@@ -297,10 +300,19 @@ def _redact_attributes(
     """Redact the free-text string values of untrusted producer attributes, preserving structure.
 
     The collector is the primary redaction authority for structured fields (the pipeline's pass does
-    not rewrite attributes). Every string value is run through the layered redactor (URLs, emails,
-    paths, and known secrets become fixed markers) and then CLAMPED to the dimension-value byte
-    bound; non-string scalars pass through unchanged. The keys are Milhouse-validated dimension
-    keys, not producer free text, so they are left as-is.
+    not rewrite attributes). Every string value is run through the layered redactor and then CLAMPED
+    to the dimension-value byte bound; non-string scalars pass through unchanged.
+
+    What the redactor actually does to each class, since the distinction matters for what reaches
+    durable storage: an email, a local filesystem path, and a known secret are REPLACED by an opaque
+    pseudonym marker, so the original value never lands. A URL is SANITIZED, not replaced -- its
+    credentials and query string are stripped, while its scheme, host, and path are PRESERVED
+    (`https://u:p@host/a?token=x` becomes `https://host/a`). That is deliberate: an observability
+    record has to say which endpoint was involved. It does mean a producer's internal host name and
+    path reach the record, and in full mode reach ClickHouse, so a producer that must not disclose
+    an internal endpoint has to omit it rather than rely on redaction to remove it.
+
+    The keys are Milhouse-validated dimension keys, not producer free text, so they are left as-is.
 
     Why the clamp is load-bearing: a producer value is bounded to ``MAX_DIMENSION_VALUE_BYTES`` at
     parse, but redaction EXPANDS a short token into a ~24-byte marker, so a value densely packed
