@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import contextlib
 import os
-from collections.abc import Iterator
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from milhouse.config.filesystem import SecureFileError, SecureFileErrorKind
 from milhouse.domain.records import (
     CollectorDescriptorV1,
     EventDataV1,
@@ -30,8 +31,10 @@ from milhouse.spooling import (
     spool_content_sha256,
     spool_frame_line,
 )
+from milhouse.spooling import commit as commit_module
 from milhouse.spooling import reconcile as reconcile_module
 from milhouse.state import (
+    ControlDatabase,
     GlobalCommitBarrier,
     StateError,
     initialize_control_state,
@@ -150,11 +153,152 @@ def _count(database, table: str = "_segments") -> int:
 # --- empty and healthy ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("level", ["pending", "day"])
+def test_reconciliation_repairs_owned_mode_subset_pending_directories(
+    tmp_path: Path, level: str
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    pending = spool_root / "pending"
+    pending.mkdir(mode=0o700)
+    os.chmod(pending, 0 if level == "pending" else 0o700)
+    day_dir = pending / _DAY
+    if level == "day":
+        day_dir.mkdir(mode=0o700)
+        os.chmod(day_dir, 0)
+    try:
+        report = reconciler.reconcile()
+        assert report.complete
+        assert report.recovery_safe
+        assert report.anomalies == ()
+        assert stat.S_IMODE(os.lstat(pending).st_mode) == 0o700
+        if level == "day":
+            assert stat.S_IMODE(os.lstat(day_dir).st_mode) == 0o700
+    finally:
+        database.close()
+
+
+def test_incomplete_inventory_only_normalizes_a_safe_pending_directory(
+    tmp_path: Path,
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    pending = spool_root / "pending"
+    day_dir = pending / _DAY
+    day_dir.mkdir(mode=0o700, parents=True)
+    os.chmod(day_dir, 0o777)
+    day_identity = (os.lstat(day_dir).st_dev, os.lstat(day_dir).st_ino)
+    pending_identity = (os.lstat(pending).st_dev, os.lstat(pending).st_ino)
+    os.chmod(pending, 0)
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.quarantined == ()
+        assert report.healthy == 0
+        assert report.anomalies == (SegmentAnomaly("", _DAY, "foreign_name", "day_unsafe"),)
+        assert stat.S_IMODE(os.lstat(pending).st_mode) == 0o700
+        assert (os.lstat(pending).st_dev, os.lstat(pending).st_ino) == pending_identity
+        assert stat.S_IMODE(os.lstat(day_dir).st_mode) == 0o777
+        assert (os.lstat(day_dir).st_dev, os.lstat(day_dir).st_ino) == day_identity
+        assert tuple(path.name for path in pending.iterdir()) == (_DAY,)
+        assert _count(database) == 0
+    finally:
+        os.chmod(day_dir, 0o700)
+        database.close()
+
+
+def test_open_private_directory_rejects_an_unvalidated_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(mode=0o700, parents=True)
+    os.chmod(parent, 0o700)
+    os.chmod(child, 0o700)
+    parent_fd = os.open(parent, reconcile_module._dir_flags())
+    try:
+        assert reconcile_module._open_or_repair_private_dir_at(parent_fd, "missing") is None
+        monkeypatch.setattr(reconcile_module, "_validated_dir_descriptor", lambda _fd: None)
+        assert reconcile_module._open_or_repair_private_dir_at(parent_fd, "child") is None
+        assert child.is_dir()
+    finally:
+        os.close(parent_fd)
+
+
+def test_nonempty_tight_writer_stage_is_never_cleanup_authority(tmp_path: Path) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    pending = spool_root / "pending"
+    day_dir = pending / _DAY
+    day_dir.mkdir(mode=0o700, parents=True)
+    os.chmod(pending, 0o700)
+    os.chmod(day_dir, 0o700)
+    stage = day_dir / f"{reconcile_module._STAGE_PREFIX}{'a' * 32}"
+    stage.write_bytes(b"preserve")
+    os.chmod(stage, 0)
+    try:
+        report = reconciler.reconcile()
+        assert stage.exists()
+        assert report.quarantined == ()
+        assert SegmentAnomaly("", _DAY, "stale_temp", "staged_temporary") in report.anomalies
+        assert SegmentAnomaly("", _DAY, "quarantine_blocked", "unsafe") in report.anomalies
+    finally:
+        os.chmod(stage, 0o600)
+        database.close()
+
+
 def test_reconciling_an_empty_spool_reports_nothing(tmp_path: Path) -> None:
     database, _store, _spool_root, reconciler = _reconciler(tmp_path)
     try:
         report = reconciler.reconcile()
-        assert report == reconcile_module.ReconciliationReport((), (), 0, 0, complete=True)
+        assert report == reconcile_module.ReconciliationReport((), (), (), 0, 0, complete=True)
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("root_state", ["missing", "symlink", "mode", "owner", "acl"])
+def test_an_untrusted_spool_root_is_never_certified_as_an_empty_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_state: str
+) -> None:
+    database, _store, spool_root, reconciler = _reconciler(tmp_path)
+    real_fstat = os.fstat
+    real_acl_check = reconcile_module.require_no_extended_acl
+    trusted_empty = tmp_path / "trusted-empty"
+    if root_state == "missing":
+        spool_root.rmdir()
+    elif root_state == "symlink":
+        spool_root.rmdir()
+        trusted_empty.mkdir(mode=0o700)
+        os.chmod(trusted_empty, 0o700)
+        spool_root.symlink_to(trusted_empty, target_is_directory=True)
+    elif root_state == "mode":
+        os.chmod(spool_root, 0o755)
+    elif root_state == "owner":
+        root_inode = os.lstat(spool_root).st_ino
+
+        def _foreign_root(descriptor: int) -> os.stat_result:
+            info = real_fstat(descriptor)
+            if info.st_ino != root_inode:
+                return info
+            fields = list(info)
+            fields[4] = os.geteuid() + 1
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(os, "fstat", _foreign_root)
+    else:
+        root_inode = os.lstat(spool_root).st_ino
+
+        def _root_acl(descriptor: int) -> None:
+            if real_fstat(descriptor).st_ino == root_inode:
+                raise SecureFileError(SecureFileErrorKind.ACCESS_CONTROL_UNSAFE)
+            real_acl_check(descriptor)
+
+        monkeypatch.setattr(reconcile_module, "require_no_extended_acl", _root_acl)
+
+    try:
+        report = reconciler.reconcile()
+        assert not report.complete
+        assert report.registered == ()
+        assert report.quarantined == ()
+        assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "spool_root_unsafe"),)
     finally:
         database.close()
 
@@ -202,7 +346,7 @@ def test_acquiring_the_writer_reconciles_orphans_before_any_commit(tmp_path: Pat
 
 
 def test_a_commit_through_a_long_lived_writer_registers_a_later_crash_orphan(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # the gate review's reproduction: writer A outlives its constructor; writer B then crashes a
     # commit after publication; a commit through A must register B's orphan BEFORE A's new row
@@ -224,19 +368,16 @@ def test_a_commit_through_a_long_lived_writer_registers_a_later_crash_orphan(
             installation_id=_INSTALLATION_ID,
         )
 
-        class _TxnFailDatabase:
-            @property
-            def path(self) -> Path:
-                return second.path
+        real_transaction = ControlDatabase.transaction
 
-            @property
-            def connection(self) -> object:
-                return second.connection
-
-            def transaction(self) -> object:
+        @contextlib.contextmanager
+        def _fail_second_transaction(self):  # type: ignore[no-untyped-def]
+            if self is second:
                 raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
+            with real_transaction(self) as connection:
+                yield connection
 
-        writer_b._database = _TxnFailDatabase()  # type: ignore[attr-defined]
+        monkeypatch.setattr(ControlDatabase, "transaction", _fail_second_transaction)
         between_header, between_frames = _segment(batch_id="between-1")
         with pytest.raises(SpoolError) as crashed:
             writer_b.commit_segment(between_header, between_frames, committed_at=_NOW)
@@ -346,7 +487,9 @@ def test_acquisition_barrier_failure_surfaces_a_spool_error(tmp_path: Path) -> N
         database.close()
 
 
-def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) -> None:
+def test_a_crashed_commit_retry_converges_after_reacquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # end-to-end convergence: crash a real commit after publication, re-acquire via the normal
     # writer API, and prove a same-batch retry is distinguishable from an unrecoverable collision
     database, barrier, spool_root = _control(tmp_path)
@@ -359,23 +502,15 @@ def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) ->
         )
         header, frames = _segment(batch_id="batch-1")
 
-        class _TxnFailDatabase:
-            # reads (the pre-commit scan) succeed; only the write-side boundary fails, exactly
-            # like a crash between publication and the ledger insert
-            @property
-            def path(self) -> Path:
-                return database.path
+        @contextlib.contextmanager
+        def _fail_transaction(_self):  # type: ignore[no-untyped-def]
+            raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
+            yield  # pragma: no cover - contextmanager requires a generator
 
-            @property
-            def connection(self) -> object:
-                return database.connection
-
-            def transaction(self) -> object:
-                raise StateError("MH_STATE_TXN", "planted transaction-boundary failure")
-
-        store._database = _TxnFailDatabase()  # type: ignore[attr-defined]
-        with pytest.raises(SpoolError) as crashed:
-            store.commit_segment(header, frames, committed_at=_NOW)
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ControlDatabase, "transaction", _fail_transaction)
+            with pytest.raises(SpoolError) as crashed:
+                store.commit_segment(header, frames, committed_at=_NOW)
         assert crashed.value.code == "MH_SPOOL_COMMIT"  # published durably, no ledger row
         assert _count(database) == 0
 
@@ -399,46 +534,59 @@ def test_a_crashed_commit_retry_converges_after_reacquisition(tmp_path: Path) ->
         database.close()
 
 
-def test_the_no_gap_lock_protocol_holds_exclusive_across_reconcile_and_commit(
-    tmp_path: Path,
+def test_the_no_gap_protocol_hands_exclusive_recovery_to_shared_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # pin the no-gap protocol: acquisition reconciles under ONE exclusive hold, and every commit
-    # runs reconcile+publish+insert under ONE exclusive hold — never a shared publish, never an
-    # unlock window between reconciliation and publication
-    database, _barrier, spool_root = _control(tmp_path)
+    # Pin the plan-preserving no-gap protocol: writer acquisition reconciles exclusively; every
+    # commit then reconciles exclusively and converts that same main descriptor to shared before
+    # publication, while the gate prevents a cooperating writer from entering during the handoff.
+    database, barrier, spool_root = _control(tmp_path)
     calls: list[str] = []
-    held_through_publish: list[bool] = []
-    pending = spool_root / "pending"
+    real_exclusive = GlobalCommitBarrier.exclusive
+    real_handoff = GlobalCommitBarrier.exclusive_then_shared
+    real_publish = commit_module.publish_segment_bytes
 
-    class _SpyBarrier(GlobalCommitBarrier):
-        @contextlib.contextmanager
-        def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
-            calls.append("exclusive")
-            before = pending.exists()
-            with super().exclusive(blocking=blocking) as hold:
-                yield hold
-            # if publication happened during THIS single hold, pending appears while it was held
-            held_through_publish.append(not before and pending.exists())
+    @contextlib.contextmanager
+    def _spy_exclusive(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        calls.append("constructor_exclusive")
+        with real_exclusive(self, blocking=blocking):
+            yield
 
-        @contextlib.contextmanager
-        def shared(self, *, blocking: bool = True) -> Iterator[None]:
-            calls.append("shared")
-            with super().shared(blocking=blocking):
-                yield
+    @contextlib.contextmanager
+    def _spy_handoff(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        with real_handoff(self, blocking=blocking) as transition:
+            calls.append("writer_exclusive")
+
+            def _recording_transition() -> None:
+                transition()
+                calls.append("writer_shared")
+
+            yield _recording_transition
+
+    def _spy_publish(path: Path, content: bytes) -> None:
+        calls.append("publish")
+        real_publish(path, content)
+
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive", _spy_exclusive)
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive_then_shared", _spy_handoff)
+    monkeypatch.setattr(commit_module, "publish_segment_bytes", _spy_publish)
 
     try:
         store = DurableSpool(
             database=database,
-            barrier=_SpyBarrier(tmp_path / "control" / "commit.lock"),
+            barrier=barrier,
             spool_root=spool_root,
             installation_id=_INSTALLATION_ID,
         )
-        assert calls == ["exclusive"]
+        assert calls == ["constructor_exclusive"]
         header, frames = _segment()
         store.commit_segment(header, frames, committed_at=_NOW)
-        # exactly one more exclusive hold covered the whole reconcile+publish+insert; no shared use
-        assert calls == ["exclusive", "exclusive"]
-        assert held_through_publish == [False, True]
+        assert calls == [
+            "constructor_exclusive",
+            "writer_exclusive",
+            "writer_shared",
+            "publish",
+        ]
     finally:
         database.close()
 
@@ -490,26 +638,58 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
     # the next reconciliation registers). The raw mutating scan is NOT exported: a barrier-less
     # reconciliation entrypoint was the re-review's P1 bypass. Widening this surface is a
     # deliberate, reviewed change.
+    # The slice-4 delivery surface (deliver_segment, replay_segments) mutates ONLY the delivery-side
+    # checkpoint (_segment_exporters.delivery_status), never a segment row or reconciliation state,
+    # and only under the shared barrier over segments already committed (hence already reconciled).
+    # It therefore cannot bypass mandatory reconciliation. Exporter/ExporterAttempt/ReplayReport are
+    # inert protocol/value types.
+    # The slice-5a audit surface (verify_spool) is strictly READ-ONLY: it opens durable files and
+    # reads ledger rows to report integrity, mutating nothing and holding no barrier.
+    # SegmentVerification/VerifyReport are inert value types.
+    # The slice-5b retention_preview is strictly READ-ONLY: it reads each committed segment's frames
+    # and ledger row to classify record-class expiry and report reclaimable counts/bytes, mutating
+    # nothing and holding no barrier. retention_apply DOES delete fully-expired segment rows, but it
+    # is a declared MAINTENANCE operation on the EXCLUSIVE side (the same authority backup,
+    # migration, and reconciliation take): it validates the barrier is the control-plane commit lock
+    # and acquires barrier.exclusive() itself before any deletion, gated on a confirm token, and
+    # records an audit row per prune. It therefore does not bypass the barrier discipline — it IS
+    # that discipline applied to retention.
+    # RetentionPreview/RetentionResult/SegmentRetention/PrunedSegment are inert value types.
     assert set(spooling.__all__) == {
         "DurableSpool",
+        "Exporter",
+        "ExporterAttempt",
         "ExporterDelivery",
         "OrphanRegistration",
         "ParsedSegment",
+        "PrunedSegment",
+        "QuarantinedFile",
         "ReconciliationReport",
+        "ReplayReport",
+        "RetentionPreview",
+        "RetentionResult",
         "SegmentAnomaly",
         "SegmentHeaderV1",
         "SegmentRecord",
+        "SegmentRetention",
+        "SegmentVerification",
         "SpoolError",
         "SpoolFrameV1",
         "SpoolReconciler",
+        "VerifyReport",
         "build_segment_bytes",
+        "deliver_segment",
         "parse_segment_bytes",
         "publish_segment_bytes",
         "read_trusted_segment",
         "read_untrusted_segment",
+        "replay_segments",
+        "retention_apply",
+        "retention_preview",
         "spool_content_sha256",
         "spool_frame_line",
         "spool_segment_header_line",
+        "verify_spool",
         "write_spool_segment",
     }
     assert "insert_segment_row" not in spooling.__all__
@@ -522,25 +702,24 @@ def test_the_package_export_surface_cannot_bypass_mandatory_reconciliation() -> 
 def test_every_reconciliation_entrypoint_holds_exclusive_before_mutating(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # spy on the scan body itself: whenever any supported entrypoint reaches it, the exclusive
-    # barrier must already be held (a probe acquisition from a second descriptor fails BUSY) and the
-    # authority token passed to it must be live
+    # Spy on the first ledger read: every supported entrypoint must already be inside the scan's
+    # lexical exclusive context, so a probe acquisition from another descriptor fails BUSY.
     database, barrier, spool_root = _control(tmp_path)
     probe = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")
-    real_run = reconcile_module._Scan.run
-    held_checks: list[tuple[bool, bool]] = []
+    real_ledger_index = reconcile_module._Scan._ledger_index
+    held_checks: list[bool] = []
 
-    def _asserting_run(self, authority):  # type: ignore[no-untyped-def]
+    def _asserting_ledger_index(self):  # type: ignore[no-untyped-def]
         blocked = False
         try:
             with probe.exclusive(blocking=False):
                 pass
         except StateError:
             blocked = True
-        held_checks.append((blocked, bool(getattr(authority, "active", False))))
-        return real_run(self, authority)
+        held_checks.append(blocked)
+        return real_ledger_index(self)
 
-    monkeypatch.setattr(reconcile_module._Scan, "run", _asserting_run)
+    monkeypatch.setattr(reconcile_module._Scan, "_ledger_index", _asserting_ledger_index)
     try:
         store = DurableSpool(  # entrypoint 1: writer acquisition
             database=database,
@@ -557,38 +736,37 @@ def test_every_reconciliation_entrypoint_holds_exclusive_before_mutating(
             installation_id=_INSTALLATION_ID,
         )
         reconciler.reconcile()  # entrypoint 3: the explicit startup pass
-        # exclusive was held and the authority token live at every scan invocation
-        assert held_checks == [(True, True), (True, True), (True, True)]
+        assert held_checks == [True, True, True]
     finally:
         database.close()
 
 
 def test_a_direct_unheld_scan_call_fails_before_any_mutation(tmp_path: Path) -> None:
-    # the re-review's reproduction: the raw scan body must be impossible to run without owning
-    # barrier authority — a direct internal call with no live hold fails before touching the ledger
-    from milhouse.state.barrier import ExclusiveHold
-
-    database, barrier, spool_root = _control(tmp_path)
+    database, _barrier, spool_root = _control(tmp_path)
     header, frames = _segment(batch_id="orphan-1")
     _publish_orphan(spool_root, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames))
     try:
         assert not hasattr(reconcile_module, "_run_reconciliation_scan")  # the old bypass is gone
         own_lock = tmp_path / "control" / "commit.lock"
-        for bogus_authority in (None, object(), ExclusiveHold(own_lock)):  # absent/foreign/inactive
+
+        class ForgedBarrier(GlobalCommitBarrier):
+            pass
+
+        for bogus_authority in (
+            None,
+            object(),
+            ForgedBarrier(own_lock),
+        ):
             scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
             with pytest.raises(SpoolError) as captured:
                 scan.run(bogus_authority)  # type: ignore[arg-type]
             assert captured.value.code == "MH_SPOOL_BARRIER"
-        # a STALE token captured from a completed hold is inactive and equally refused
-        with barrier.exclusive() as hold:
-            pass
-        assert not hold.active
-        with pytest.raises(SpoolError) as stale:
-            reconcile_module._Scan(database, spool_root, _INSTALLATION_ID).run(hold)
-        assert stale.value.code == "MH_SPOOL_BARRIER"
-        # nothing mutated: the orphan remains unregistered and both tables are unchanged
+        # nothing mutated: the orphan remains unregistered, both tables are unchanged, and the
+        # filesystem is untouched (no quarantine directory was ever created)
         assert _count(database) == 0
         assert _count(database, "_segment_exporters") == 0
+        assert (spool_root / "pending" / _DAY / "orphan-1.jsonl").exists()
+        assert not (spool_root / "quarantine").exists()
     finally:
         database.close()
 
@@ -614,12 +792,10 @@ def test_exclusive_authority_is_bound_to_the_state_root(tmp_path: Path) -> None:
         assert mismatched.value.code == "MH_SPOOL_STORE"
         assert _count(database_a) == 0
 
-        # (2) a direct A scan with B's LIVE token fails the identity check before mutation
-        with barrier_b.exclusive() as foreign_live_hold:
-            assert foreign_live_hold.active
-            with pytest.raises(SpoolError) as foreign:
-                reconcile_module._Scan(database_a, spool_a, _INSTALLATION_ID).run(foreign_live_hold)
-            assert foreign.value.code == "MH_SPOOL_BARRIER"
+        # (2) a direct A scan with B's barrier fails binding before acquisition or mutation
+        with pytest.raises(SpoolError) as foreign:
+            reconcile_module._Scan(database_a, spool_a, _INSTALLATION_ID).run(barrier_b)
+        assert foreign.value.code == "MH_SPOOL_BARRIER"
         assert _count(database_a) == 0
         assert _count(database_a, "_segment_exporters") == 0
 
@@ -637,18 +813,115 @@ def test_exclusive_authority_is_bound_to_the_state_root(tmp_path: Path) -> None:
         database_b.close()
 
 
-def test_a_token_cannot_be_activated_by_attribute_assignment(tmp_path: Path) -> None:
-    from milhouse.state.barrier import ExclusiveHold
+def test_a_barrier_with_a_displaced_gate_is_not_authority_for_the_main_lock(
+    tmp_path: Path,
+) -> None:
+    database, _barrier, spool_root = _control(tmp_path)
+    tampered = GlobalCommitBarrier(tmp_path / "control" / "commit.lock")
+    object.__setattr__(tampered, "_gate_path", tmp_path / "foreign" / "commit.lock.gate")
+    try:
+        with pytest.raises(SpoolError) as public_error:
+            SpoolReconciler(
+                database=database,
+                barrier=tampered,
+                spool_root=spool_root,
+                installation_id=_INSTALLATION_ID,
+            )
+        assert public_error.value.code == "MH_SPOOL_STORE"
 
-    hold = ExclusiveHold(tmp_path / "control" / "commit.lock")
-    assert not hold.active
-    with pytest.raises(AttributeError):
-        hold._active = True  # type: ignore[attr-defined]
-    with pytest.raises(AttributeError):
-        hold.__active = True  # type: ignore[attr-defined]
-    with pytest.raises(AttributeError):
-        hold.active = True  # type: ignore[misc]
-    assert not hold.active  # the trust decision is not a publicly writable bit
+        with pytest.raises(SpoolError) as direct_error:
+            reconcile_module._Scan(database, spool_root, _INSTALLATION_ID).run(tampered)
+        assert direct_error.value.code == "MH_SPOOL_BARRIER"
+        assert not (spool_root / "pending").exists()
+        assert not (spool_root / "quarantine").exists()
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_a_direct_scan_rejects_a_foreign_spool_before_any_mutation(tmp_path: Path) -> None:
+    (tmp_path / "rootA").mkdir()
+    (tmp_path / "foreign").mkdir()
+    database, barrier, _spool_a = _control(tmp_path / "rootA")
+    foreign_spool = tmp_path / "foreign" / "spool"
+    foreign_spool.mkdir(mode=0o700)
+    os.chmod(foreign_spool, 0o700)
+    header, frames = _segment(batch_id="orphan-1")
+    source = _publish_orphan(
+        foreign_spool, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames)
+    )
+    try:
+        with pytest.raises(SpoolError) as captured:
+            reconcile_module._Scan(database, foreign_spool, _INSTALLATION_ID).run(barrier)
+        assert captured.value.code == "MH_SPOOL_BARRIER"
+        assert source.exists()
+        assert _count(database) == 0
+        assert not (foreign_spool / "quarantine").exists()
+    finally:
+        database.close()
+
+
+def test_a_direct_scan_uses_the_validated_path_not_a_symlink_dotdot_spelling(
+    tmp_path: Path,
+) -> None:
+    database, barrier, spool_root = _control(tmp_path)
+    foreign = tmp_path / "foreign"
+    foreign_child = foreign / "child"
+    foreign_child.mkdir(parents=True, mode=0o700)
+    os.chmod(foreign, 0o700)
+    os.chmod(foreign_child, 0o700)
+    (spool_root / "alias").symlink_to(foreign_child, target_is_directory=True)
+    raw_spool = spool_root / "alias" / ".."
+    source = _publish_orphan(
+        foreign,
+        _DAY,
+        f"{reconcile_module._STAGE_PREFIX}foreign.jsonl",
+        b"classified-canary\n",
+    )
+    try:
+        report = reconcile_module._Scan(database, raw_spool, _INSTALLATION_ID).run(barrier)
+        assert report.complete
+        assert report.quarantined == ()
+        assert report.anomalies == ()
+        assert source.read_bytes() == b"classified-canary\n"
+        assert not (foreign / "quarantine").exists()
+        assert _count(database) == 0
+    finally:
+        database.close()
+
+
+def test_a_control_database_label_cannot_spoof_its_live_sqlite_binding(tmp_path: Path) -> None:
+    (tmp_path / "rootA").mkdir()
+    (tmp_path / "rootB").mkdir()
+    database_a, barrier_a, spool_a = _control(tmp_path / "rootA")
+    database_b, _barrier_b, _spool_b = _control(tmp_path / "rootB")
+    spoof = ControlDatabase(
+        connection=database_b.connection,
+        path=database_a.path,
+        created=False,
+    )
+    header, frames = _segment(batch_id="orphan-1")
+    source = _publish_orphan(spool_a, _DAY, "orphan-1.jsonl", build_segment_bytes(header, frames))
+    try:
+        with pytest.raises(SpoolError) as public_error:
+            SpoolReconciler(
+                database=spoof,
+                barrier=barrier_a,
+                spool_root=spool_a,
+                installation_id=_INSTALLATION_ID,
+            )
+        assert public_error.value.code == "MH_SPOOL_STORE"
+
+        with pytest.raises(SpoolError) as direct_error:
+            reconcile_module._Scan(spoof, spool_a, _INSTALLATION_ID).run(barrier_a)
+        assert direct_error.value.code == "MH_SPOOL_BARRIER"
+        assert _count(database_a) == 0
+        assert _count(database_b) == 0
+        assert source.exists()
+        assert not (spool_a / "quarantine").exists()
+    finally:
+        database_a.close()
+        database_b.close()
 
 
 def test_the_anomaly_cap_stops_directory_enumeration(
@@ -664,20 +937,20 @@ def test_the_anomaly_cap_stops_directory_enumeration(
         (pending / junk).mkdir(mode=0o700)
     header, frames = _segment(batch_id="batch-1")
     _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
-    opened: list[Path] = []
-    real_names = reconcile_module._secure_dir_names
+    opened: list[int] = []
+    real_names = reconcile_module._secure_names_from_descriptor
 
-    def _recording_names(path: Path):  # type: ignore[no-untyped-def]
-        opened.append(path)
-        return real_names(path)
+    def _recording_names(descriptor: int):
+        opened.append(os.fstat(descriptor).st_ino)
+        return real_names(descriptor)
 
-    monkeypatch.setattr(reconcile_module, "_secure_dir_names", _recording_names)
+    monkeypatch.setattr(reconcile_module, "_secure_names_from_descriptor", _recording_names)
     try:
         report = reconciler.reconcile()
         assert not report.complete
         assert report.registered == ()
         assert report.scanned == 0  # no entry was ever classified
-        assert opened == [pending]  # the valid day directory was never opened
+        assert opened == [os.lstat(pending).st_ino]  # the valid day directory was never opened
         assert _count(database) == 0
     finally:
         database.close()
@@ -1353,7 +1626,18 @@ def test_a_foreign_owned_pending_directory_is_reported_unsafe(
     pending.mkdir(mode=0o700)
     os.chmod(pending, 0o700)
     real_uid = os.geteuid()
-    monkeypatch.setattr(reconcile_module, "_current_uid", lambda: real_uid + 1)
+    pending_inode = os.lstat(pending).st_ino
+    real_fstat = os.fstat
+
+    def _foreign_pending(descriptor: int) -> os.stat_result:
+        info = real_fstat(descriptor)
+        if info.st_ino != pending_inode:
+            return info
+        fields = list(info)
+        fields[4] = real_uid + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", _foreign_pending)
     try:
         report = reconciler.reconcile()
         assert report.anomalies == (SegmentAnomaly("", "", "foreign_name", "pending_unsafe"),)
@@ -1374,15 +1658,18 @@ def test_a_foreign_owned_day_directory_is_reported_unsafe(
     day_dir.mkdir(mode=0o700)
     os.chmod(day_dir, 0o700)
     real_uid = os.geteuid()
-    real_current_uid = reconcile_module._current_uid
-    calls: list[int] = []
+    day_inode = os.lstat(day_dir).st_ino
+    real_fstat = os.fstat
 
-    def _foreign_after_pending() -> int:
-        calls.append(1)
-        # the pending check passes with the real uid; the day check then sees a foreign owner
-        return real_current_uid() if len(calls) == 1 else real_uid + 1
+    def _foreign_day(descriptor: int) -> os.stat_result:
+        info = real_fstat(descriptor)
+        if info.st_ino != day_inode:
+            return info
+        fields = list(info)
+        fields[4] = real_uid + 1  # st_uid in the portable ten-field stat_result sequence
+        return os.stat_result(fields)
 
-    monkeypatch.setattr(reconcile_module, "_current_uid", _foreign_after_pending)
+    monkeypatch.setattr(os, "fstat", _foreign_day)
     try:
         report = reconciler.reconcile()
         assert SegmentAnomaly("", _DAY, "foreign_name", "day_unsafe") in report.anomalies
@@ -1781,6 +2068,7 @@ def test_the_reconciler_rejects_a_bad_binding_or_installation(tmp_path: Path) ->
                 "MH_SPOOL_STORE",
             ),
             ({"spool_root": tmp_path / "elsewhere"}, "MH_SPOOL_STORE"),
+            ({"spool_root": object()}, "MH_SPOOL_STORE"),
             ({"installation_id": "bad"}, "MH_SPOOL_IDENTITY"),
         ):
             base = {
@@ -1797,21 +2085,39 @@ def test_the_reconciler_rejects_a_bad_binding_or_installation(tmp_path: Path) ->
         database.close()
 
 
-def test_reconciliation_happens_inside_the_exclusive_barrier(tmp_path: Path) -> None:
+def test_a_direct_scan_normalizes_an_invalid_spool_root_before_mutation(tmp_path: Path) -> None:
+    database, barrier, _spool_root = _control(tmp_path)
+    try:
+        scan = reconcile_module._Scan(
+            database,
+            object(),  # type: ignore[arg-type]
+            _INSTALLATION_ID,
+        )
+        with pytest.raises(SpoolError) as captured:
+            scan.run(barrier)
+        assert captured.value.code == "MH_SPOOL_BARRIER"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+    finally:
+        database.close()
+
+
+def test_reconciliation_happens_inside_the_exclusive_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     database, _store, spool_root, reconciler = _reconciler(tmp_path)
     header, frames = _segment()
     _publish_orphan(spool_root, _DAY, "batch-1.jsonl", build_segment_bytes(header, frames))
 
-    class _AssertingBarrier(GlobalCommitBarrier):
-        @contextlib.contextmanager
-        def exclusive(self, *, blocking: bool = True) -> Iterator[object]:
-            assert _count(database) == 0  # not yet registered when the exclusive lock is taken
-            with super().exclusive(blocking=blocking) as hold:
-                yield hold
+    real_exclusive = GlobalCommitBarrier.exclusive
 
-    reconciler._barrier = _AssertingBarrier(  # type: ignore[attr-defined]
-        tmp_path / "control" / "commit.lock"
-    )
+    @contextlib.contextmanager
+    def _asserting_exclusive(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        assert _count(database) == 0  # not yet registered when the exclusive lock is taken
+        with real_exclusive(self, blocking=blocking):
+            yield
+
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive", _asserting_exclusive)
     try:
         assert len(reconciler.reconcile().registered) == 1
         assert _count(database) == 1
@@ -1832,6 +2138,63 @@ def test_a_barrier_acquisition_failure_surfaces_a_spool_error(tmp_path: Path) ->
         assert captured.value.__context__ is None
     finally:
         os.chmod(tmp_path / "control" / "commit.lock", 0o600)
+        database.close()
+
+
+@pytest.mark.parametrize("callback_name", ["observe", "action"])
+def test_a_callback_state_error_is_not_mislabeled_as_barrier_failure(
+    tmp_path: Path, callback_name: str
+) -> None:
+    database, barrier, spool_root = _control(tmp_path)
+
+    def _fail(*_args: object) -> None:
+        raise StateError("MH_STATE_TXN", "planted callback failure")
+
+    try:
+        scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
+        with pytest.raises(StateError) as captured:
+            scan.run(barrier, **{callback_name: _fail})
+        assert captured.value.code == "MH_STATE_TXN"
+        # The failed callback unwound the context and released both lock files.
+        with barrier.exclusive(blocking=False):
+            pass
+    finally:
+        database.close()
+
+
+def test_a_writer_phase_transition_failure_is_normalized_before_the_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, barrier, spool_root = _control(tmp_path)
+    real_handoff = GlobalCommitBarrier.exclusive_then_shared
+    action_called = False
+
+    @contextlib.contextmanager
+    def _failing_handoff(self, *, blocking: bool = True):  # type: ignore[no-untyped-def]
+        with real_handoff(self, blocking=blocking):
+
+            def _fail_transition() -> None:
+                raise StateError("MH_STATE_BARRIER", "planted phase-transition failure")
+
+            yield _fail_transition
+
+    def _action() -> None:
+        nonlocal action_called
+        action_called = True
+
+    monkeypatch.setattr(GlobalCommitBarrier, "exclusive_then_shared", _failing_handoff)
+    try:
+        scan = reconcile_module._Scan(database, spool_root, _INSTALLATION_ID)
+        with pytest.raises(SpoolError) as captured:
+            scan.run(barrier, action=_action)
+        assert captured.value.code == "MH_SPOOL_BARRIER"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+        assert not action_called
+        # The failed transition unwound the context and released both descriptors.
+        with barrier.exclusive(blocking=False):
+            pass
+    finally:
         database.close()
 
 

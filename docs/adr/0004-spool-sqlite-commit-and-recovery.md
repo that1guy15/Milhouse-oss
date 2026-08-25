@@ -23,11 +23,37 @@ A durable commit is deliberately reconciled across the filesystem and SQLite:
 
 All durable writers take the shared global commit barrier; backup, restore, migration, and declared maintenance take the exclusive side. Startup and writer acquisition register valid orphan segments, report a ledger row with a missing segment as unhealthy corruption, and recover or quarantine stale temporary artifacts. Derived records use the same spool protocol and idempotent per-rule/version checkpoints before projections advance.
 
-Delivery is physically at least once and logically effectively once through deterministic IDs, conflict detection, destination confirmation, and checkpoints. Pending records remain retryable until delivered or their hard privacy expiry. Delivered records remain in the redacted spool until each record's class expiry. Audited restartable compaction removes only expired frames. Full mode never prunes the last recoverable unexpired copy.
+Delivery is physically at least once and logically effectively once through deterministic IDs, conflict detection, destination confirmation, and checkpoints. Pending records remain retryable until delivered or their hard privacy expiry. Delivered records remain in the redacted spool until each record's class expiry. Audited restartable compaction — which removes only expired frames from a mixed-expiry segment — is deferred out of W03 by amendment A09; until it lands a mixed-expiry segment is withheld from egress and never pruned, so no expired record leaks and no unexpired record is lost. Full mode never prunes the last recoverable unexpired copy.
 
 ## Consequences
 
 No writer bypasses the runtime pipeline or writes directly to projections/destinations. Crash tests cover every commit, cursor, derivation, export, confirmation, and checkpoint boundary. Backup snapshots use the global barrier and a segment watermark; target purge uses exclusive fences.
+
+## Amendment A06: installation-account filesystem-containment boundary (2026-07-28)
+
+Owner-approved plan amendment A06 scopes threat-model security objective 4 to the attacker model
+that Milhouse can enforce on its supported POSIX hosts. Filesystem code must prevent writes or
+unlinks outside approved roots caused by untrusted input, traversal, symlinks, other local users, or
+cooperating Milhouse processes. Quarantine and reconciliation must bind mutation to validated live
+directory chains and exact pass-owned objects, use recoverable fsynced source retirement, preserve
+validated recovery copies when namespace state becomes uncertain, and report detected displacement
+as uncertain rather than successful.
+
+POSIX provides no operation that atomically proves an ancestor pathname still names an opened
+directory and then performs a later descriptor-relative mutation. A hostile process already running
+as the Milhouse operating-system account can rename an ancestor in that adjacent syscall window and
+displace the mutation outside the approved root's current pathname. The residual applies to both
+quarantine publication and pending-source retirement. The Milhouse operating-system account and the
+host administrator are therefore trusted for filesystem containment; hostile same-UID containment
+is not claimed. Operators should run Milhouse under a dedicated service account and run no untrusted
+code under that identity.
+
+This amendment narrows the literal attacker model previously implied by objective 4. It retains the
+traversal, symlink, different-user, cooperating-writer, namespace-displacement, and retry acceptance
+tests, and it does not change any wire byte, stored schema, retention rule, egress surface, product
+scope, or release gate. ADR 0008 already treats explicitly installed in-process plugins as trusted
+code running with the Milhouse user's authority; A06 makes the corresponding filesystem trust
+boundary explicit without treating plugin manifests as containment.
 
 ## Plan references
 

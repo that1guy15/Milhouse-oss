@@ -11,6 +11,7 @@ import re
 import socket
 import ssl
 import sys
+import time
 import urllib.parse
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -32,6 +33,11 @@ SKIP_PARTS = {
     "dist",
     "site",
 }
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_BASE = 0.5
+GITHUB_HTML_HOSTS = frozenset({"github.com", "www.github.com"})
+GITHUB_RAW_KINDS = frozenset({"blob", "tree", "raw"})
 
 
 class LinkError(ValueError):
@@ -260,7 +266,74 @@ def _request_once(
     raise LinkError("external URL connection failed") from last_error
 
 
-def check_external(url: str, timeout: float, redirects: int) -> None:
+def _request_with_retry(
+    host: str,
+    port: int,
+    scheme: str,
+    target: str,
+    endpoints: Sequence[PublicEndpoint],
+    method: str,
+    timeout: float,
+) -> tuple[int, str | None]:
+    """Issue one hop's request, retrying transient failures a bounded number of times.
+
+    Retries a connection failure (``LinkError`` from ``_request_once``) or a retryable
+    status with short linear backoff. On the final attempt the outcome is returned or the
+    ``LinkError`` re-raised, so the caller still sees a retryable status and decides its fate.
+    """
+
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        final = attempt >= RETRY_ATTEMPTS
+        try:
+            status, location = _request_once(host, port, scheme, target, endpoints, method, timeout)
+        except LinkError:
+            if final:
+                raise
+            time.sleep(RETRY_BACKOFF_BASE * attempt)
+            continue
+        if status in RETRYABLE_STATUSES and not final:
+            time.sleep(RETRY_BACKOFF_BASE * attempt)
+            continue
+        return status, location
+    raise LinkError("external URL connection failed")  # pragma: no cover - loop always exits
+
+
+def _github_raw_url(url: str) -> str | None:
+    """Map a github.com blob/tree/raw HTML URL to its raw.githubusercontent.com equivalent.
+
+    Returns ``None`` for any other host, a path with too few segments, or an unrecognized kind.
+    """
+
+    parsed = urllib.parse.urlsplit(url)
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in GITHUB_HTML_HOSTS:
+        return None
+    parts = [segment for segment in parsed.path.split("/") if segment]
+    if len(parts) < 5:
+        return None
+    owner, repo, kind, ref, *rest = parts
+    if kind not in GITHUB_RAW_KINDS:
+        return None
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{'/'.join(rest)}"
+
+
+def _github_raw_reachable(raw_url: str, timeout: float, redirects: int) -> bool:
+    """Probe a derived raw URL through the same guarded machinery; True when it is live.
+
+    Reuses ``check_external`` with tolerance disabled so the SSRF public-endpoint guard still
+    applies to the raw host and the github tolerance branch cannot re-enter (no recursion).
+    """
+
+    try:
+        check_external(raw_url, timeout, redirects, tolerate=False)
+    except LinkError:
+        return False
+    return True
+
+
+def check_external(
+    url: str, timeout: float, redirects: int, *, tolerate: bool = True
+) -> str | None:
     current = url
     for _attempt in range(redirects + 1):
         parsed = urllib.parse.urlsplit(current)
@@ -274,7 +347,7 @@ def check_external(url: str, timeout: float, redirects: int) -> None:
             raise LinkError(f"external URL has an invalid port: {url!r}") from exc
         endpoints = _public_endpoints(parsed.hostname, port)
         target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
-        status, location = _request_once(
+        status, location = _request_with_retry(
             parsed.hostname,
             port,
             parsed.scheme,
@@ -289,9 +362,9 @@ def check_external(url: str, timeout: float, redirects: int) -> None:
             current = urllib.parse.urljoin(current, location)
             continue
         if 200 <= status < 300:
-            return
+            return None
         if status in {403, 405, 501}:
-            fallback_status, _fallback_location = _request_once(
+            status, location = _request_with_retry(
                 parsed.hostname,
                 port,
                 parsed.scheme,
@@ -300,9 +373,14 @@ def check_external(url: str, timeout: float, redirects: int) -> None:
                 "GET",
                 timeout,
             )
-            if 200 <= fallback_status < 300:
-                return
-            raise LinkError(f"external URL returned HTTP {fallback_status}: {url!r}")
+            if 200 <= status < 300:
+                return None
+        if tolerate and status in {404, 429}:
+            raw_url = _github_raw_url(current)
+            if raw_url is not None and _github_raw_reachable(raw_url, timeout, redirects):
+                return (
+                    f"github.com returned HTTP {status} but the file is live via {raw_url}: {url!r}"
+                )
         raise LinkError(f"external URL returned HTTP {status}: {url!r}")
     raise LinkError(f"external URL exceeded {redirects} redirect(s): {url!r}")
 
@@ -314,7 +392,7 @@ def validate(
     limit: int,
     timeout: float,
     redirects: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     cache: dict[Path, set[str]] = {}
     external_urls: set[str] = set()
     checked = 0
@@ -354,12 +432,16 @@ def validate(
                 fragment = urllib.parse.unquote(parsed.fragment)
                 if fragment not in available:
                     raise LinkError(f"{source}:{line}: missing anchor #{fragment}")
+    warnings = 0
     if external:
         if len(external_urls) > limit:
             raise LinkError(f"external link count {len(external_urls)} exceeds bound {limit}")
         for url in sorted(external_urls):
-            check_external(url, timeout, redirects)
-    return checked, len(external_urls) if external else 0
+            warning = check_external(url, timeout, redirects)
+            if warning is not None:
+                print(f"warning: {warning}", file=sys.stderr)
+                warnings += 1
+    return checked, (len(external_urls) if external else 0), warnings
 
 
 def parse_args(arguments: Sequence[str]) -> argparse.Namespace:
@@ -380,12 +462,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         root = args.repo_root.resolve(strict=True)
         files = markdown_files(args.paths)
-        links, external = validate(
+        links, external, tolerated = validate(
             files, root, args.external, args.max_external, args.timeout, args.max_redirects
         )
     except (LinkError, OSError) as exc:
         fail(str(exc))
-    print(f"links: {len(files)} file(s), {links} link(s), {external} external probe(s) passed")
+    print(
+        f"links: {len(files)} file(s), {links} link(s), "
+        f"{external} external probe(s) passed, {tolerated} tolerated"
+    )
     return 0
 
 

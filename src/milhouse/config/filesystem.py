@@ -37,6 +37,7 @@ class SecureFileErrorKind(StrEnum):
 
 _STAGED_FILE_PREFIX = ".milhouse-stage-"
 _STAGED_FILE_ATTEMPTS = 16
+_PRIVATE_FILE_MODE = 0o600
 _MACOS_ACL_TYPE_EXTENDED = 0x00000100
 _LINUX_ACL_XATTR_NAMES = (
     b"system.posix_acl_access",
@@ -329,6 +330,18 @@ def _require_no_extended_acl(descriptor: int) -> None:
 
     if _descriptor_has_extended_acl(descriptor):
         raise SecureFileError(SecureFileErrorKind.ACCESS_CONTROL_UNSAFE)
+
+
+def require_no_extended_acl(descriptor: int) -> None:
+    """Fail closed when an opened descriptor's mode bits are supplemented by an extended ACL.
+
+    Public so directory-securing callers (the spool writer and reconciliation enumerator) enforce
+    the same access-control envelope as the secure file primitives, instead of trusting mode bits
+    alone. Raises :class:`SecureFileError` with ``ACCESS_CONTROL_UNSAFE`` (or
+    ``SECURITY_UNSUPPORTED`` on hosts without an ACL probe).
+    """
+
+    _require_no_extended_acl(descriptor)
 
 
 def _require_private_parent(descriptor: int, metadata: os.stat_result) -> None:
@@ -783,6 +796,105 @@ def inspect_regular_file_no_follow(
     return opened.selection
 
 
+def remove_regular_file_no_follow(
+    path: str | Path,
+    *,
+    expected_identity: FileIdentity | None = None,
+) -> None:
+    """Securely unlink one regular file relative to its no-follow-opened private parent, then fsync.
+
+    The parent directory chain is opened no-follow, so no symlinked ancestor can redirect it, and
+    the parent is required to be an owned, ACL-free ``0700`` directory. The leaf is OPENED no-follow
+    (never a symlink) relative to the parent descriptor and validated from that descriptor: it must
+    be an owner-only, exact ``0600``, single-link, ACL-free regular file, and — when
+    ``expected_identity`` is supplied — the exact ``(device, inode)``, so a file outside the
+    certified envelope or swapped in since the caller selected it is refused rather than unlinked.
+    The name is then unlinked relative to the parent descriptor and the parent is fsynced so the
+    removal is durable across a crash.
+
+    The result is effectively tri-state via the raised kind: a pre-unlink failure means the file is
+    still present (the caller may treat it as a lingering orphan), while an fsync failure AFTER a
+    successful unlink raises ``COMMIT_UNCERTAIN`` — the entry is gone but its removal may not
+    survive a crash, so the caller re-inspects/reconciles rather than asserting an orphan.
+
+    POSIX cannot atomically bind the descriptor validation to the subsequent unlink-by-name; that
+    one-syscall residual window is excluded for cooperating writers by the exclusive maintenance
+    barrier and, for a hostile same-account process, by the installation-account trust boundary
+    (ADR 0008 / amendment A06). Every failure raises a fixed :class:`SecureFileError` carrying no
+    path or OS detail.
+    """
+
+    normalized = lexical_absolute_path(path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow == 0:
+        raise SecureFileError(SecureFileErrorKind.SECURITY_UNSUPPORTED)
+    effective_user_id = getattr(os, "geteuid", None)
+    if effective_user_id is None:
+        raise SecureFileError(SecureFileErrorKind.SECURITY_UNSUPPORTED)
+
+    parent_descriptor: int | None = None
+    leaf_descriptor: int | None = None
+    unlinked = False
+    failure: SecureFileError | None = None
+    leaf_flags = os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        parent_descriptor, leaf = _open_directory_chain(normalized, nofollow=nofollow)
+        _require_private_parent(parent_descriptor, os.fstat(parent_descriptor))
+        leaf_descriptor = os.open(leaf, leaf_flags, dir_fd=parent_descriptor)
+        metadata = os.fstat(leaf_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != effective_user_id()
+            or stat.S_IMODE(metadata.st_mode) != _PRIVATE_FILE_MODE
+            or metadata.st_nlink != 1
+        ):
+            raise SecureFileError(SecureFileErrorKind.NOT_REGULAR)
+        if expected_identity is not None and FileIdentity.from_stat(metadata) != expected_identity:
+            raise SecureFileError(SecureFileErrorKind.CHANGED)
+        _require_no_extended_acl(leaf_descriptor)
+        os.unlink(leaf, dir_fd=parent_descriptor)
+        unlinked = True
+        os.fsync(parent_descriptor)
+    except FileNotFoundError:
+        failure = SecureFileError(SecureFileErrorKind.NOT_FOUND)
+    except SecureFileError as error:
+        failure = error
+    except ValueError:
+        failure = SecureFileError(SecureFileErrorKind.INVALID)
+    except OSError as exc:
+        if unlinked:
+            # The entry is already gone; only the durability fsync failed — commit-uncertain, not a
+            # lingering orphan.
+            failure = SecureFileError(SecureFileErrorKind.COMMIT_UNCERTAIN)
+        else:
+            kind = (
+                SecureFileErrorKind.NOT_REGULAR
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}
+                else SecureFileErrorKind.WRITE_FAILED
+            )
+            failure = SecureFileError(kind)
+    except Exception:
+        failure = SecureFileError(
+            SecureFileErrorKind.COMMIT_UNCERTAIN if unlinked else SecureFileErrorKind.WRITE_FAILED
+        )
+    finally:
+        for descriptor in (leaf_descriptor, parent_descriptor):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    if failure is None:
+                        # Reaching the close with no prior failure means the whole body — including
+                        # the unlink — succeeded, so the entry is already gone. A descriptor-close
+                        # failure then leaves durability unconfirmed, never a lingering orphan:
+                        # report commit-uncertain so retention re-inspects rather than asserting the
+                        # file is still present.
+                        failure = SecureFileError(SecureFileErrorKind.COMMIT_UNCERTAIN)
+
+    if failure is not None:
+        raise failure
+
+
 __all__ = [
     "FileIdentity",
     "FileSelection",
@@ -794,5 +906,7 @@ __all__ = [
     "inspect_regular_file_no_follow",
     "lexical_absolute_path",
     "open_regular_file_no_follow",
+    "remove_regular_file_no_follow",
+    "require_no_extended_acl",
     "sync_parent_directory_no_follow",
 ]

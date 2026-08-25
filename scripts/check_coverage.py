@@ -121,12 +121,28 @@ def validate_coverage(
             details = _mapping(raw_details, f"files[{file_name!r}]")
             summary = _mapping(details.get("summary"), f"files[{file_name!r}].summary")
             file_branches = _counts(summary, "branch", f"files[{file_name!r}].summary")
-            percentage = file_branches.percentage()
-            if not file_branches.meets(critical_branch_threshold):
-                raise CoverageError(
-                    f"critical file {file_name} branch coverage {percentage:.2f}% is below "
-                    f"{critical_branch_threshold:.2f}%"
-                )
+            if file_branches.total == 0:
+                # Coverage.py reports branchless modules as 0/0. They satisfy a branch threshold
+                # vacuously only when the module itself is measurable and every statement ran;
+                # otherwise adding a branchless critical file could weaken the gate silently.
+                file_lines = _counts(summary, "line", f"files[{file_name!r}].summary")
+                if file_lines.total == 0:
+                    raise CoverageError(
+                        f"critical file {file_name} has no measurable line or branch items"
+                    )
+                percentage = 100.0
+                if not file_lines.meets(100.0):
+                    raise CoverageError(
+                        f"critical branchless file {file_name} line coverage "
+                        f"{file_lines.percentage():.2f}% is below 100.00%"
+                    )
+            else:
+                percentage = file_branches.percentage()
+                if not file_branches.meets(critical_branch_threshold):
+                    raise CoverageError(
+                        f"critical file {file_name} branch coverage {percentage:.2f}% is below "
+                        f"{critical_branch_threshold:.2f}%"
+                    )
             critical_results.append((file_name, percentage))
             matched_patterns.update(matching_patterns)
         unmatched_patterns = tuple(

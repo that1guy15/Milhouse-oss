@@ -3,18 +3,19 @@
 A :class:`DurableSpool` binds one control database, one commit barrier, one spool root, and the
 installation identity, all under the same canonical state root, so a caller cannot publish under a
 different barrier than maintenance holds. Per ADR 0004 and plan sections 3.4/4.3, mandatory
-spool/ledger reconciliation runs on writer acquisition AND inside every commit's own exclusive
-critical section with no unlock window before publication, so recovery is never opt-in and a
-long-lived writer can never proceed while another writer's crash left a durably-published segment
-unregistered.
+spool/ledger reconciliation runs on writer acquisition AND at the start of every commit. A commit
+holds the barrier exclusively for recovery, converts the same main lock to shared while the
+exclusive gate prevents a cooperating-writer gap, then publishes under the required shared writer
+side. Recovery is never opt-in, and a long-lived writer cannot proceed past another writer's crash
+orphan.
 
 Per ADR 0004 and plan section 4.7 a commit is a deliberate, authorized, reconciled operation: it
 authorizes the ``local_spool`` and ``local_sqlite`` egress surfaces (restricted input is rejected
-before any mutation), derives the ``YYYY-MM-DD`` partition from the commit instant, then, holding
-the exclusive commit barrier across reconciliation and publication, creates the partition
-directory, atomically publishes the exact segment bytes (write, flush, fsync, no-replace rename,
-parent fsync), and inserts the segment ledger row (``origin = 'committed'``) plus one row per
-required exporter in a single SQLite transaction. A
+before any mutation), derives the ``YYYY-MM-DD`` partition from the commit instant, then creates and
+durably links the private partition directories, atomically publishes the exact segment bytes
+(write, flush, fsync, no-replace rename, parent fsync), and inserts the segment ledger row
+(``origin = 'committed'``) plus one row per required exporter in a single SQLite transaction. The
+publication and ledger insert run under the shared commit barrier. A
 crash or ledger failure after publication leaves a durable orphan and is reported as the fixed
 commit-uncertain ``MH_SPOOL_COMMIT``, never as success. The ledger preserves every immutable header
 field so recovery never infers policy from newer configuration, and every read is validated so a
@@ -33,7 +34,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from milhouse.config.filesystem import lexical_absolute_path
+from milhouse.config.filesystem import (
+    FileIdentity,
+    SecureFileError,
+    lexical_absolute_path,
+    require_no_extended_acl,
+)
 from milhouse.core.clock import TimeError, format_timestamp
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.ledger import (
@@ -53,8 +59,8 @@ from milhouse.spooling.segment import (
     SpoolFrameV1,
 )
 from milhouse.spooling.writer import build_segment_bytes, publish_segment_bytes
-from milhouse.state.barrier import GlobalCommitBarrier
-from milhouse.state.database import ControlDatabase
+from milhouse.state.barrier import GlobalCommitBarrier, _is_bound_barrier
+from milhouse.state.database import ControlDatabase, _validated_database_path
 from milhouse.state.errors import StateError
 
 if TYPE_CHECKING:
@@ -93,33 +99,112 @@ def _committed_stamp(committed_at: datetime) -> str:
 
 
 def _require_private_dir(path: Path, subject: str) -> None:
-    info: os.stat_result | None
+    """Require an owned, exact-0700, ACL-free directory, validated on an opened descriptor.
+
+    The descriptor-based check closes the gap the earlier lstat version left: mode bits alone do
+    not prove the access envelope, so the same extended-ACL probe the secure file primitives use
+    runs against the opened directory itself.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    unsafe = False
+    descriptor: int | None = None
     try:
-        info = os.lstat(path)
-    except OSError:
-        info = None
-    if (
-        info is None
-        or stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != _current_uid()
-        or stat.S_IMODE(info.st_mode) != _DIR_MODE
-    ):
-        _fail("MH_SPOOL_DIR", f"the {subject} must be an owned 0o700 directory")
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != _current_uid()
+            or stat.S_IMODE(info.st_mode) != _DIR_MODE
+        ):
+            unsafe = True
+        else:
+            require_no_extended_acl(descriptor)
+    except (OSError, SecureFileError):
+        unsafe = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover - defensive: close failure on a valid descriptor
+                unsafe = True
+    if unsafe:
+        _fail("MH_SPOOL_DIR", f"the {subject} must be an owned, ACL-free 0o700 directory")
+
+
+def _fsync_private_dir(path: Path, subject: str) -> None:
+    """Re-open, validate, and fsync one private directory without leaking path details."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    failed = False
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != _current_uid()
+            or stat.S_IMODE(info.st_mode) != _DIR_MODE
+        ):
+            failed = True
+        else:
+            require_no_extended_acl(descriptor)
+            os.fsync(descriptor)
+    except (OSError, SecureFileError):
+        failed = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover - defensive close failure
+                failed = True
+    if failed:
+        _fail("MH_SPOOL_DIR", f"the {subject} could not be made durable")
 
 
 def _secure_child_dir(parent: Path, name: str) -> Path:
+    """Create/repair one private child through the shared descriptor-relative primitive."""
+
+    # Reconciliation owns the shared spool-directory primitive. Import lazily to preserve the
+    # commit -> reconciliation dependency direction used by writer acquisition.
+    from milhouse.spooling.reconcile import (
+        _dir_flags,
+        _ensure_private_dir_at,
+        _validated_dir_descriptor,
+    )
+
     child = parent / name
-    create_failed = False
+    parent_fd: int | None = None
+    child_fd: int | None = None
+    accepted = False
     try:
-        os.mkdir(child, _DIR_MODE)
-    except FileExistsError:
-        pass
-    except OSError:
-        create_failed = True
-    if create_failed:
+        parent_fd = os.open(parent, _dir_flags())
+        parent_identity = _validated_dir_descriptor(parent_fd)
+        if parent_identity is not None:
+            child_pair = _ensure_private_dir_at(parent_fd, name, sync_child=True)
+            if child_pair is not None:
+                child_fd, child_identity = child_pair
+                named_parent = FileIdentity.from_stat(os.stat(parent, follow_symlinks=False))
+                named_child = FileIdentity.from_stat(
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                )
+                accepted = (
+                    named_parent == parent_identity
+                    and _validated_dir_descriptor(parent_fd) == parent_identity
+                    and named_child == child_identity
+                    and _validated_dir_descriptor(child_fd) == child_identity
+                )
+    except (OSError, ValueError):
+        accepted = False
+    finally:
+        for descriptor in (child_fd, parent_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:  # pragma: no cover - defensive close failure
+                    accepted = False
+    if not accepted:
         _fail("MH_SPOOL_DIR", "a spool directory could not be created")
-    _require_private_dir(child, "spool directory")
     return child
 
 
@@ -141,14 +226,22 @@ class DurableSpool:
         spool_root: str | Path,
         installation_id: str,
     ) -> None:
-        if not isinstance(database, ControlDatabase):
+        database_path = _validated_database_path(database)
+        if database_path is None:
             _fail("MH_SPOOL_STORE", "a control database is required")
-        if not isinstance(barrier, GlobalCommitBarrier):
+        if type(barrier) is not GlobalCommitBarrier:
             _fail("MH_SPOOL_STORE", "a commit barrier is required")
-        control_dir = lexical_absolute_path(database.path).parent
+        control_dir = database_path.parent
         state_root = control_dir.parent
-        resolved_spool = lexical_absolute_path(spool_root)
-        if lexical_absolute_path(barrier.path) != control_dir / _BARRIER_NAME:
+        invalid_spool = False
+        try:
+            resolved_spool = lexical_absolute_path(spool_root)
+        except SecureFileError:
+            invalid_spool = True
+            resolved_spool = Path()
+        if invalid_spool:
+            _fail("MH_SPOOL_STORE", "a spool root path is required")
+        if not _is_bound_barrier(barrier, control_dir / _BARRIER_NAME):
             # Pin the exact lock, not just its directory: a barrier on a different file beside the
             # database would share no flock with maintenance, so publication would race a backup or
             # migration despite the barrier being "held".
@@ -166,10 +259,9 @@ class DurableSpool:
         self._installation_id = installation_id
         # A writer acquisition performs mandatory recovery: reconcile the spool with the ledger
         # under the exclusive barrier before any commit is possible. This constructor pass is an
-        # additional check; every commit ALSO reconciles inside its own exclusive critical section
-        # with no unlock window, so a long-lived writer can never proceed past another writer's
-        # later crash orphan (the gate review's reproduced handoff gap).
-        self._last_reconciliation = self._reconcile_exclusively(action=None)
+        # additional check; every commit ALSO reconciles exclusively, then hands the same main
+        # descriptor to shared mode without a cooperating-writer gap before publication.
+        self._last_reconciliation = self._reconcile_then_write(action=None)
 
     @property
     def last_reconciliation(self) -> ReconciliationReport:
@@ -177,12 +269,12 @@ class DurableSpool:
 
         return self._last_reconciliation
 
-    def _reconcile_exclusively(self, action: Callable[[], None] | None) -> ReconciliationReport:
-        """Run mandatory reconciliation and an optional commit action in one exclusive hold.
+    def _reconcile_then_write(self, action: Callable[[], None] | None) -> ReconciliationReport:
+        """Run exclusive recovery, then an optional action under the shared writer side.
 
-        The barrier-owning wrapper in the reconcile module acquires the exclusive side itself and
-        passes its live authority token to the scan, so there is no unlock window between recovery
-        and the action and no call path that can scan without owning the barrier.
+        The barrier owns the exclusive-to-shared transition on one main descriptor while its gate
+        excludes cooperating entrants. There is no unlock window and no caller-mintable authority
+        token that can bypass acquisition.
         """
 
         # Imported here to keep the reconcile module's dependency on the ledger one-directional.
@@ -200,9 +292,19 @@ class DurableSpool:
             observe=_observe,
         )
         if not report.complete:
+            if any(
+                anomaly.kind == "foreign_name"
+                and anomaly.detail in {"spool_root_unsafe", "spool_root_changed"}
+                for anomaly in report.anomalies
+            ):
+                _fail("MH_SPOOL_DIR", "the spool root must be an owned, ACL-free 0o700 directory")
             # A truncated inventory cannot prove orphan absence or batch uniqueness, so mandatory
             # recovery fails closed: neither acquisition nor a commit may proceed on a partial view.
             _fail("MH_SPOOL_INCOMPLETE", "reconciliation was truncated by a scan bound")
+        if not report.recovery_safe:
+            # Inventory was complete, but an exact prior-recovery cleanup could not be verified.
+            # No later recovery or writer mutation ran, and this is not a scan-bound failure.
+            _fail("MH_SPOOL_RECOVERY", "reconciliation recovery could not be verified")
         return report
 
     def commit_segment(
@@ -212,11 +314,10 @@ class DurableSpool:
         *,
         committed_at: datetime,
     ) -> SegmentRecord:
-        """Reconcile, authorize, publish, and record one segment in one exclusive critical section.
+        """Reconcile exclusively, then publish and record under the shared writer barrier.
 
-        Mandatory recovery runs first, under the same exclusive barrier hold as the publication and
-        ledger insert, so no other writer can create an orphan between reconciliation and this
-        commit and this writer cannot proceed while an earlier durable segment is unregistered.
+        Mandatory recovery runs first. The main lock then converts to shared before publication,
+        while the gate prevents another cooperating writer from creating an orphan in between.
         """
 
         if not isinstance(header, SegmentHeaderV1):
@@ -252,7 +353,7 @@ class DurableSpool:
             publish_segment_bytes(day_dir / f"{header.batch_id}.jsonl", content)
             self._commit_ledger(record)
 
-        self._reconcile_exclusively(action=_publish_and_record)
+        self._reconcile_then_write(action=_publish_and_record)
         return record
 
     def _commit_ledger(self, record: SegmentRecord) -> None:

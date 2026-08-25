@@ -26,6 +26,12 @@ canonical script rather than reconstructing its safety checks as a manual sync c
 See [Contributor setup](docs/setup.md), [Development workflow](docs/development.md), and
 [Dependency policy](docs/dependencies.md) before changing the toolchain or lock.
 
+Before starting a task, run `./scripts/run_make.py worktree-check`. Keep the primary checkout clean,
+on `main`, and synchronized with `origin/main`; make changes only in a named task worktree. The
+worktree creator owns its cleanup after merge, closure, or supersession. Handoffs privately identify
+the path, branch, exact head, dirty count, PR, owner, and one precise state: `clean-main`, `active`,
+`recovery-stashed`, or `blocked`. Do not commit private machine paths or stash metadata.
+
 Do not use live provider credentials or production data in tests. Use synthetic fixtures and deterministic clocks.
 
 ## Contribution rules

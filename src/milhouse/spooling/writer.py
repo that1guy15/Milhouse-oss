@@ -22,6 +22,8 @@ from milhouse.config.filesystem import (
 )
 from milhouse.spooling.errors import SpoolError
 from milhouse.spooling.segment import (
+    MAX_SEGMENT_FILE_BYTES,
+    MAX_SEGMENT_FRAMES,
     SegmentHeaderV1,
     SpoolFrameV1,
     spool_content_sha256,
@@ -56,7 +58,7 @@ def _validate_consistency(header: SegmentHeaderV1, frames: tuple[SpoolFrameV1, .
             _fail("MH_SPOOL_PRIVACY", "each frame privacy class must match the header")
 
 
-def publish_segment_bytes(path: str | Path, content: bytes) -> None:
+def _create_segment_file(path: str | Path, content: bytes) -> None:
     exists = False
     failed = False
     try:
@@ -74,6 +76,10 @@ def publish_segment_bytes(path: str | Path, content: bytes) -> None:
         _fail("MH_SPOOL_WRITE", "the segment could not be durably published")
 
 
+def publish_segment_bytes(path: str | Path, content: bytes) -> None:
+    _create_segment_file(path, content)
+
+
 def build_segment_bytes(
     header: SegmentHeaderV1, frames: tuple[SpoolFrameV1, ...] | list[SpoolFrameV1]
 ) -> bytes:
@@ -87,12 +93,22 @@ def build_segment_bytes(
         _fail("MH_SPOOL_HEADER", "a segment header is required")
     if not isinstance(frames, (tuple, list)):
         _fail("MH_SPOOL_FRAMES", "frames must be provided as a concrete sequence")
+    if len(frames) > MAX_SEGMENT_FRAMES:
+        _fail("MH_SPOOL_COUNT", "the segment contains more frames than the writer admits")
     frame_tuple = tuple(frames)
     _validate_consistency(header, frame_tuple)
-    frame_lines = [spool_frame_line(frame) for frame in frame_tuple]
+    header_line = spool_segment_header_line(header)
+    frame_lines: list[bytes] = []
+    total_bytes = len(header_line)
+    for frame in frame_tuple:
+        line = spool_frame_line(frame)
+        total_bytes += len(line)
+        if total_bytes > MAX_SEGMENT_FILE_BYTES:
+            _fail("MH_SPOOL_SIZE", "the segment exceeds the maximum size")
+        frame_lines.append(line)
     if spool_content_sha256(frame_lines) != header.content_sha256:
         _fail("MH_SPOOL_DIGEST", "the header digest does not match the frame bytes")
-    return spool_segment_header_line(header) + b"".join(frame_lines)
+    return header_line + b"".join(frame_lines)
 
 
 def write_spool_segment(

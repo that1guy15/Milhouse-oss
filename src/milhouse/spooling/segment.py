@@ -28,6 +28,8 @@ SCHEMA_VERSION = 1
 FRAME_VERSION = 1
 MAX_HEADER_LINE_BYTES = 8_192
 MAX_FRAME_LINE_BYTES = 262_144 + 1_024  # a canonical record plus the small frame envelope
+MAX_SEGMENT_FILE_BYTES = 64 * 1024 * 1024
+MAX_SEGMENT_FRAMES = 1_000_000
 MAX_RETENTION_DAYS = 3_650  # matches the config `[retention]` ceiling
 
 BATCH_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", flags=re.ASCII)
