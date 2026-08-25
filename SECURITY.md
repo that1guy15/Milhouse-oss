@@ -44,6 +44,11 @@ P0/P1 reports block release. Maintainers will acknowledge a valid private report
   returns collision-safe whole-path/whole-URL markers when canonical output would otherwise leak or
   become malformed.
 - Raw prompts, responses, transcripts, and tool output are never persisted in 1.0.
+- W02/G02 landed the section 4.15 `local_log` wire and stream-sink primitives. The concrete
+  persisted structured-log file belongs to W03/G03 and is not gate-passed until independently
+  reviewed. When persisted, local operational logs use the fail-closed `local_log` surface:
+  installation-scoped metadata only, with no arbitrary-text or exception-detail field and no
+  secret, path, prompt, transcript, or tool-output content in files, stderr, or tracebacks.
 - Acknowledged records are durably spooled before export.
 - ClickHouse and the ingestion receiver are loopback-only by default.
 - MCP is local stdio, bounded, and read-only by default.

@@ -105,8 +105,9 @@ No other private donor path is approved. A request to add one requires a plan
 amendment or an ADR permitted by the plan, an ownership review, a new row here,
 and approval before source expression is introduced.
 
-The W02 stable-error, config-diagnostic, and structured-event implementation is a clean-room
-rewrite based only on the public plan and current OSS contracts. No private logging or error path is
+The W02 stable-error, config-diagnostic, structured-event, and persisted structured-log
+(plan section 4.15) implementation is a clean-room rewrite based only on the public plan and current
+OSS contracts. No private logging or error path is
 approved for reuse, and no private donor expression, fixture, history, or behavior is incorporated.
 
 The W02 common-egress policy is likewise a clean-room implementation of the public plan's binding

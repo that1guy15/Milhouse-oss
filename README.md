@@ -3,14 +3,14 @@
 Milhouse is a local-first observability and verified engineering-feedback control plane for small
 teams and AI-assisted development workflows.
 
-> **Status: pre-alpha implementation; no public release.** The W01 package and quality-toolchain
-> foundation has passed G01; W02 domain, configuration, identity, trust, and privacy implementation
-> is in progress. The repository now contains strict configuration/schema validation, deterministic
-> record identity and envelopes, privacy/redaction primitives, secure runtime path and explicit
-> secret-loading foundations, secure pseudonym-key material primitives, and metadata-only exact
-> third-party plugin allowlist validation. Durable storage,
-> collection, querying, initialization, and the operational runtime are not implemented yet. Do not
-> use this build for production data.
+> **Status: pre-alpha implementation; no public release.** G02 is accepted, and W03 is in progress.
+> Protected `main` now contains the strict configuration, deterministic identity, privacy, and local
+> structured-log contracts from W02 plus the first durable-storage foundations from W03: secured
+> SQLite control state, fenced leases and a global commit barrier, self-describing spool segments,
+> atomic segment publication, a durable segment ledger, bounded readers, reconciliation, and
+> quarantine/recovery hardening. G03 has not passed. Full replay, retention, structured-log file
+> persistence, ClickHouse, collectors, querying, initialization, and the operational runtime are not
+> accepted or supported yet. Do not use this build for production data.
 
 The normative scope, contracts, work order, gates, and Definition of Done are in [the authoritative implementation plan](docs/implementation-plan.md). Progress and validation evidence are tracked in [implementation status](docs/implementation-status.md).
 
@@ -49,7 +49,7 @@ python3 -I scripts/run_uv.py run --locked milhouse config schema
 ```
 
 Those commands exercise the pre-alpha CLI and offline configuration surface only. `milhouse init`,
-collectors, storage, feedback, reports, MCP, and services become available in their owning work
+collectors, storage commands, feedback, reports, MCP, and services become available in their owning work
 packages. In particular, product initialization is W06 work; contributor setup does not create
 Milhouse configuration or runtime state. The current key-material module is a lower-level primitive:
 W06 still owns private-directory initialization and stale staging-artifact handling, while W16 owns
@@ -86,6 +86,14 @@ Current repository validation:
 These commands validate the current source tree. W01 has passed, but that does not imply that the
 Milhouse runtime or any later work package is complete.
 
+## Watch the build
+
+The maintainer-authored
+[Milhouse engineering journal](https://github.com/that1guy15/Milhouse-oss/discussions/categories/announcements)
+explains meaningful merged architecture and feature milestones in plain language. Posts link the
+exact protected evidence and distinguish implemented behavior from planned work and release
+readiness. See the [journal workflow](docs/engineering-journal.md).
+
 ## Source and privacy boundary
 
 This is a fresh public implementation. The private operational repository is read-only donor material, not the codebase. Reuse is limited to the audited, generalized algorithms listed in [provenance](docs/provenance.md); private history, telemetry, configuration, paths, fixtures, reports, and agent content are prohibited.
@@ -99,6 +107,7 @@ Never attach credentials, real telemetry, raw agent content, private incident da
 - [Architecture](docs/architecture.md)
 - [Contributor setup](docs/setup.md)
 - [Development workflow](docs/development.md)
+- [Engineering journal](docs/engineering-journal.md)
 - [Dependency policy](docs/dependencies.md)
 - [Privacy](PRIVACY.md)
 - [Threat model](docs/threat-model.md)

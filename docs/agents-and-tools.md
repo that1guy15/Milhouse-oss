@@ -40,12 +40,33 @@ select one dependency-ready work package
 -> fix and re-review until no P0/P1 remains
 -> milhouse-compound when an explicitly requested reusable lesson exists
 -> milhouse-oss-maintainer for provenance, status, commit, PR, and authorized merge handling
+-> authorized engineering-journal post after a meaningful milestone reaches merged_verified
+-> beginner-friendly companion and draft-only Substack handoff for every completed
+   Discussion-derived learning post
 ```
 
 Subagents may perform independent read-only work in parallel. Parallel writes require disjoint files
 and hidden state; the primary agent integrates and verifies the combined tree. Review remains
 read-only. Selecting a skill grants no source, GitHub, provider, external-model, tag, publication, or
 messaging authority.
+
+Local development follows the canonical [worktree hygiene contract](../AGENTS.md#worktree-hygiene).
+The primary checkout is a clean, synchronized `main`; agent changes live in named task worktrees;
+and the creator removes each task worktree when its PR merges, closes, or is superseded. Run
+`./scripts/run_make.py worktree-check` before starting work. Invoke
+`python3 -I scripts/check_worktree_hygiene.py --expect LABEL=PATH` for active handoff registrations
+and add `--strict` at task close. Runtime handoffs use the precise states `clean-main`, `active`,
+`recovery-stashed`, or `blocked` and do not commit private machine paths.
+
+The [engineering journal](engineering-journal.md) is the public, human-readable output of selected
+`merged_verified` milestones. It summarizes only protected public evidence and cannot pass a gate,
+publish a package, claim release readiness, or expose raw/private inputs.
+
+The paired learning companion is an external personal-content task artifact, not Milhouse product
+output. The owner has authorized each completed blog derived from a current-work or feature
+Discussion to be created and saved as an unpublished draft through the owner's authenticated Chrome
+session. That standing authority excludes publication, scheduling, email delivery, account changes,
+credential handling, and every other external mutation.
 
 ## Planned agent surfaces
 

@@ -10,7 +10,10 @@ description: "Build, debug, and validate Milhouse internals against the authorit
 Before editing:
 
 1. Read `docs/implementation-plan.md` and `docs/implementation-status.md`.
-2. Identify one active work package, its dependencies, and its exact gate assertions.
+2. Take one dependency-ready item from the **Milhouse OSS 1.0 Roadmap** Project (`State: Ready`, or
+   the active `In progress` one), and identify its dependencies and exact gate assertions. Ensure a
+   tracking Issue exists (create and add one, with a `type:` label, if not) and set the Project item
+   `In progress`. The status ledger stays authoritative; the Project mirrors it.
 3. Read the relevant accepted ADRs, architecture, security policy, source, and tests.
 4. Confirm that the requested work and any external mutation are authorized in the status ledger.
 

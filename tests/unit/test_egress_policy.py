@@ -157,6 +157,43 @@ def test_runtime_types_are_strict_and_value_safe(arguments: dict[str, Any], code
     assert "unknown" not in str(captured.value)
 
 
+def test_local_log_surface_is_metadata_only() -> None:
+    assert (
+        require_egress(surface=EgressSurface.LOCAL_LOG, privacy_class="public")
+        is EgressDisposition.METADATA
+    )
+    assert (
+        require_egress(surface=EgressSurface.LOCAL_LOG, privacy_class="internal")
+        is EgressDisposition.REDACTED_METADATA
+    )
+
+    with pytest.raises(PrivacyError) as sensitive:
+        require_egress(surface=EgressSurface.LOCAL_LOG, privacy_class="sensitive")
+    assert sensitive.value.code == "MH_EGRESS_CLASS_DENIED"
+
+    with pytest.raises(PrivacyError) as restricted:
+        require_egress(surface=EgressSurface.LOCAL_LOG, privacy_class="restricted")
+    assert restricted.value.code == "MH_EGRESS_RESTRICTED"
+
+
+def test_local_log_is_a_local_surface_and_rejects_external_policy() -> None:
+    with pytest.raises(PrivacyError) as enabled:
+        require_egress(
+            surface=EgressSurface.LOCAL_LOG,
+            privacy_class="public",
+            explicitly_enabled=True,
+        )
+    assert enabled.value.code == "MH_EGRESS_POLICY"
+
+    with pytest.raises(PrivacyError) as allowlisted:
+        require_egress(
+            surface=EgressSurface.LOCAL_LOG,
+            privacy_class="public",
+            allowed_classifications=frozenset({"public"}),
+        )
+    assert allowlisted.value.code == "MH_EGRESS_POLICY"
+
+
 def test_hard_matrix_denial_is_distinct_from_external_policy_denial() -> None:
     with pytest.raises(PrivacyError) as hard_denial:
         require_egress(surface=EgressSurface.REPO_BRIEF, privacy_class="sensitive")

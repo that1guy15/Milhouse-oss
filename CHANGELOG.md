@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Add the W04 G04b storage exporter and query repository: a record→ClickHouse exporter that
+  authorizes each record against the `local_clickhouse` egress surface (fail-closed) and writes rows
+  as native column data (never interpolated into SQL), a query repository over the deduplicating
+  `records_current`/`feedback_current` views with server-side parameter binding, and `milhouse
+  storage export/records/feedback` commands — proving the demo → spool → export → query path. The
+  live export round-trip and feedback-state derivation are an opt-in local smoke; the recovery
+  obligations (idempotent delivery ledger, outage drain, native restore) still sequence with G03, so
+  G04b is not yet accepted.
+- Add the W04 ClickHouse storage foundation (G04a): packaged, checksum-protected SQL migrations
+  (0001–0004), a migration runner that refuses an altered applied checksum, a typed authenticated
+  `clickhouse-connect` client that opens no socket at construction, `milhouse storage
+  status/plan/migrate` commands, and a hardened loopback-only, digest-pinned reference compose with
+  the built-in default account locked. The offline subset runs in CI; the live G04a criteria are an
+  opt-in local smoke and remain owner/host gate evidence (G04a not yet accepted).
+- Add the first runnable local product surface: `milhouse init`, `health`, `demo`, and the
+  `spool`/`events`/`doctor` inspect commands (spool-only, credential-free), on the accepted W02/W03
+  foundations.
+- Pair each meaningful engineering-journal milestone with an unpublished, beginner-friendly
+  learning companion or scoped learning-series plan, and require every completed Discussion-derived
+  article to be saved through authenticated Chrome as an unpublished Substack draft while keeping
+  publication, scheduling, and email delivery separately controlled.
+- Record owner-approved amendment A06, making the installation-account filesystem-containment
+  trust boundary explicit while retaining traversal, symlink, other-user, cooperating-process, and
+  namespace-drift defenses and tests.
 - Approve the authoritative Milhouse OSS 1.0 implementation plan and W00-W18 gate model.
 - Establish the public/private source boundary, file-level donor provenance, and pre-alpha status.
 - Ratify locked architecture and engineering-process decisions through ADRs 0001-0015.
@@ -9,6 +33,8 @@
   sanitized compound learning, and explicit no-vendoring, privacy, egress, and mutation boundaries.
 - Add privacy, threat-model, governance, support, DCO, and implementation-status artifacts.
 - Remove stale duplicate workflow/publication instructions and harden issue/review privacy guidance.
+- Add an evidence-linked GitHub Discussions engineering journal, maintainer announcement form, and
+  inaugural pre-alpha architecture post while keeping release claims separately authorized.
 - Begin the W01 foundation with the `milhouse-observability` distribution, typed `milhouse` import
   package, modular pre-alpha Click entry point, and explicit package-resource manifest.
 - Separate bounded runtime, optional receiver, and development dependencies; add the uv 0.11.29
@@ -85,3 +111,30 @@
   fixed macOS 14 with Python 3.11 and 3.14 while the existing Ubuntu matrix covers Python 3.11-3.14.
 - Accept a raw JSON record draft that omits optional correlation data by strictly revalidating the
   exact model default instead of attempting to JSON-encode that already-constructed nested model.
+- Ratify owner-approved amendment A02 (ADR 0016): the persisted local structured-log contract (plan
+  section 4.15), adding the `local_log` egress surface with installation-scoped operational metadata
+  only and no external egress, record, publication, or retention expansion.
+- Record owner-approved amendment A03 (ADR 0017): the exact bounded D01 PR #21 historical DCO
+  disposition, keeping the original squash permanently noncompliant and future enforcement unchanged.
+- Implement the W02-owned `local_log` contract (amendment A02): the fail-closed `local_log` egress
+  surface, the CanonicalJSONV1 `StructuredLogEventV1` wire and encoder, a golden vector corpus with
+  cross-process/property determinism and adversarial leak-freedom, and a stream sink that emits exact
+  event-line bytes, normalizes hostile failures, and refuses partial writes.
+- Assemble and correct the W02 G02 evidence packet (`docs/gate-evidence/G02.md`); the owner accepted
+  G02 on 2026-07-24 at protected `main` `90f8e4b` with green post-merge Required CI.
+- Add the W03 SQLite control-plane foundation: owner-only WAL storage with full synchronous
+  durability, ordered checksum-bound migrations, fenced leases, and the shared/exclusive global
+  commit barrier used by writers and maintenance.
+- Add self-describing v1 spool segments, canonical frame bytes, bounded identifiers and retention,
+  atomic no-overwrite publication, durable segment commit plus SQLite ledger rows, and exporter
+  delivery state.
+- Add secure bounded segment reads and mandatory reconciliation that verifies full filesystem/ledger
+  agreement, safely registers durably published orphan segments, and fails closed on corruption,
+  conflicts, unsafe file shapes, or incomplete inventory.
+- Add descriptor-relative quarantine and recovery hardening for corrupt, conflicted, and exact stale
+  writer artifacts, with no-follow classification, restrictive ownership/mode/link checks,
+  fsynced copy/publication/retirement ordering, and explicit uncertain outcomes that block writer
+  handoff. W03 remains in progress; G03 has not passed.
+- Backfill the checked-in canonical source for Build Journal #2 and add Build Journal #3, a public
+  evidence-linked walkthrough of the durable local-state and spool recovery milestone, while
+  preserving the pre-alpha and no-release boundary.

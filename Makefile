@@ -20,7 +20,7 @@ ifneq ($(strip $(findstring i,$(_MILHOUSE_SHORT_MAKEFLAGS))$(findstring n,$(_MIL
 $(error Milhouse gates refuse make dry-run, ignore-error, question, or touch modes)
 endif
 
-_MILHOUSE_TARGETS := setup lock lock-check format format-check lint type-check test test-coverage \
+_MILHOUSE_TARGETS := setup worktree-check lock lock-check format format-check lint type-check test test-coverage \
 	identity-portability \
 	repo-check docs-check workflow-check skill-check quality build package-check \
 	artifact-smoke audit license-check private-identifier-check secret-scan \
@@ -35,6 +35,9 @@ $(_MILHOUSE_TARGETS): override UV_RUN := $(UV) run --locked --all-groups --all-e
 
 setup:
 	./setup.sh
+
+worktree-check:
+	$(PYTHON) -I scripts/check_worktree_hygiene.py
 
 lock:
 	$(UV) lock
@@ -61,7 +64,9 @@ test:
 identity-portability:
 	$(UV_RUN) python -m pytest \
 		tests/contract/test_identity_portability_contract.py \
-		tests/integration/test_identity_subprocess_integration.py
+		tests/integration/test_identity_subprocess_integration.py \
+		tests/integration/test_log_wire_subprocess_integration.py \
+		tests/integration/test_spool_subprocess_integration.py
 
 test-coverage:
 	mkdir -p build
@@ -80,6 +85,7 @@ test-coverage:
 		--critical 'src/milhouse/core/clock.py' \
 		--critical 'src/milhouse/core/errors.py' \
 		--critical 'src/milhouse/core/logging.py' \
+		--critical 'src/milhouse/core/log_wire.py' \
 		--critical 'src/milhouse/domain/_validation.py' \
 		--critical 'src/milhouse/domain/identity.py' \
 		--critical 'src/milhouse/domain/records.py' \
@@ -90,11 +96,50 @@ test-coverage:
 		--critical 'src/milhouse/privacy/redact.py' \
 		--critical 'src/milhouse/privacy/render.py' \
 		--critical 'src/milhouse/privacy/sanitize.py' \
+		--critical 'src/milhouse/state/alert_state.py' \
+		--critical 'src/milhouse/state/audit.py' \
+		--critical 'src/milhouse/state/barrier.py' \
+		--critical 'src/milhouse/state/cursors.py' \
+		--critical 'src/milhouse/state/database.py' \
+		--critical 'src/milhouse/state/derivation.py' \
+		--critical 'src/milhouse/state/errors.py' \
+		--critical 'src/milhouse/state/leases.py' \
+		--critical 'src/milhouse/state/migrations.py' \
+		--critical 'src/milhouse/state/schema.py' \
+		--critical 'src/milhouse/spooling/commit.py' \
+		--critical 'src/milhouse/spooling/errors.py' \
+		--critical 'src/milhouse/spooling/exporter.py' \
+		--critical 'src/milhouse/spooling/ledger.py' \
+		--critical 'src/milhouse/spooling/reader.py' \
+		--critical 'src/milhouse/spooling/reconcile.py' \
+		--critical 'src/milhouse/spooling/replay.py' \
+		--critical 'src/milhouse/spooling/retention.py' \
+		--critical 'src/milhouse/spooling/segment.py' \
+		--critical 'src/milhouse/spooling/verify.py' \
+		--critical 'src/milhouse/spooling/writer.py' \
+		--critical 'src/milhouse/storage/_identifiers.py' \
+		--critical 'src/milhouse/storage/client.py' \
+		--critical 'src/milhouse/storage/errors.py' \
+		--critical 'src/milhouse/storage/exporter.py' \
+		--critical 'src/milhouse/storage/repository.py' \
+		--critical 'src/milhouse/storage/runner.py' \
+		--critical 'src/milhouse/storage/schema.py' \
+		--critical 'src/milhouse/runtime/__init__.py' \
+		--critical 'src/milhouse/runtime/alerting.py' \
+		--critical 'src/milhouse/runtime/context.py' \
+		--critical 'src/milhouse/runtime/errors.py' \
+		--critical 'src/milhouse/runtime/pipeline.py' \
+		--critical 'src/milhouse/runtime/registry.py' \
+		--critical 'src/milhouse/runtime/result.py' \
+		--critical 'src/milhouse/http/client.py' \
+		--critical 'src/milhouse/http/errors.py' \
+		--critical 'src/milhouse/collectors/site_canary.py' \
 		--critical 'scripts/check_artifacts.py' \
 		--critical 'scripts/check_coverage.py' \
 		--critical 'scripts/check_dco.py' \
 		--critical 'scripts/check_links.py' \
 		--critical 'scripts/check_private_identifiers.py' \
+		--critical 'scripts/check_worktree_hygiene.py' \
 		--critical 'scripts/gitleaks.py' \
 		--critical 'scripts/prepare_environment.py' \
 		--critical 'scripts/required_ci.py' \
@@ -115,7 +160,7 @@ repo-check:
 
 docs-check:
 	$(UV_RUN) python scripts/check_links.py --repo-root . --external \
-		--max-external 50 --timeout 5 --max-redirects 3 .
+		--max-external 80 --timeout 5 --max-redirects 3 .
 
 workflow-check:
 	$(UV_RUN) python scripts/validate_workflows.py --require-aggregate .github/workflows

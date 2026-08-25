@@ -19,6 +19,7 @@ Closes #
 - [ ] Relevant `milhouse-gate-review` completed and no P0/P1 remains
 - [ ] Reusable learning was compounded, or this change has no reusable learning
 - [ ] Canonical `skills/` and `.agents/skills/` alias parity is retained
+- [ ] Engineering-journal impact is assessed: publish, group into a later milestone, or no post
 
 ## Privacy Check
 

@@ -1,0 +1,69 @@
+title: "[Build Journal] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Milhouse build-journal posts explain verified work from protected `main`. They are not
+        release announcements. Do not include credentials, real telemetry, private paths, account
+        identifiers, raw agent content, provider payloads, generated reports, or private incidents.
+  - type: input
+    id: milestone
+    attributes:
+      label: Milestone
+      description: Name the merged work package, gate, or architecture slice covered by this post.
+      placeholder: "W02: deterministic identity and privacy foundations"
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this matters
+      description: Explain the user or engineering problem in plain language before implementation details.
+    validations:
+      required: true
+  - type: textarea
+    id: implemented
+    attributes:
+      label: Implemented and verified
+      description: Describe only behavior present on protected main and link its pull requests and checks.
+    validations:
+      required: true
+  - type: textarea
+    id: architecture
+    attributes:
+      label: Architecture walkthrough
+      description: Explain important boundaries and tradeoffs; label planned components as planned.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Verification evidence
+      description: Link the exact protected commit, Required CI run, tests, and gate evidence used.
+    validations:
+      required: true
+  - type: textarea
+    id: next
+    attributes:
+      label: What comes next
+      description: Describe dependency-ready work without presenting a schedule or unapproved feature as committed.
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Current boundaries
+      description: State what is not implemented, released, supported, or suitable for production use.
+    validations:
+      required: true
+  - type: checkboxes
+    id: attestation
+    attributes:
+      label: Publication check
+      options:
+        - label: Every implemented claim is supported by merged public evidence linked above.
+          required: true
+        - label: The post contains no private, credential-bearing, raw-agent, or production data.
+          required: true
+        - label: Planned architecture and released functionality are clearly distinguished.
+          required: true

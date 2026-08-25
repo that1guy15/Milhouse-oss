@@ -95,3 +95,50 @@ def test_arbitrary_allowlists_cannot_elevate_telegram(allowlist: frozenset[str])
     assert result is EgressDisposition.POLICY_FILTERED_SUMMARY
     assert "public" in allowlist
     assert allowlist <= {"public", "internal"}
+
+
+_METADATA_DISPOSITIONS = frozenset(
+    {EgressDisposition.METADATA, EgressDisposition.REDACTED_METADATA}
+)
+
+
+@pytest.mark.property
+@given(st.sampled_from(_CLASSES), _CLASS_SETS)
+def test_local_log_never_exceeds_internal_metadata_ceiling(
+    privacy_class: str,
+    allowlist: frozenset[str],
+) -> None:
+    # restricted is refused before any surface policy is considered.
+    if privacy_class == "restricted":
+        with pytest.raises(PrivacyError) as restricted:
+            require_egress(
+                surface=EgressSurface.LOCAL_LOG,
+                privacy_class="restricted",
+                allowed_classifications=cast(frozenset[PrivacyClassV1], allowlist),
+            )
+        assert restricted.value.code == "MH_EGRESS_RESTRICTED"
+        return
+
+    # LOCAL_LOG is a local surface, so any non-empty external policy must be refused outright.
+    if allowlist:
+        with pytest.raises(PrivacyError) as policy:
+            require_egress(
+                surface=EgressSurface.LOCAL_LOG,
+                privacy_class=cast(PrivacyClassV1, privacy_class),
+                allowed_classifications=cast(frozenset[PrivacyClassV1], allowlist),
+            )
+        assert policy.value.code == "MH_EGRESS_POLICY"
+        return
+
+    try:
+        result = require_egress(
+            surface=EgressSurface.LOCAL_LOG,
+            privacy_class=cast(PrivacyClassV1, privacy_class),
+        )
+    except PrivacyError as denied:
+        assert privacy_class == "sensitive"
+        assert denied.code == "MH_EGRESS_CLASS_DENIED"
+        return
+
+    assert privacy_class in {"public", "internal"}
+    assert result in _METADATA_DISPOSITIONS

@@ -80,6 +80,10 @@ ClickHouse failure never prevents unrelated durable collection. Deterministic re
 - One fail-closed egress matrix authorizes each surface/classification pair and returns its mandatory
   maximum content shape. External caller policy may narrow that matrix but cannot elevate it;
   restricted input is denied before surface-specific policy is considered.
+- The persisted local structured-log surface (`local_log`, section 4.15) is one such matrix pair: it
+  authorizes only installation-scoped operational metadata (public metadata, internal redacted
+  metadata; sensitive and restricted denied), stays downstream of redaction, carries no arbitrary-text
+  or exception-detail field, and resolves under the configured runtime home logs path.
 - Raw prompts, responses, transcripts, and tool output are never persisted in 1.0.
 - Agent summaries/traces are structured, bounded, and disabled by default.
 - Hosted storage, receiver remote bind, notifications, GitHub writes, and MCP writes are independent opt-ins.

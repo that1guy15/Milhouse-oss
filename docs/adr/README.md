@@ -6,17 +6,32 @@ The implementation plan remains the normative build contract. If an ADR and the 
 
 ADRs 0001-0014 are plan-version 1.0 ratifications dated 2026-07-18. ADR 0015 is
 an owner-approved process adaptation dated 2026-07-19; it changes no public API,
-stored schema, privacy promise, or product scope.
+stored schema, privacy promise, or product scope. ADRs 0016 and 0017 record
+owner-approved amendments A02 and A03 dated 2026-07-22: ADR 0016 ratifies the
+persisted local structured-log contract and amends ADR 0007, and ADR 0017 records
+the bounded D01 historical DCO disposition. An ADR 0016 addendum ratifies amendment
+A05 dated 2026-07-23 (the exact v1 stored-log schema). The ADR 0004 addendum ratifies
+owner-approved amendment A06 dated 2026-07-28 and makes the installation-account
+filesystem-containment boundary explicit. The ADR 0007 addendum ratifies
+owner-approved amendment A07 dated 2026-08-01, binding W03 audited compaction to
+the installation's control-plane pseudonym key ID/epoch and adding the reserved
+compaction-successor namespace with its auto-converging upgrade remediation. A
+second ADR 0007 addendum ratifies owner-approved amendment A08 dated 2026-08-02,
+making key establishment dependency-ready in W03 and schema-11 successor recovery
+complete-set and atomic. A third ADR 0007 addendum ratifies owner-approved
+amendment A09 dated 2026-08-03, deferring the W03 audited mixed-expiry compaction
+rewrite and withdrawing its reserved namespace and migrations 11–12 (control schema
+returns to version 10), while retention keeps its durable-tombstone crash-safe prune.
 
 | ADR | Ratified decision |
 |---|---|
 | [0001](0001-product-scope-naming-and-license.md) | Product, 1.0 scope, supported environments, naming, and license |
 | [0002](0002-configuration-paths-and-secrets.md) | Configuration, paths, runtime home, and secrets |
 | [0003](0003-records-identity-and-metrics.md) | Canonical records, deterministic identity, and metric semantics |
-| [0004](0004-spool-sqlite-commit-and-recovery.md) | Durable spool, SQLite control state, commit, replay, and recovery |
+| [0004](0004-spool-sqlite-commit-and-recovery.md) | Durable spool, SQLite control state, commit, replay, recovery, and the A06 installation-account filesystem-containment boundary |
 | [0005](0005-clickhouse-analytical-storage.md) | ClickHouse analytical storage, migrations, and recovery |
 | [0006](0006-alert-incident-and-feedback-state.md) | Alert, incident, and verified-feedback state machines |
-| [0007](0007-privacy-identity-egress-and-retention.md) | Trust, privacy, installation identity, egress, retention, and purge |
+| [0007](0007-privacy-identity-egress-and-retention.md) | Trust, privacy, installation identity, egress, retention, and purge, the A07 installation-key-provenance and reserved compaction-namespace upgrade addendum, the A08 dependency-ready key lifecycle and complete successor-set recovery addendum, and the A09 addendum deferring the W03 audited mixed-expiry compaction rewrite (withdrawing its reserved namespace and migrations 11–12; retention keeps its durable-tombstone prune) |
 | [0008](0008-trusted-plugin-boundary.md) | Trusted in-process plugin boundary and collector API |
 | [0009](0009-scheduler-process-and-service-model.md) | Scheduler, processes, jobs, and explicit OS services |
 | [0010](0010-local-stdio-mcp.md) | Local stdio MCP with bounded, read-first tools |
@@ -25,6 +40,8 @@ stored schema, privacy promise, or product scope.
 | [0013](0013-packaging-versioning-and-release.md) | Packaging, versioning, artifacts, and release train |
 | [0014](0014-support-governance-security-and-provenance.md) | Support, governance, security response, and provenance |
 | [0015](0015-agent-engineering-workflow.md) | Agent engineering loop, five focused skills, read-only review, sanitized learning, discovery, and authority boundaries |
+| [0016](0016-local-structured-log-persistence.md) | Persisted local structured-log wire, namespace, durability, rotation, recovery, concurrency, and `local_log` egress (amendments A02 and A05; amends ADR 0007) |
+| [0017](0017-d01-dco-historical-disposition.md) | Exact bounded D01 PR #21 historical DCO disposition (amendment A03) |
 
 ## Status vocabulary
 

@@ -7,7 +7,10 @@
 1. No classified raw value reaches persistence or egress.
 2. No acknowledged unexpired record is lost in tested crash/outage scenarios.
 3. Untrusted telemetry cannot become code, SQL, a command, URL fetch, filesystem target, or agent instruction.
-4. Milhouse cannot write outside approved state roots or configured `.milhouse/` directories.
+4. Milhouse cannot write outside approved state roots or configured `.milhouse/` directories
+   through untrusted input, path traversal, symlinks, other local users, or cooperating Milhouse
+   processes. The operating-system account running Milhouse and the host administrator are trusted
+   for filesystem containment.
 5. External listeners, storage, notifications, issues, services, plugins, and MCP writes require explicit enablement.
 6. Private donor material and supply-chain compromise cannot enter release artifacts unnoticed.
 
@@ -27,7 +30,7 @@
 | Raw prompts/responses/transcripts/tool output | Source user/provider | Restricted | Transient parser input only; never persisted or egressed | None |
 | SQLite control/index metadata | Installation operator | Internal/sensitive | Local state and encrypted backup policy | Bounded by referenced record/control lifecycle |
 | Reports and repo briefs | Target/repository owner | Public/internal | Local reports or configured `.milhouse/` | 90 days for reports; briefs atomically replaced |
-| Operational logs | Installation operator | Internal | Local rotated logs | 14 days |
+| Operational logs | Installation operator | Internal | Local rotated structured-log JSONL via the `local_log` egress surface (plan section 4.15) | 14 days |
 | Diagnostics | Installation operator | Internal/redacted metadata | Local previewed bundle only | Explicit operator deletion/policy |
 | Backups | Installation operator | Same as included telemetry | Restricted local/off-device storage; encryption required off device | Explicit manual policy disclosed in manifest |
 | Receiver nonces/idempotency | Installation operator | Internal metadata | SQLite | 10 minutes for nonces; operation policy for idempotency |
@@ -59,6 +62,11 @@ Every asset has an accountable owner, classification, location/egress rule, and 
 - An exact metadata match is an authorization precondition, not a signature, provenance guarantee,
   sandbox, or safety verdict; operators remain responsible for what they install and allowlist.
 - Local administrators and compromised user accounts can read local data/keys unless host controls prevent it.
+- POSIX cannot atomically bind an ancestor-pathname proof to a later descriptor-relative mutation.
+  A hostile process already running as the Milhouse operating-system account can therefore displace
+  a write or unlink in the adjacent syscall window. Hostile same-UID interference is a documented
+  residual, not a defended threat; operators should use a dedicated service account and run no
+  untrusted code under that identity.
 - Pattern redaction cannot safely preserve arbitrary free text; allowlists and restricted fail-closed handling remain necessary.
 - Filesystem unlink is not guaranteed forensic erasure on modern media.
 - Hosted providers and notifications have their own retention/security behavior after explicitly allowed egress.

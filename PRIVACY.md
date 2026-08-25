@@ -111,6 +111,7 @@ fixed matrix below.
 - Telegram/GitHub Issues: public or explicitly enabled internal summaries only.
 - Hosted ClickHouse: separate opt-in with a classification allowlist.
 - Diagnostics: local preview, metadata/redacted content only, never automatic upload.
+- Local operational log: installation-scoped operational metadata only (public metadata, internal redacted metadata; sensitive and restricted denied); never external egress.
 
 This primitive is implemented in the current candidate and exhaustively matrix-tested. Operational
 acceptance remains gated on G02 and on each later storage, CLI, report, MCP, diagnostics, and

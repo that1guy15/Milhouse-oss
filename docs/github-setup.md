@@ -8,7 +8,8 @@ Default branch: `main`
 ## Required controls
 
 - Issues, pull requests, and private vulnerability reporting enabled.
-- Discussions optional; every template warns against real telemetry or credentials.
+- Discussions enabled with a maintainer-authored `Announcements` build journal; every template warns
+  against real telemetry, credentials, private identifiers, and raw agent content.
 - Secret scanning and push protection enabled.
 - Dependabot alerts/updates, dependency review, and CodeQL enabled by W17.
 - Actions permitted only from the checked-in `.github/workflows/` definitions.
