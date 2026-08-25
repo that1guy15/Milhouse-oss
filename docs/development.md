@@ -7,9 +7,11 @@ pre-alpha infrastructure; it does not make later product commands available.
 
 ## Reproducible environment
 
-The repository requires Python 3.11-3.14 and exactly uv 0.11.29. `scripts/run_uv.py` resolves the
-uv executable from `MILHOUSE_UV` or `PATH`, verifies its exact version, and then delegates without
-falling back to another package manager. It anchors commands to this checkout and ignores ambient
+The repository requires Python 3.11-3.14 and exactly uv 0.11.29 — see
+[setup](setup.md) for how to install that exact version, and for the `MILHOUSE_UV` /
+`MILHOUSE_PYTHON` overrides when the executable found on `PATH` is not the right one.
+`scripts/run_uv.py` resolves the uv executable from `MILHOUSE_UV` or `PATH`, verifies its exact
+version, and then delegates without falling back to another package manager. It anchors commands to this checkout and ignores ambient
 uv/Python project redirection, user-level uv configuration, and gate-altering pytest, coverage,
 typing, property-test, and tool control variables. The Makefile invokes the wrapper with Python
 isolated mode and refuses Make modes that can skip recipes or ignore failures. Canonical gate

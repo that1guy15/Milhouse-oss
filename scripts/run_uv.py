@@ -82,10 +82,23 @@ def verify_uv(path: Path) -> None:
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
-        fail("could not execute uv --version")
+        fail(f"could not execute uv --version using {path}")
     output = (completed.stdout or completed.stderr).strip()
     if completed.returncode != 0 or not _VERSION_PATTERN.fullmatch(output):
-        fail(f"expected uv {UV_VERSION}; the resolved executable reported another version")
+        # Name the executable that was RESOLVED, and the override that redirects it. Without the
+        # path this message is unactionable whenever the wrong uv is earlier on PATH than the right
+        # one -- the common case being a version manager (pyenv, conda) whose shim prepends its own
+        # bin directory INSIDE the interpreter, so the uv the operator sees in their shell is not
+        # the uv ``shutil.which`` resolves here.
+        #
+        # The resolved path is operator-supplied (MILHOUSE_UV or PATH), so echoing it discloses
+        # nothing the caller did not provide. The executable's OWN output stays unreported: it is
+        # untrusted foreign process output, and reflecting it would let a hostile binary write
+        # terminal escapes into this diagnostic.
+        fail(
+            f"expected uv {UV_VERSION}; {path} reported another version. Install that exact "
+            f"version or set {UV_ENVIRONMENT_OVERRIDE} to the absolute path of the correct one"
+        )
 
 
 def uv_environment() -> dict[str, str]:

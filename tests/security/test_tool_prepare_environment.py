@@ -138,6 +138,7 @@ def test_policy_rejects_owner_and_nested_mount_mismatches(tmp_path: Path) -> Non
     entry.write_text("synthetic\n", encoding="utf-8")
     info = entry.stat()
     common = {
+        "relative": ("entry",),
         "root": False,
         "trusted_sync_result": False,
         "root_device": info.st_dev,
@@ -509,6 +510,86 @@ def test_write_exposed_tree_is_rejected_before_any_modes_change(
         prepare_environment.prepare_environment(environment)
 
     assert stat.S_IMODE(exposed.stat().st_mode) == mode
+
+
+def test_write_exposed_rejection_names_the_offending_entry_and_mode(tmp_path: Path) -> None:
+    """The fail-closed rejection must identify WHICH entry tripped it, not just that one did.
+
+    Without the name an operator has to guess among thousands of environment entries; the usual
+    cause is a stale ``.venv`` carried over from another checkout.
+    """
+
+    environment = tmp_path / "environment"
+    environment.mkdir(mode=0o700)
+    nested = environment / "bin"
+    nested.mkdir(mode=0o700)
+    exposed = nested / "activate"
+    exposed.write_text("synthetic\n", encoding="utf-8")
+    exposed.chmod(0o664)
+
+    with pytest.raises(
+        prepare_environment.EnvironmentSafetyError,
+        match="group- or world-writable",
+    ) as caught:
+        prepare_environment.prepare_environment(environment)
+
+    message = str(caught.value)
+    # The entry is named RELATIVE to the environment root -- identifying, but never an absolute
+    # machine path, so the diagnostic does not disclose where the checkout lives.
+    assert "bin/activate" in message
+    assert "0664" in message
+    assert os.fspath(tmp_path) not in message
+
+
+def test_policy_rejections_name_the_offending_entry(tmp_path: Path) -> None:
+    """Each policy rejection identifies the entry that tripped it, by environment-relative path."""
+
+    entry = tmp_path / "entry"
+    entry.write_text("synthetic\n", encoding="utf-8")
+    info = entry.stat()
+    common = {
+        "relative": ("bin", "activate"),
+        "root": False,
+        "trusted_sync_result": False,
+        "root_device": info.st_dev,
+        "root_mount_id": None,
+        "mount_id": None,
+    }
+
+    with pytest.raises(
+        prepare_environment.EnvironmentSafetyError,
+        match="owned by another user",
+    ) as owner_error:
+        prepare_environment._validate_policy(
+            info,
+            owner=info.st_uid + 1,
+            nested_mount=False,
+            **common,
+        )
+    assert "bin/activate" in str(owner_error.value)
+
+    with pytest.raises(
+        prepare_environment.EnvironmentSafetyError,
+        match="nested mount point",
+    ) as mount_error:
+        prepare_environment._validate_policy(
+            info,
+            owner=info.st_uid,
+            nested_mount=True,
+            **common,
+        )
+    assert "bin/activate" in str(mount_error.value)
+
+
+def test_describe_entry_names_the_root_and_renders_the_mode(tmp_path: Path) -> None:
+    entry = tmp_path / "entry"
+    entry.write_text("synthetic\n", encoding="utf-8")
+    entry.chmod(0o640)
+    info = entry.stat()
+
+    assert prepare_environment._describe_entry(()) == "the environment root"
+    assert prepare_environment._describe_entry(("bin", "activate")) == "bin/activate"
+    assert prepare_environment._describe_entry(("bin",), info) == "bin (mode 0640)"
 
 
 def test_trusted_sync_result_restricts_new_single_link_entries(tmp_path: Path) -> None:

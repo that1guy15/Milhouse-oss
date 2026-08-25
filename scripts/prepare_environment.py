@@ -192,9 +192,24 @@ def _open_regular_at(parent_fd: int, name: str, *, follow_symlinks: bool = False
     raise last_error
 
 
+def _describe_entry(relative: tuple[str, ...], info: os.stat_result | None = None) -> str:
+    """Name one offending entry for an operator diagnostic, with its mode when relevant.
+
+    The name is the entry's path RELATIVE to the environment root (``bin/activate``), never an
+    absolute machine path, so the diagnostic identifies the entry to act on without disclosing where
+    the checkout lives. The root itself is named, not rendered as an empty path.
+    """
+
+    location = "/".join(relative) if relative else "the environment root"
+    if info is None:
+        return location
+    return f"{location} (mode {stat.S_IMODE(info.st_mode):04o})"
+
+
 def _validate_policy(
     info: os.stat_result,
     *,
+    relative: tuple[str, ...],
     root: bool,
     owner: int,
     trusted_sync_result: bool,
@@ -203,18 +218,34 @@ def _validate_policy(
     mount_id: int | None,
     nested_mount: bool,
 ) -> tuple[str, int | None]:
+    # Every policy rejection names the entry that tripped it. The check stays fail-closed and
+    # unchanged; only the diagnostic gains the offending path (and, where the mode is the fault, the
+    # mode) so an operator can fix the environment instead of guessing which of thousands of entries
+    # is at fault. A stale group-writable ``.venv/`` from another checkout is the common cause.
     if info.st_uid != owner:
-        raise EnvironmentSafetyError("the environment contains an entry owned by another user")
+        raise EnvironmentSafetyError(
+            "the environment contains an entry owned by another user: "
+            f"{_describe_entry(relative)} (uid {info.st_uid}, expected {owner})"
+        )
     if root_device is not None and info.st_dev != root_device:
-        raise EnvironmentSafetyError("the environment contains an entry on another filesystem")
+        raise EnvironmentSafetyError(
+            f"the environment contains an entry on another filesystem: {_describe_entry(relative)}"
+        )
     if not root and nested_mount:
-        raise EnvironmentSafetyError("the environment contains a nested mount point")
+        raise EnvironmentSafetyError(
+            f"the environment contains a nested mount point: {_describe_entry(relative)}"
+        )
     kind, desired = _classify(info, root=root)
     if kind != "symlink" and root_mount_id is not None and mount_id != root_mount_id:
-        raise EnvironmentSafetyError("the environment contains a nested mount point")
+        raise EnvironmentSafetyError(
+            f"the environment contains a nested mount point: {_describe_entry(relative)}"
+        )
     write_exposed = kind != "symlink" and bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
     if write_exposed and (not trusted_sync_result or root or desired is None):
-        raise EnvironmentSafetyError("the environment contains a group- or world-writable entry")
+        raise EnvironmentSafetyError(
+            "the environment contains a group- or world-writable entry: "
+            f"{_describe_entry(relative, info)}; remove the environment and re-run setup"
+        )
     return kind, desired
 
 
@@ -341,6 +372,7 @@ def _capture_tree(
 ) -> tuple[list[EntrySnapshot], dict[tuple[str, ...], EntrySnapshot]]:
     root_kind, root_desired = _validate_policy(
         root_info,
+        relative=(),
         root=True,
         owner=owner,
         trusted_sync_result=trusted_sync_result,
@@ -389,6 +421,7 @@ def _capture_tree(
                     nested_mount = False
                 kind, desired = _validate_policy(
                     pinned_info,
+                    relative=child_relative,
                     root=False,
                     owner=owner,
                     trusted_sync_result=trusted_sync_result,

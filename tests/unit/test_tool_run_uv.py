@@ -76,6 +76,33 @@ def test_run_uv_rejects_an_ambient_executable_with_the_wrong_version(
     diagnostic = capsys.readouterr().err
     assert f"expected uv {run_uv.UV_VERSION}" in diagnostic
     assert untrusted_output not in diagnostic
+    # The diagnostic must be ACTIONABLE: it names the executable that was actually resolved (which
+    # the caller supplied through PATH or the override) and the override that redirects it, so an
+    # operator whose shell shows the right uv can see which wrong one was found instead.
+    assert os.fspath(ambient) in diagnostic
+    assert run_uv.UV_ENVIRONMENT_OVERRIDE in diagnostic
+
+
+def test_wrong_version_diagnostic_never_reflects_hostile_executable_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A hostile uv cannot inject terminal escapes or noise into the operator's diagnostic."""
+
+    hostile = _fake_uv(tmp_path / "uv", "uv 0.0.0\x1b[31mINJECTED\x1b[0m" + "A" * 4000)
+    monkeypatch.delenv(run_uv.UV_ENVIRONMENT_OVERRIDE, raising=False)
+    monkeypatch.setenv("PATH", str(hostile.parent))
+
+    with pytest.raises(SystemExit) as caught:
+        run_uv.run_uv([])
+
+    assert caught.value.code == 2
+    diagnostic = capsys.readouterr().err
+    assert "INJECTED" not in diagnostic
+    assert "\x1b" not in diagnostic
+    assert "AAAA" not in diagnostic
+    assert len(diagnostic) < 400
 
 
 def test_explicit_exact_uv_wins_over_a_poisoned_ambient_path_and_forwards_exit_code(
