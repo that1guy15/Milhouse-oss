@@ -161,6 +161,16 @@ class OutboxReadResult:
     monotonic rotation high-water and advances it as ``max(persisted, max_observed_sequence)``, then
     threads it back as ``read_outbox(..., last_acknowledged_sequence=...)`` so a later read can flag
     a deleted top-run of rotated segments (``MH_OUTBOX_LOSS_TOP_RUN_GONE``).
+
+    ``frame_offsets`` is a parallel tuple (same length and order as ``new_frames``) carrying each
+    frame's BYTE OFFSET -- the start byte of its line WITHIN ITS OWN physical file (0-based). It is
+    the plan-section-4.9 "file identity plus byte offset" FALLBACK identity a consumer folds into a
+    frame's record identity so two genuinely distinct but byte-identical frames (same producer,
+    same-millisecond ``occurred_at``, identical body) do not collapse to one record. The offset is
+    stable across a compliant rotation (a rename never moves bytes) and a restore (the same bytes),
+    so a crash-before-advance replay re-reads the same frame at the same offset and re-derives the
+    same identity. It is per-file, so a frame at the same offset in two DIFFERENT files is the one
+    residual collision (see the collector).
     """
 
     new_frames: tuple[OutboxFrameV1, ...]
@@ -169,6 +179,7 @@ class OutboxReadResult:
     loss_signal: OutboxLossSignal | None
     diagnostics: OutboxDiagnostics
     max_observed_sequence: int | None = None
+    frame_offsets: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +192,8 @@ class _FileRead:
 @dataclass(frozen=True, slots=True)
 class _Parsed:
     frames: list[OutboxFrameV1] = field(default_factory=list)
+    #: The per-file byte offset of each emitted frame, kept in lockstep with ``frames``.
+    offsets: list[int] = field(default_factory=list)
     rejected: Counter[str] = field(default_factory=Counter)
 
 
@@ -262,15 +275,27 @@ def _iter_complete_lines(region: bytes) -> list[bytes]:
     return [part + _LF for part in parts]
 
 
-def _parse_region(region: bytes, config: OutboxReaderConfig, into: _Parsed) -> None:
+def _parse_region(
+    region: bytes, config: OutboxReaderConfig, into: _Parsed, *, base_offset: int
+) -> None:
     """Parse every complete line in ``region``, rejecting oversized/invalid/denied lines by code.
 
     A rejected line's raw bytes are never captured: the oversize branch never parses, and the parse
     branch discards the value-safe :class:`OutboxError` after reading only its fixed ``.code``.
+
+    ``base_offset`` is the byte offset of ``region``'s first byte WITHIN ITS OWN physical file (the
+    cursor offset for the active file, ``0`` for a whole rotated file), so each emitted frame
+    records ``base_offset + <bytes of prior lines in this region>`` -- its start byte in that file.
+    The
+    running total advances over EVERY line, including rejected ones, so a valid line after a skipped
+    one still gets its true file offset.
     """
 
     allowlist = config.producer_allowlist
+    running = 0
     for line in _iter_complete_lines(region):
+        line_offset = base_offset + running
+        running += len(line)
         if len(line) > config.max_line_bytes:
             into.rejected[_LINE_OVERSIZE_CODE] += 1
             continue
@@ -284,6 +309,7 @@ def _parse_region(region: bytes, config: OutboxReaderConfig, into: _Parsed) -> N
             into.rejected[_PRODUCER_DENIED_CODE] += 1
             continue
         into.frames.append(frame)
+        into.offsets.append(line_offset)
 
 
 def _loss(
@@ -323,8 +349,7 @@ def _loss(
 
 
 def _success(
-    frames: list[OutboxFrameV1],
-    rejected: Counter[str],
+    parsed: _Parsed,
     *,
     next_position: OutboxPosition,
     bytes_consumed: int,
@@ -333,20 +358,21 @@ def _success(
     max_observed_sequence: int | None = None,
 ) -> OutboxReadResult:
     diagnostics = OutboxDiagnostics(
-        frames_emitted=len(frames),
-        rejected_lines=sum(rejected.values()),
-        rejected_codes=MappingProxyType(dict(rejected)),
+        frames_emitted=len(parsed.frames),
+        rejected_lines=sum(parsed.rejected.values()),
+        rejected_codes=MappingProxyType(dict(parsed.rejected)),
         bytes_consumed=bytes_consumed,
         rotations_crossed=rotations_crossed,
         torn_tail_bytes=torn_tail_bytes,
     )
     return OutboxReadResult(
-        new_frames=tuple(frames),
+        new_frames=tuple(parsed.frames),
         next_position=next_position,
         next_position_string=encode_outbox_position(next_position),
         loss_signal=None,
         diagnostics=diagnostics,
         max_observed_sequence=max_observed_sequence,
+        frame_offsets=tuple(parsed.offsets),
     )
 
 
@@ -386,7 +412,12 @@ def read_outbox(
     prior_string = prior_cursor.position if prior_cursor is not None else None
     active = _read_regular_file(file_path, config.max_file_bytes)
 
-    if prior is None or (active.device, active.inode) == (prior.device, prior.inode):
+    if prior is None:
+        # No cursor yet (never committed for this source): the WHOLE retained stream is unread, so a
+        # first read must ingest any retained rotated files too -- reading only the active file
+        # would silently drop frames in files that rotated before this first read (permanent loss).
+        return _read_from_start(file_path, active, config)
+    if (active.device, active.inode) == (prior.device, prior.inode):
         return _read_same_file(active, prior, config)
     assert prior_string is not None
     return _recover_rotation(
@@ -421,7 +452,7 @@ def _read_same_file(
         complete_end = start
     region = content[start:complete_end]
     parsed = _Parsed()
-    _parse_region(region, config, parsed)
+    _parse_region(region, config, parsed, base_offset=start)
     next_position = OutboxPosition(
         device=active.device,
         inode=active.inode,
@@ -429,12 +460,107 @@ def _read_same_file(
         content_sha256=_sha256_hex(content[:complete_end]),
     )
     return _success(
-        parsed.frames,
-        parsed.rejected,
+        parsed,
         next_position=next_position,
         bytes_consumed=complete_end - start,
         rotations_crossed=0,
         torn_tail_bytes=len(content) - complete_end,
+    )
+
+
+def _read_from_start(
+    file_path: str | Path, active: _FileRead, config: OutboxReaderConfig
+) -> OutboxReadResult:
+    """First read with NO cursor: ingest the whole retained chain, not only the active file.
+
+    With no cursor every retained byte is unread, so -- when a ``rotation_glob`` is set -- the
+    reader discovers the retained rotated files and reads them (numeric order, lowest first) then
+    the active file, exactly as :func:`_recover_rotation` does past a cursor but from offset 0 in
+    each rotated file. This closes the silent-loss window where run 1 committed nothing (cursor
+    still ``None``) and the outbox rotated before run 2: the older-but-retained frames are ingested.
+
+    Fail-closed, mirroring the cursor path: the retained rotated sequences must be a CONTIGUOUS run
+    (a gap is a rotated segment deleted out of order -- nothing is acked yet, so a compliant
+    producer would not have -- an unrecoverable ``MH_OUTBOX_LOSS_ROTATION_GONE``); each rotated file
+    must be
+    whole (a torn rotated tail is ``MH_OUTBOX_LOSS_ROTATED_TORN``), and an unparseable/ambiguous
+    rotated name fails closed as it does under a cursor. A loss with no cursor is reported against a
+    synthetic zero position of the active file. With no ``rotation_glob``, or none retained, the
+    active file is the whole stream so far and is read from its start.
+    """
+
+    if config.rotation_glob is None:
+        return _read_same_file(active, None, config)
+    directory = lexical_absolute_path(file_path).parent
+    by_sequence, discovery_loss = _discover_rotations(directory, active, config)
+    if discovery_loss is not None:
+        return _loss_no_cursor(active, discovery_loss)
+    if not by_sequence:
+        return _read_same_file(active, None, config)
+
+    max_observed = max(by_sequence)
+    rotated = sorted(by_sequence)
+    if rotated != list(range(rotated[0], rotated[0] + len(rotated))):
+        return _loss_no_cursor(
+            active, "MH_OUTBOX_LOSS_ROTATION_GONE", max_observed_sequence=max_observed
+        )
+
+    regions: list[bytes] = []
+    bytes_consumed = 0
+    for sequence in rotated:
+        read = by_sequence[sequence]
+        if _has_torn_tail(read.content):
+            return _loss_no_cursor(
+                active, "MH_OUTBOX_LOSS_ROTATED_TORN", max_observed_sequence=max_observed
+            )
+        regions.append(read.content)
+        bytes_consumed += len(read.content)
+
+    complete_end = active.content.rfind(_LF) + 1
+    regions.append(active.content[:complete_end])
+    bytes_consumed += complete_end
+
+    parsed = _Parsed()
+    for region in regions:
+        # Each region is a whole rotated file or the active file's complete prefix, so every frame's
+        # offset is measured from its own file's start (base_offset 0), matching the per-file offset
+        # a later read of the same file (rotated or not) reproduces.
+        _parse_region(region, config, parsed, base_offset=0)
+
+    next_position = OutboxPosition(
+        device=active.device,
+        inode=active.inode,
+        offset=complete_end,
+        content_sha256=_sha256_hex(active.content[:complete_end]),
+    )
+    return _success(
+        parsed,
+        next_position=next_position,
+        bytes_consumed=bytes_consumed,
+        rotations_crossed=len(rotated),
+        torn_tail_bytes=len(active.content) - complete_end,
+        max_observed_sequence=max_observed,
+    )
+
+
+def _loss_no_cursor(
+    active: _FileRead, code: str, *, max_observed_sequence: int | None = None
+) -> OutboxReadResult:
+    """Report a first-read (no cursor) data loss against a synthetic zero position of the file.
+
+    A loss signal is anchored on a cursor position; with no cursor, the anchor is the active file's
+    identity at offset 0 with the empty-prefix hash -- privacy-safe (integers + a fixed digest), and
+    the collector reads only ``loss_signal.code`` from it.
+    """
+
+    synthetic = OutboxPosition(
+        device=active.device, inode=active.inode, offset=0, content_sha256=_sha256_hex(b"")
+    )
+    return _loss(
+        code,
+        synthetic,
+        encode_outbox_position(synthetic),
+        max_observed_sequence=max_observed_sequence,
     )
 
 
@@ -576,8 +702,11 @@ def _recover_rotation(
             max_observed_sequence=max_observed,
         )
 
-    regions: list[bytes] = [cursor_file.content[prior.offset :]]
-    bytes_consumed = len(regions[0])
+    # Each region is paired with its base offset WITHIN ITS OWN file: the cursor file resumes at
+    # ``prior.offset``, every rotated file above and the active file start at 0. So a frame keeps
+    # its per-file offset whether it is read here (mid-rotation) or later from its own file.
+    regions: list[tuple[bytes, int]] = [(cursor_file.content[prior.offset :], prior.offset)]
+    bytes_consumed = len(regions[0][0])
     for sequence in above:
         read = by_sequence[sequence]
         if _has_torn_tail(read.content):
@@ -588,18 +717,18 @@ def _recover_rotation(
                 observed_size=len(read.content),
                 max_observed_sequence=max_observed,
             )
-        regions.append(read.content)
+        regions.append((read.content, 0))
         bytes_consumed += len(read.content)
 
     complete_end = active.content.rfind(_LF) + 1
     active_region = active.content[:complete_end]
-    regions.append(active_region)
+    regions.append((active_region, 0))
     bytes_consumed += complete_end
 
     # Phase B: parse every region now that the chain is proven continuous.
     parsed = _Parsed()
-    for region in regions:
-        _parse_region(region, config, parsed)
+    for region, base_offset in regions:
+        _parse_region(region, config, parsed, base_offset=base_offset)
 
     next_position = OutboxPosition(
         device=active.device,
@@ -608,8 +737,7 @@ def _recover_rotation(
         content_sha256=_sha256_hex(active.content[:complete_end]),
     )
     return _success(
-        parsed.frames,
-        parsed.rejected,
+        parsed,
         next_position=next_position,
         bytes_consumed=bytes_consumed,
         rotations_crossed=1 + len(above),

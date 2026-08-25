@@ -372,6 +372,105 @@ def test_multiple_rotations_recovered_in_monotonic_order(tmp_path: Path) -> None
     assert result.diagnostics.rotations_crossed == 2
 
 
+def test_first_read_no_cursor_ingests_retained_rotations(tmp_path: Path) -> None:
+    # FIX 1 (P1): a FIRST read (cursor still None: run 1 committed nothing) after the outbox ALREADY
+    # rotated must ingest the retained rotated file too -- reading only the active file would drop
+    # those frames forever with no loss signal.
+    path = _outbox(tmp_path, _frame_line(kind="a") + _frame_line(kind="b"))
+    _rotate(path, 1)  # feedback-outbox.00000001.jsonl now holds a, b
+    _write(path, _frame_line(kind="c"))  # the fresh active file holds c
+    config = OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+
+    result = read_outbox(file_path=path, prior_cursor=None, config=config)
+    assert result.loss_signal is None
+    assert [frame.kind for frame in result.new_frames] == ["a", "b", "c"]  # whole chain, in order
+    assert result.diagnostics.rotations_crossed == 1
+    assert result.max_observed_sequence == 1
+    # The cursor is established at the active file's EOF.
+    assert result.next_position is not None
+    assert result.next_position.inode == os.stat(path).st_ino
+    assert result.next_position.offset == len(_frame_line(kind="c"))
+
+
+def test_first_read_no_cursor_without_glob_reads_only_active(tmp_path: Path) -> None:
+    # Without a rotation_glob the reader cannot enumerate rotations, so a first read reads only the
+    # active file -- the pre-existing, safe single-file behaviour (there is nothing to discover).
+    path = _outbox(tmp_path, _frame_line(kind="a"))
+    _rotate(path, 1)
+    _write(path, _frame_line(kind="c"))
+    result = read_outbox(file_path=path, prior_cursor=None, config=OutboxReaderConfig())
+    assert result.loss_signal is None
+    assert [frame.kind for frame in result.new_frames] == ["c"]
+
+
+def test_first_read_no_cursor_gap_in_rotations_is_p1_loss(tmp_path: Path) -> None:
+    # A gap in the retained rotated run on a first read is unrecoverable loss (nothing is acked, so
+    # a compliant producer would not have deleted an intermediate segment). Reported at zero.
+    path = _outbox(tmp_path, _frame_line(kind="a"))
+    _rotate(path, 1)
+    _write(path, _frame_line(kind="b"))
+    _rotate(path, 3)  # sequences {1, 3} retained -- 2 is missing
+    _write(path, _frame_line(kind="c"))
+    result = read_outbox(
+        file_path=path, prior_cursor=None, config=OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    )
+    assert result.new_frames == ()
+    assert result.loss_signal is not None
+    assert result.loss_signal.code == "MH_OUTBOX_LOSS_ROTATION_GONE"
+
+
+def test_frame_offsets_are_per_file_byte_positions(tmp_path: Path) -> None:
+    # FIX 2: each frame exposes its start byte WITHIN its own file, so a consumer can fold the
+    # offset into identity to keep byte-identical-but-distinct frames apart.
+    line_a = _frame_line(kind="a")
+    path = _outbox(tmp_path, line_a + _frame_line(kind="b"))
+    result = read_outbox(file_path=path, prior_cursor=None, config=OutboxReaderConfig())
+    assert [frame.kind for frame in result.new_frames] == ["a", "b"]
+    assert result.frame_offsets == (0, len(line_a))
+
+
+def test_frame_offset_skips_a_preceding_rejected_line(tmp_path: Path) -> None:
+    # A rejected line BEFORE a valid frame must not shift the valid frame's offset: the running
+    # total advances over the rejected line so the frame records its TRUE byte start.
+    rejected = b"this is not a valid json frame\n"
+    good = _frame_line(kind="ok")
+    path = _outbox(tmp_path, rejected + good)
+    result = read_outbox(file_path=path, prior_cursor=None, config=OutboxReaderConfig())
+    assert [frame.kind for frame in result.new_frames] == ["ok"]
+    assert result.diagnostics.rejected_lines == 1
+    assert result.frame_offsets == (len(rejected),)  # the true offset, past the skipped bad line
+
+
+def test_frame_offset_skips_a_preceding_oversized_line(tmp_path: Path) -> None:
+    # The oversize branch also advances the running total, so a valid frame after an oversized line
+    # still records its true offset. The bound is set above the valid frame but below the bad line.
+    good = _frame_line(kind="ok")
+    config = OutboxReaderConfig(max_line_bytes=len(good) + 100)
+    oversized = b"o" * (len(good) + 200) + b"\n"  # over max_line_bytes -> rejected as oversize
+    path = _outbox(tmp_path, oversized + good)
+    result = read_outbox(file_path=path, prior_cursor=None, config=config)
+    assert [frame.kind for frame in result.new_frames] == ["ok"]
+    assert result.diagnostics.rejected_lines == 1
+    assert result.frame_offsets == (len(oversized),)
+
+
+def test_frame_offset_is_stable_across_rotation(tmp_path: Path) -> None:
+    # The per-file offset is what makes the replay/identity property survive rotation: a rename
+    # never moves bytes, so frame "b" keeps the same offset once it lives in the rotated file.
+    line_a = _frame_line(kind="a")
+    path = _outbox(tmp_path, line_a + _frame_line(kind="b"))
+    config = OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    first = read_outbox(file_path=path, prior_cursor=None, config=config)
+    b_first = [frame.kind for frame in first.new_frames].index("b")
+    assert first.frame_offsets[b_first] == len(line_a)
+
+    _rotate(path, 1)  # "b" now lives in the rotated file, at the SAME byte offset
+    _write(path, _frame_line(kind="c"))
+    second = read_outbox(file_path=path, prior_cursor=None, config=config)
+    b_second = [frame.kind for frame in second.new_frames].index("b")
+    assert second.frame_offsets[b_second] == len(line_a)
+
+
 def test_needed_rotated_file_removed_is_p1_loss(tmp_path: Path) -> None:
     path = _outbox(tmp_path, _frame_line(kind="a") + _frame_line(kind="b"))
     cursor = _cursor_for(path, _frame_line(kind="a"))
@@ -947,3 +1046,125 @@ def test_ack_rejects_malformed_last_sequence(tmp_path: Path, bad_value: object) 
     with pytest.raises(OutboxError) as raised:
         read_outbox_ack(directory, "outbox-ack.json")
     assert raised.value.code == "MH_OUTBOX_ACK"
+
+
+# --- reader: guards, config validation, and none-cursor rotation edges (coverage) ---------------
+
+
+def test_read_outbox_rejects_a_non_config() -> None:
+    with pytest.raises(OutboxError) as err:
+        read_outbox(file_path="/x", prior_cursor=None, config=object())  # type: ignore[arg-type]
+    assert err.value.code == "MH_OUTBOX_CONFIG"
+
+
+def test_read_outbox_rejects_a_non_cursor() -> None:
+    with pytest.raises(OutboxError) as err:
+        read_outbox(
+            file_path="/x",
+            prior_cursor=object(),  # type: ignore[arg-type]
+            config=OutboxReaderConfig(),
+        )
+    assert err.value.code == "MH_OUTBOX_CURSOR"
+
+
+def test_config_rejects_an_empty_rotation_glob() -> None:
+    with pytest.raises(OutboxError) as err:
+        OutboxReaderConfig(rotation_glob="")
+    assert err.value.code == "MH_OUTBOX_CONFIG"
+
+
+def test_config_rejects_a_non_string_producer_allowlist_entry() -> None:
+    with pytest.raises(OutboxError) as err:
+        OutboxReaderConfig(producer_allowlist=("ok", 1))  # type: ignore[arg-type]
+    assert err.value.code == "MH_OUTBOX_CONFIG"
+
+
+def test_read_outbox_on_a_directory_is_not_regular(tmp_path: Path) -> None:
+    directory = tmp_path / "a-directory"
+    directory.mkdir()
+    with pytest.raises(OutboxError) as err:
+        read_outbox(file_path=directory, prior_cursor=None, config=OutboxReaderConfig())
+    assert err.value.code == "MH_OUTBOX_NOT_REGULAR"
+
+
+def test_first_read_no_cursor_unparseable_rotation_is_loss(tmp_path: Path) -> None:
+    path = _outbox(tmp_path, _frame_line(kind="a"))
+    # matches the glob but the wildcard is not a pure integer run
+    _write(path.parent / "feedback-outbox.abc.jsonl", _frame_line(kind="x"))
+    result = read_outbox(
+        file_path=path, prior_cursor=None, config=OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    )
+    assert result.new_frames == ()
+    assert result.loss_signal is not None
+    assert result.loss_signal.code == "MH_OUTBOX_LOSS_ROTATION_UNPARSEABLE"
+
+
+def test_first_read_no_cursor_torn_rotation_is_loss(tmp_path: Path) -> None:
+    path = _outbox(tmp_path, _frame_line(kind="a"))
+    _write(path.parent / "feedback-outbox.00000001.jsonl", b"torn line without a newline")
+    result = read_outbox(
+        file_path=path, prior_cursor=None, config=OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    )
+    assert result.new_frames == ()
+    assert result.loss_signal is not None
+    assert result.loss_signal.code == "MH_OUTBOX_LOSS_ROTATED_TORN"
+
+
+def test_first_read_no_cursor_glob_matching_active_link_is_excluded(tmp_path: Path) -> None:
+    # A hard link with a rotated-looking name that resolves to the ACTIVE inode is excluded (never
+    # double-counted), so the read falls back to the active file alone.
+    path = _outbox(tmp_path, _frame_line(kind="a"))
+    os.link(path, path.parent / "feedback-outbox.00000001.jsonl")
+    result = read_outbox(
+        file_path=path, prior_cursor=None, config=OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    )
+    assert result.loss_signal is None
+    assert [frame.kind for frame in result.new_frames] == ["a"]
+
+
+def test_rotated_cursor_file_truncated_below_offset_is_loss(tmp_path: Path) -> None:
+    body = _frame_line(kind="a") + _frame_line(kind="b")
+    path = _outbox(tmp_path, body)
+    cursor = _cursor_for(path, body)  # consumed A+B
+    rotated = _rotate(path, 1)
+    _write(path, _frame_line(kind="c"))
+    with rotated.open("r+b") as handle:
+        handle.truncate(5)  # shrink the rotated cursor file below the cursor offset
+    result = read_outbox(
+        file_path=path, prior_cursor=cursor, config=OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    )
+    assert result.new_frames == ()
+    assert result.loss_signal is not None
+    assert result.loss_signal.code == "MH_OUTBOX_LOSS_TRUNCATED"
+
+
+def test_rotated_cursor_file_rewritten_prefix_is_loss(tmp_path: Path) -> None:
+    path = _outbox(tmp_path, _frame_line(kind="a"))
+    cursor = _cursor_for(path, _frame_line(kind="a"))  # consumed A
+    rotated = _rotate(path, 1)
+    _write(path, _frame_line(kind="c"))
+    # rewrite the consumed prefix with a same-length but different frame -> prefix hash mismatch
+    rotated.write_bytes(_frame_line(kind="z"))
+    result = read_outbox(
+        file_path=path, prior_cursor=cursor, config=OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    )
+    assert result.new_frames == ()
+    assert result.loss_signal is not None
+    assert result.loss_signal.code == "MH_OUTBOX_LOSS_REWRITE"
+
+
+def test_torn_rotated_file_above_cursor_is_loss(tmp_path: Path) -> None:
+    # The cursor sits (consuming nothing) in the file that becomes seq 1; seq 2 -- ABOVE the cursor
+    # -- is torn, so the whole recovery fails closed.
+    path = _outbox(tmp_path, _frame_line(kind="a"))
+    cursor = _cursor_for(path, b"")
+    _rotate(path, 1)  # seq 1 = A (complete), the cursor's file
+    _write(path, b"torn-no-newline")
+    _rotate(path, 2)  # seq 2 = torn, above the cursor
+    _write(path, _frame_line(kind="c"))
+    result = read_outbox(
+        file_path=path, prior_cursor=cursor, config=OutboxReaderConfig(rotation_glob=_ROTATION_GLOB)
+    )
+    assert result.new_frames == ()
+    assert result.loss_signal is not None
+    assert result.loss_signal.code == "MH_OUTBOX_LOSS_ROTATED_TORN"

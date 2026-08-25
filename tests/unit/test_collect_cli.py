@@ -57,6 +57,12 @@ _NON_CANARY_COLLECTOR = (
     '\n[[collectors]]\nid = "example-outbox"\ntype = "file_outbox"\n'
     'target = "example-app"\npath = "outbox"\n'
 )
+# A file_outbox collector whose relative outbox path the test plants as a SYMLINK, so the real
+# collect registry's path resolution fails closed with a config-error (exit 2), not a traceback.
+_SYMLINK_OUTBOX_COLLECTOR = (
+    '\n[[collectors]]\nid = "sym-outbox"\ntype = "file_outbox"\n'
+    'target = "example-app"\npath = "outbox.jsonl"\n'
+)
 
 
 def _config_file(
@@ -88,7 +94,7 @@ def _use_fake_registry(monkeypatch: pytest.MonkeyPatch, factory: object) -> None
     """Swap the production collect registry for one resolving ``site_canary`` to ``factory``."""
 
     registry = registry_with("site_canary", factory)
-    monkeypatch.setattr(root, "_new_collect_registry", lambda: registry)
+    monkeypatch.setattr(root, "_new_collect_registry", lambda *args, **kwargs: registry)
 
 
 def _isolation_factory(fail_id: str) -> object:
@@ -226,6 +232,28 @@ def test_collect_run_commits_a_segment_and_exits_zero(
     assert payload["records_delivered"] == 0
     # A durable segment reached the spool.
     assert list((paths.spool / "pending").rglob("*.jsonl"))
+
+
+def test_collect_run_maps_a_symlinked_outbox_path_to_a_config_error(tmp_path: Path) -> None:
+    # A symlinked/uninspectable file_outbox path is a CONFIGURATION fault: the real registry
+    # resolves it symlink-free, so it must surface as the clean exit-2 config-error contract (not an
+    # uncaught traceback). No fake registry here -- the real path resolution must run.
+    config_file = _config_file(
+        tmp_path, extra=_SYMLINK_OUTBOX_COLLECTOR, mode="spool_only", clickhouse_enabled=False
+    )
+    runner = CliRunner()
+    assert runner.invoke(main, ["--config", str(config_file), "init"]).exit_code == 0
+    # Plant a symlink at the resolved outbox path (config-dir relative).
+    (tmp_path / "cfg" / "outbox.jsonl").symlink_to(tmp_path / "nonexistent-target")
+
+    result = runner.invoke(main, ["--config", str(config_file), "collect", "run"])
+
+    assert (
+        result.exit_code == 2
+    )  # the config-error contract, not the exit-1 run abort or a traceback
+    assert "config.path.symlink" in result.output
+    # A clean coded exit, never a raw traceback escaping to the user.
+    assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
 def test_collect_run_json_is_stable_and_privacy_safe(

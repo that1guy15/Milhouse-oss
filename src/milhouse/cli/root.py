@@ -14,6 +14,7 @@ from platformdirs import user_config_path, user_data_path
 
 from milhouse import __version__, storage
 from milhouse.cli import bootstrap, demo, views
+from milhouse.collectors.file_outbox import FileOutboxBinding, register_file_outbox
 from milhouse.collectors.site_canary import SITE_CANARY_TYPE, register_site_canary
 from milhouse.config import (
     ConfigError,
@@ -21,9 +22,15 @@ from milhouse.config import (
     generate_json_schema_bytes,
     load_config,
     load_secret_environment,
+    resolve_config_source_path,
     resolve_runtime_paths,
 )
-from milhouse.config._models import CollectorConfig, MilhouseConfig, TargetConfig
+from milhouse.config._models import (
+    CollectorConfig,
+    FileOutboxCollector,
+    MilhouseConfig,
+    TargetConfig,
+)
 from milhouse.core.clock import SystemClock
 from milhouse.privacy.keys import load_pseudonym_key
 from milhouse.privacy.pseudonym import PrivacyError
@@ -308,15 +315,30 @@ class CollectCommandError(_CodedCommandError):
     exit_code = 1
 
 
-def _new_collect_registry() -> CollectorRegistry:
-    """Build the production first-party collector registry (real HTTP-backed site_canary).
+def _new_collect_registry(config: MilhouseConfig, paths: RuntimePaths) -> CollectorRegistry:
+    """Build the production first-party collector registry (real HTTP-backed site_canary + outbox).
 
     A module-level seam so a network-free test can substitute a registry holding a fake collector;
-    production ``collect`` always calls it with the real registry.
+    production ``collect`` always calls it with the real registry. The ``file_outbox`` factory is
+    PATH-BOUND: each configured ``file_outbox`` collector's relative outbox path is resolved here
+    (symlink-free, from the config directory) into an absolute file, and its parent is the
+    owner-only ``.milhouse`` acknowledgement directory — so the collector, like site_canary with its
+    URL, is bound to a resolved path and never resolves an ambient one. Resolving a path never
+    requires the file to exist, so an outbox that has not been written yet still binds cleanly.
     """
 
     registry = CollectorRegistry()
     register_site_canary(registry)
+    outbox_bindings: dict[str, FileOutboxBinding] = {}
+    for collector in config.collectors:
+        if not isinstance(collector, FileOutboxCollector):
+            continue
+        outbox_path = resolve_config_source_path(collector.path, config_dir=paths.config_dir)
+        outbox_bindings[collector.id] = FileOutboxBinding(
+            outbox_path=outbox_path, ack_directory=outbox_path.parent
+        )
+    if outbox_bindings:
+        register_file_outbox(registry, outbox_paths=outbox_bindings)
     return registry
 
 
@@ -346,7 +368,7 @@ def _build_collect_pipeline(
     rather than in a separate reject guard.
     """
 
-    registry = _new_collect_registry()
+    registry = _new_collect_registry(config, paths)
     barrier = GlobalCommitBarrier(bootstrap.barrier_path(paths))
     return RuntimePipeline(
         mode=mode,
@@ -481,6 +503,13 @@ def _run_collect(
         )
         # The full target set is passed for lookup; the collector filters above scope the run.
         summary = pipeline.run(tuple(collectors), tuple(targets))
+    except ConfigError as error:
+        # Building the pipeline resolves each file_outbox collector's outbox path (symlink-free,
+        # from the config dir). A symlinked/uninspectable path is a CONFIGURATION fault, so surface
+        # it as the exit-2 config-error contract every other config problem uses -- a clean
+        # ``error: config.path.*`` rather than a raw traceback. Like the unknown-collector/target
+        # guards, a bad configured path is a whole-run config error, not a per-collector isolation.
+        raise ConfigCommandError(error) from None
     except (SpoolError, StateError, PipelineError, storage.StorageError) as error:
         # A spool-integrity, control-state, pipeline-construction, or ClickHouse-ownership failure
         # (e.g. DurableSpool reconciliation, a tampered barrier, a crashed-prior-writer orphan, an
